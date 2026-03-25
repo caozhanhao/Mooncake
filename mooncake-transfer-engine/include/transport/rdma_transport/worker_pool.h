@@ -29,6 +29,10 @@ class WorkerPool {
 
     // Add slices to queue, called by Transport
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
+    void addProcessedSliceCount(uint64_t count) {
+        if (count)
+            processed_slice_count_.fetch_add(count, std::memory_order_relaxed);
+    }
 
    private:
     void performPostSend(int thread_id);

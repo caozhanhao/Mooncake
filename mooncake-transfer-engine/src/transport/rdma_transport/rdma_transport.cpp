@@ -490,6 +490,7 @@ Status RdmaTransport::submitTransferTask(
             slice->rdma.dest_addr = request.target_offset + offset;
             slice->rdma.retry_cnt = request.advise_retry_cnt;
             slice->rdma.max_retry_cnt = kMaxRetryCount;
+            slice->rdma.endpoint = nullptr;
             slice->task = &task;
             slice->target_id = request.target_id;
             slice->status = Slice::PENDING;

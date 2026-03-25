@@ -103,6 +103,8 @@ class RdmaContext {
 
     int disconnectAllEndpoints();
 
+    void addProcessedSliceCount(uint64_t count);
+
     // Get the total number of QPs across all endpoints in this context
     size_t getTotalQPNumber() const;
 

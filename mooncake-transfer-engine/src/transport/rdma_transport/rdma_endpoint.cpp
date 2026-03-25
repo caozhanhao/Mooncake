@@ -54,6 +54,8 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     max_sge_per_wr_ = max_sge_per_wr;
     max_inline_bytes_ = max_inline_bytes;
 
+    inflight_slices_.clear();
+
     wr_depth_list_ = new volatile int[num_qp_list];
     if (!wr_depth_list_) {
         LOG(ERROR) << "Failed to allocate memory for work request depth list";
@@ -112,6 +114,7 @@ int RdmaEndPoint::reconstruct() {
 }
 
 int RdmaEndPoint::deconstruct() {
+    resetInflightSlices();
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (ibv_destroy_qp(qp_list_[i])) {
             PLOG(ERROR) << "Failed to destroy QP";
@@ -399,6 +402,7 @@ int RdmaEndPoint::disconnectForReestablish() {
 }
 
 void RdmaEndPoint::disconnectUnlocked() {
+    resetInflightSlices();
     ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RESET;
@@ -435,6 +439,14 @@ bool RdmaEndPoint::hasOutstandingSlice() const {
     for (size_t i = 0; i < qp_list_.size(); i++)
         if (wr_depth_list_[i] != 0) return true;
     return false;
+}
+
+bool RdmaEndPoint::consumeSlice(Transport::Slice *slice) {
+    RWSpinlock::WriteGuard guard(lock_);
+    auto it = inflight_slices_.find(slice);
+    if (it == inflight_slices_.end()) return false;
+    inflight_slices_.erase(it);
+    return true;
 }
 
 int RdmaEndPoint::submitPostSend(
@@ -474,6 +486,8 @@ int RdmaEndPoint::submitPostSend(
         slice->ts = getCurrentTimeInNano();
         slice->status = Transport::Slice::POSTED;
         slice->rdma.qp_depth = &wr_depth_list_[qp_index];
+        slice->rdma.endpoint = this;
+        inflight_slices_.insert(slice);
     }
     __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
     __sync_fetch_and_add(cq_outstanding_, wr_count);
@@ -485,6 +499,11 @@ int RdmaEndPoint::submitPostSend(
             failed_slice_list.push_back(slice_list[i]);
             __sync_fetch_and_sub(&wr_depth_list_[qp_index], 1);
             __sync_fetch_and_sub(cq_outstanding_, 1);
+            auto it = inflight_slices_.find(slice_list[i]);
+            if (it != inflight_slices_.end()) {
+                inflight_slices_.erase(it);
+            }
+            slice_list[i]->rdma.endpoint = nullptr;
             bad_wr = bad_wr->next;
         }
     }
@@ -627,5 +646,15 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     }
 
     return 0;
+}
+
+void RdmaEndPoint::resetInflightSlices() {
+    if (inflight_slices_.empty()) return;
+    size_t failed_count = inflight_slices_.size();
+    for (auto *slice : inflight_slices_) {
+        slice->markFailed();
+    }
+    inflight_slices_.clear();
+    context_.addProcessedSliceCount(failed_count);
 }
 }  // namespace mooncake

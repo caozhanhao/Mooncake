@@ -16,6 +16,7 @@
 #define RDMA_ENDPOINT_H
 
 #include <queue>
+#include <unordered_set>
 
 #include "rdma_context.h"
 
@@ -73,6 +74,10 @@ class RdmaEndPoint {
 
     bool hasOutstandingSlice() const;
 
+    // Remove a slice from inflight tracking. Returns false if it was already
+    // consumed or reset.
+    bool consumeSlice(Transport::Slice *slice);
+
     bool active() const { return active_; }
 
     void set_active(bool flag) {
@@ -105,6 +110,7 @@ class RdmaEndPoint {
 
    private:
     void disconnectUnlocked();
+    void resetInflightSlices();
 
    public:
     const std::string toString() const;
@@ -154,6 +160,8 @@ class RdmaEndPoint {
     volatile bool active_;
     volatile int *cq_outstanding_;
     volatile uint64_t inactive_time_;
+
+    std::unordered_set<Transport::Slice *> inflight_slices_;
 };
 
 }  // namespace mooncake

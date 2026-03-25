@@ -288,6 +288,14 @@ void WorkerPool::performPollCq(int thread_id) {
             else
                 qp_depth_set[slice->rdma.qp_depth] = 1;
             // __sync_fetch_and_sub(slice->rdma.qp_depth, 1);
+
+            // endpoint->consumeSlice to update endpoint's `inflight_slices_`.
+            // Note that only consume submitted slices for endpoint.
+            auto *endpoint = slice->rdma.endpoint;
+            if (endpoint && !endpoint->consumeSlice(slice)) {
+                continue;
+            }
+
             if (wc[i].status != IBV_WC_SUCCESS) {
                 bool show_work_request_flushed_error = globalConfig().trace;
                 // After detect an error, subsequent work requests will result

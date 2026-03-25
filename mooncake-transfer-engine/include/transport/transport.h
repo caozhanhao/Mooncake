@@ -35,6 +35,7 @@
 #include "transfer_metadata.h"
 
 namespace mooncake {
+class RdmaEndPoint;
 class TransferMetadata;
 /// By default, these functions return 0 (or non-null pointer) on success and
 /// return -1 (or null pointer) on failure. The errno is set accordingly on
@@ -99,8 +100,6 @@ class Transport {
         return *reinterpret_cast<BatchDesc *>(id);
     }
 
-    // Slice must be allocated on heap, as it will delete self on markSuccess
-    // or markFailed.
     struct Slice {
         enum SliceStatus { PENDING, POSTED, SUCCESS, TIMEOUT, FAILED };
 
@@ -124,6 +123,7 @@ class Transport {
                 volatile int *qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
+                RdmaEndPoint *endpoint;
             } rdma;
             struct {
                 void *dest_addr;

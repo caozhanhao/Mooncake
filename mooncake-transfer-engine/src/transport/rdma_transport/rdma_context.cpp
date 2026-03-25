@@ -365,6 +365,10 @@ int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
     return endpoint_store_->deleteEndpoint(peer_nic_path);
 }
 
+void RdmaContext::addProcessedSliceCount(uint64_t count) {
+    if (worker_pool_) worker_pool_->addProcessedSliceCount(count);
+}
+
 size_t RdmaContext::getTotalQPNumber() const {
     return endpoint_store_->getTotalQPNumber();
 }
