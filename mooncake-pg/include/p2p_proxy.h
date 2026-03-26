@@ -65,7 +65,7 @@ class P2PProxy {
         int rank = 0;
         int size = 0;
         int cuda_device_index = -1;
-        std::string location;
+        std::string gpu_location;
     };
 
     struct SendOp {
@@ -231,7 +231,7 @@ class P2PProxy {
     int rank_ = 0;
     int size_ = 0;
     int cuda_device_index_ = -1;
-    std::string location_;
+    std::string gpu_location_;
     P2PResources resources_;
 
     std::queue<SendOpContext> send_queue_;

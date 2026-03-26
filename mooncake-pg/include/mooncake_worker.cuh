@@ -18,6 +18,7 @@ namespace mooncake {
 
 static constexpr size_t kBufferSize = 1u << 24;
 static constexpr size_t kMaxNumRanks = 64;
+static constexpr uint32_t kCompletionReadyValue = 1u;
 
 struct SegmentInfo {
     uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2],
@@ -46,6 +47,7 @@ struct TransferGroupMeta {
 
 __global__ struct Task {
     volatile bool active = false;
+    uint32_t completion = 0;
     c10d::OpType opType = c10d::OpType::UNKNOWN;
     size_t tensorSize;  // In bytes
     int64_t broadcastRoot;

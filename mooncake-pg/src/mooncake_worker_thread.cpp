@@ -262,6 +262,9 @@ void MooncakeWorker::startWorker() {
                             signal_ptr[j] = 0;
                         }
                         task_status[i].store(DONE, std::memory_order_release);
+                        __atomic_store_n(&task.completion,
+                                         kCompletionReadyValue,
+                                         __ATOMIC_RELEASE);
                         task.active = false;
                         if (hasCallback_[i]) {
                             // Move the callback to release the captured values

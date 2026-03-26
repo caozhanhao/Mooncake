@@ -1,6 +1,8 @@
+#include <cuda.h>
 #include <mooncake_backend.h>
 #include <memory>
 #include <mooncake_worker.cuh>
+#include <mutex>
 
 namespace mooncake {
 
@@ -44,9 +46,7 @@ class MooncakeWorkCuda : public ::c10d::Work {
 
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
-                                  void* meta, Task* tasks, int numRanks,
-                                  const bool* activeRanks,
-                                  int* activeRanksTensor, size_t taskId) {
+                                  void* meta, Task* tasks, size_t taskId) {
     // Copy task into slot
     tasks[taskId].opType = opType;
     tasks[taskId].tensorSize = tensorSize;
@@ -55,14 +55,15 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
     tasks[taskId].transferGroupMeta = meta;
 
     // Mark active
-    __threadfence();  // Ensure writes visible to host
+    tasks[taskId].completion = 0;
+    __threadfence_system();  // Ensure writes visible to host
     tasks[taskId].active = true;
+}
 
-    // Spin-wait until CPU proxy sets DONE
-    while (tasks[taskId].active) {
-        __threadfence();
-    }
-    for (int i = 0; i < numRanks; ++i) {
+__global__ void syncActiveRanksKernel(const bool* activeRanks,
+                                      int* activeRanksTensor, int numRanks) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < numRanks) {
         activeRanksTensor[i] = activeRanks[i] ? 1 : 0;
     }
 }
@@ -284,6 +285,7 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
     }
     for (size_t i = 0; i < kNumTasks_; ++i) {
         tasks_[i].active = false;
+        tasks_[i].completion = 0;
     }
 }
 
@@ -377,6 +379,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     //  Alternately use even-odd items to maintain tasks
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
 
+    static std::once_flag cu_init_once;
+    std::call_once(cu_init_once, []() {
+        auto res = cuInit(0);
+        TORCH_CHECK(res == CUDA_SUCCESS,
+                    "cuInit failed for cuStreamWaitValue32");
+    });
+
     for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
         size_t realSize = min(tensorSize, pos + chunkSize) - pos;
         int taskId = cudaTaskCount % 2 + 2;
@@ -386,10 +395,24 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             pos, realSize);
 
         hasCallback_[taskId] = false;
-        enqueueTaskKernel<<<1, 1, 0, stream>>>(
-            opType, realSize, broadcastRoot, bufferOffset, meta.get(),
-            tasks_device_, meta->size, meta->activeRanksDevice,
-            meta->activeRanksTensor.data_ptr<int>(), taskId);
+        enqueueTaskKernel<<<1, 1, 0, stream>>>(opType, realSize, broadcastRoot,
+                                               bufferOffset, meta.get(),
+                                               tasks_device_, taskId);
+
+        auto completion_ptr =
+            reinterpret_cast<CUdeviceptr>(&tasks_device_[taskId].completion);
+        auto wait_res =
+            cuStreamWaitValue32((CUstream)stream.stream(), completion_ptr,
+                                kCompletionReadyValue, CU_STREAM_WAIT_VALUE_EQ);
+        TORCH_CHECK(wait_res == CUDA_SUCCESS,
+                    "cuStreamWaitValue32 failed in Mooncake CUDA worker");
+
+        int threads = 128;
+        int blocks = (meta->size + threads - 1) / threads;
+        syncActiveRanksKernel<<<blocks, threads, 0, stream>>>(
+            meta->activeRanksDevice, meta->activeRanksTensor.data_ptr<int>(),
+            meta->size);
+
         bufferToTensor(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
             pos, realSize);

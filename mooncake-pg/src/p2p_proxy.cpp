@@ -42,7 +42,7 @@ P2PProxy::P2PProxy(TransferEngine* engine, const Options& options)
       rank_(options.rank),
       size_(options.size),
       cuda_device_index_(options.cuda_device_index),
-      location_(options.location) {
+      gpu_location_(options.gpu_location) {
     if (!is_cpu_ && cuda_device_index_ < 0) {
         int current_device = -1;
         const cudaError_t get_device_error = cudaGetDevice(&current_device);
@@ -84,15 +84,15 @@ void P2PProxy::AllocateResources() {
         resources_.send_buffer_ = std::malloc(p2p_total_buffer_size);
         TORCH_CHECK(resources_.send_buffer_ != nullptr,
                     "Failed to allocate CPU P2P send buffer");
-        int rc = engine_->registerLocalMemory(resources_.send_buffer_,
-                                              p2p_total_buffer_size, location_);
+        int rc = engine_->registerLocalMemory(
+            resources_.send_buffer_, p2p_total_buffer_size, kWildcardLocation);
         TORCH_CHECK(rc == 0, "Failed to register CPU P2P send buffer");
 
         resources_.recv_buffer_ = std::malloc(p2p_total_buffer_size);
         TORCH_CHECK(resources_.recv_buffer_ != nullptr,
                     "Failed to allocate CPU P2P recv buffer");
-        rc = engine_->registerLocalMemory(resources_.recv_buffer_,
-                                          p2p_total_buffer_size, location_);
+        rc = engine_->registerLocalMemory(
+            resources_.recv_buffer_, p2p_total_buffer_size, kWildcardLocation);
         TORCH_CHECK(rc == 0, "Failed to register CPU P2P recv buffer");
     } else {
         SetCudaDeviceIfNeeded(
@@ -102,15 +102,15 @@ void P2PProxy::AllocateResources() {
             cudaMalloc(&resources_.send_buffer_, p2p_total_buffer_size);
         TORCH_CHECK(err == cudaSuccess,
                     "Failed to allocate CUDA P2P send buffer");
-        int rc = engine_->registerLocalMemory(resources_.send_buffer_,
-                                              p2p_total_buffer_size, location_);
+        int rc = engine_->registerLocalMemory(
+            resources_.send_buffer_, p2p_total_buffer_size, gpu_location_);
         TORCH_CHECK(rc == 0, "Failed to register CUDA P2P send buffer");
 
         err = cudaMalloc(&resources_.recv_buffer_, p2p_total_buffer_size);
         TORCH_CHECK(err == cudaSuccess,
                     "Failed to allocate CUDA P2P recv buffer");
         rc = engine_->registerLocalMemory(resources_.recv_buffer_,
-                                          p2p_total_buffer_size, location_);
+                                          p2p_total_buffer_size, gpu_location_);
         TORCH_CHECK(rc == 0, "Failed to register CUDA P2P recv buffer");
     }
 
