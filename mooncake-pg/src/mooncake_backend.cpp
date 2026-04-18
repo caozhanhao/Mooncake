@@ -88,6 +88,50 @@ class MooncakeP2PWork : public ::c10d::Work {
     std::shared_ptr<std::atomic<bool>> completed_;
 };
 
+// Aggregated Work for coalesced P2P operations.
+class MooncakeCoalescedWork : public ::c10d::Work {
+   public:
+    explicit MooncakeCoalescedWork(
+        std::vector<std::shared_ptr<std::atomic<bool>>> completions)
+        : Work(-1, c10d::OpType::UNKNOWN), completions_(std::move(completions)) {}
+
+    bool isCompleted() override {
+        for (auto& c : completions_) {
+            if (!c->load(std::memory_order_acquire)) return false;
+        }
+        return true;
+    }
+
+    bool wait(std::chrono::milliseconds timeout) override {
+        if (timeout.count() > 0) {
+            auto deadline = std::chrono::steady_clock::now() + timeout;
+            for (auto& c : completions_) {
+                BackoffWaiter waiter(
+                    BackoffWaiterConfig::sleepOnly(
+                        std::chrono::microseconds(1),
+                        std::chrono::microseconds(10)));
+                bool ok = waiter.wait_for(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now()),
+                    [&c] { return c->load(std::memory_order_acquire); });
+                if (!ok) return false;
+            }
+            return true;
+        }
+        for (auto& c : completions_) {
+            BackoffWaiter waiter(
+                BackoffWaiterConfig::sleepOnly(
+                    std::chrono::microseconds(1),
+                    std::chrono::microseconds(10)));
+            waiter.wait([&c] { return c->load(std::memory_order_acquire); });
+        }
+        return true;
+    }
+
+   private:
+    std::vector<std::shared_ptr<std::atomic<bool>>> completions_;
+};
+
 /**
  * @brief Initialize Mooncake backend state from the PyTorch process-group
  * information and optional Mooncake-specific options.
@@ -302,6 +346,21 @@ MooncakeBackend::~MooncakeBackend() { shutdown(); }
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 
+void MooncakeBackend::startCoalescing() {
+    std::lock_guard<std::mutex> lock(coalescingMutex_);
+    isCoalescing_ = true;
+    coalescingCompletions_.clear();
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::endCoalescing() {
+    std::lock_guard<std::mutex> lock(coalescingMutex_);
+    isCoalescing_ = false;
+    auto work = c10::make_intrusive<MooncakeCoalescedWork>(
+        std::move(coalescingCompletions_));
+    coalescingCompletions_.clear();
+    return work;
+}
+
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     std::vector<at::Tensor>& tensors, int dstRank, int tag) {
     connection_ctx_->waitUntilNewRanksConnected();
@@ -331,6 +390,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
         .completed_ = completed,
     });
 
+    {
+        std::lock_guard<std::mutex> lock(coalescingMutex_);
+        if (isCoalescing_) {
+            coalescingCompletions_.push_back(completed);
+            return nullptr;
+        }
+    }
     return c10::make_intrusive<MooncakeP2PWork>(completed);
 }
 
@@ -364,6 +430,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
         .completed_ = completed,
     });
 
+    {
+        std::lock_guard<std::mutex> lock(coalescingMutex_);
+        if (isCoalescing_) {
+            coalescingCompletions_.push_back(completed);
+            return nullptr;
+        }
+    }
     return c10::make_intrusive<MooncakeP2PWork>(completed);
 }
 

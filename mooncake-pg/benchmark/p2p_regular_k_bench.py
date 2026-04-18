@@ -9,6 +9,7 @@ from typing import List, Tuple
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.cuda.nvtx as nvtx
 
 from pgbench_utils import (
     configure_mooncake_device_filter,
@@ -102,16 +103,27 @@ def _run_iteration(
     recv_tensors: List[torch.Tensor],
     send_peers: List[int],
     recv_peers: List[int],
-) -> None:
+    print_log = False
+):
     ops: List[dist.P2POp] = []
     for index, src_rank in enumerate(recv_peers):
         ops.append(dist.P2POp(dist.irecv, recv_tensors[index], src_rank))
     for dst_rank in send_peers:
         ops.append(dist.P2POp(dist.isend, send_tensor, dst_rank))
 
+    # if print_log:
+    #    print(f"iteration has {len(recv_tensors)} recv and {len(send_peers)} send")
+
     requests = dist.batch_isend_irecv(ops)
-    for request in requests:
+
+    submitted = time.perf_counter()
+
+    for i, request in enumerate(requests):
         request.wait()
+
+    waitted = time.perf_counter()
+
+    return submitted, waitted
 
 
 def _count_wrong(actual: torch.Tensor, expected: torch.Tensor) -> int:
@@ -179,15 +191,28 @@ def _run_worker(local_rank: int, args: argparse.Namespace) -> None:
 
     _sync_ranks(device)
 
+    torch.cuda.profiler.start()
+
     iter_latencies = torch.empty(args.iters, device=device, dtype=torch.float64)
+    iter_latencies_sub = torch.empty(args.iters, device=device, dtype=torch.float64)
+    iter_latencies_waitted = torch.empty(args.iters, device=device, dtype=torch.float64)
     for index in range(args.iters):
+        nvtx.range_push(f"iter_{index}")
         _sync_device_if_needed(device, args.report_cputime)
         t0 = time.perf_counter()
-        _run_iteration(send_tensor, recv_tensors, send_peers, recv_peers)
+        submitted, waited = _run_iteration(send_tensor, recv_tensors, send_peers, recv_peers, rank == 0)
         _sync_device_if_needed(device, args.report_cputime)
         iter_latencies[index] = time.perf_counter() - t0
+        iter_latencies_sub[index] = submitted - t0
+        iter_latencies_waitted[index] = waited - t0
+        nvtx.range_pop()
 
     dist.all_reduce(iter_latencies, op=dist.ReduceOp.MAX)
+    dist.all_reduce(iter_latencies_sub, op=dist.ReduceOp.MAX)
+    dist.all_reduce(iter_latencies_waitted, op=dist.ReduceOp.MAX)
+    if rank == 0:
+        for (i, (lat1, lat2, lat3)) in enumerate(zip(iter_latencies, iter_latencies_sub, iter_latencies_waitted)):
+            print(f"iter_{i} latency, synced={lat1.mul(1e6)}us, submitted={lat2.mul(1e6)}us, waitted={lat3.mul(1e6)}us")
 
     wrong = 0
     if args.check > 0:
@@ -253,6 +278,9 @@ def _run_worker(local_rank: int, args: argparse.Namespace) -> None:
         )
 
     _sync_ranks(device)
+
+    torch.cuda.profiler.stop()
+
     dist.destroy_process_group()
 
 

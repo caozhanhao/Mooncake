@@ -3,6 +3,7 @@
 #include <p2p_proxy.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include <nvtx3/nvToolsExt.h>
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
@@ -146,6 +147,11 @@ void P2PProxy::AllocateResources() {
 
     if (!is_cpu_) {
         for (int peer_rank = 0; peer_rank < size_; ++peer_rank) {
+            send_peer_lanes_[peer_rank].copy_stream_.emplace(
+                at::cuda::getStreamFromPool(false, cuda_device_index_));
+            recv_peer_lanes_[peer_rank].copy_stream_.emplace(
+                at::cuda::getStreamFromPool(true, cuda_device_index_));
+
             for (auto& copy_ready_event :
                  send_peer_lanes_[peer_rank].copy_ready_events_) {
                 if (copy_ready_event != nullptr) {
@@ -338,6 +344,8 @@ P2PProxy::SendOpContext::SendOpContext(SendOp&& op_in)
       completed_(std::move(op_in.completed_)) {
     total_bytes_ =
         tensor_.numel() * static_cast<uint64_t>(tensor_.element_size());
+    std::string msg = "send_peer_" + std::to_string(peer_rank_);
+    nvtx_range = NvtxRangeHandle(nvtxRangeStartA(msg.c_str()));
 }
 
 P2PProxy::RecvTransferTask::RecvTransferTask(uint64_t chunk_offset_in,
@@ -356,6 +364,8 @@ P2PProxy::RecvOpContext::RecvOpContext(RecvOp&& op_in)
       completed_(std::move(op_in.completed_)) {
     total_bytes_ =
         tensor_.numel() * static_cast<uint64_t>(tensor_.element_size());
+    std::string msg = "recv_peer_" + std::to_string(peer_rank_);
+    nvtx_range = NvtxRangeHandle(nvtxRangeStartA(msg.c_str()));
 }
 
 uint64_t P2PProxy::GetLocalSendSlotAddress(int peer_rank,
@@ -428,7 +438,7 @@ bool P2PProxy::TryIssueSendTask(SendOpContext& op_ctx, uint32_t capacity) {
     } else {
         cudaError_t copy_error = cudaMemcpyAsync(
             task.source_, tensor_ptr + task.chunk_offset_, task.chunk_bytes_,
-            cudaMemcpyDeviceToDevice, op_ctx.cuda_stream_);
+            cudaMemcpyDeviceToDevice, lane.copy_stream_->stream());
         TORCH_CHECK(!copy_error, "P2P send cudaMemcpyAsync failed: ",
                     cudaGetErrorString(copy_error));
         const cudaEvent_t pooled_copy_ready_event =
@@ -437,7 +447,7 @@ bool P2PProxy::TryIssueSendTask(SendOpContext& op_ctx, uint32_t capacity) {
                     "P2P send pooled copy-ready event is not initialized.");
         task.copy_ready_event_ = pooled_copy_ready_event;
         copy_error =
-            cudaEventRecord(task.copy_ready_event_, op_ctx.cuda_stream_);
+            cudaEventRecord(task.copy_ready_event_, lane.copy_stream_->stream());
         if (copy_error != cudaSuccess) {
             task.copy_ready_event_ = nullptr;
             TORCH_CHECK(false, "P2P send cudaEventRecord failed: ",
@@ -526,24 +536,23 @@ bool P2PProxy::StepSendTransfer(SendOpContext& op_ctx, SendTransferTask& task) {
 
 bool P2PProxy::StepSendHeadCommit(SendOpContext& op_ctx, uint32_t capacity) {
     bool did_work = false;
-    if (op_ctx.head_update_batch_id_.has_value()) {
+
+    while (!op_ctx.head_update_batch_ids_.empty()) {
         TransferStatus head_status;
-        engine_->getTransferStatus(op_ctx.head_update_batch_id_.value(), 0,
+        engine_->getTransferStatus(op_ctx.head_update_batch_ids_.front(), 0,
                                    head_status);
         if (head_status.s == TransferStatusEnum::COMPLETED) {
-            engine_->freeBatchID(op_ctx.head_update_batch_id_.value());
-            op_ctx.head_update_batch_id_.reset();
+            engine_->freeBatchID(op_ctx.head_update_batch_ids_.front());
+            op_ctx.head_update_batch_ids_.pop_front();
             did_work = true;
         } else if (head_status.s == TransferStatusEnum::FAILED) {
-            engine_->freeBatchID(op_ctx.head_update_batch_id_.value());
-            op_ctx.head_update_batch_id_.reset();
+            engine_->freeBatchID(op_ctx.head_update_batch_ids_.front());
+            op_ctx.head_update_batch_ids_.pop_front();
             TORCH_CHECK(false, "P2P ctrl head update failed.");
             return false;
+        } else {
+            break;
         }
-    }
-
-    if (op_ctx.head_update_batch_id_.has_value()) {
-        return did_work;
     }
 
     uint32_t committed_tasks = 0;
@@ -578,7 +587,7 @@ bool P2PProxy::StepSendHeadCommit(SendOpContext& op_ctx, uint32_t capacity) {
                       .target_offset = remote_head_offset,
                       .length = sizeof(uint32_t),
                   }});
-    op_ctx.head_update_batch_id_ = batch_id;
+    op_ctx.head_update_batch_ids_.push_back(batch_id);
     did_work = true;
 
     return did_work;
@@ -590,7 +599,7 @@ bool P2PProxy::IsSendDataPathCompleted(const SendOpContext& op_ctx) const {
 
 bool P2PProxy::IsSendOpCompleted(const SendOpContext& op_ctx) const {
     return IsSendDataPathCompleted(op_ctx) &&
-           !op_ctx.head_update_batch_id_.has_value();
+           op_ctx.head_update_batch_ids_.empty();
 }
 
 bool P2PProxy::TryIssueRecvTask(RecvOpContext& op_ctx, uint32_t capacity) {
@@ -624,16 +633,17 @@ bool P2PProxy::TryIssueRecvTask(RecvOpContext& op_ctx, uint32_t capacity) {
     } else {
         cudaError_t copy_error =
             cudaMemcpyAsync(task.target_, task.source_, task.chunk_bytes_,
-                            cudaMemcpyDeviceToDevice, op_ctx.cuda_stream_);
+                            cudaMemcpyDeviceToDevice, lane.copy_stream_->stream());
         TORCH_CHECK(!copy_error, "P2P recv cudaMemcpyAsync failed: ",
                     cudaGetErrorString(copy_error));
+        nvtxMarkA("p2p_recv_issue_copy");
         const cudaEvent_t pooled_copy_ready_event =
             lane.copy_ready_events_[slot_index];
         TORCH_CHECK(pooled_copy_ready_event != nullptr,
                     "P2P recv pooled copy-ready event is not initialized.");
         task.copy_ready_event_ = pooled_copy_ready_event;
         copy_error =
-            cudaEventRecord(task.copy_ready_event_, op_ctx.cuda_stream_);
+            cudaEventRecord(task.copy_ready_event_, lane.copy_stream_->stream());
         if (copy_error != cudaSuccess) {
             task.copy_ready_event_ = nullptr;
             TORCH_CHECK(false, "P2P recv cudaEventRecord failed: ",
@@ -658,6 +668,7 @@ bool P2PProxy::StepRecvTransferTask(RecvTransferTask& task) {
 
 bool P2PProxy::StepRecvDataCopy(RecvTransferTask& task) {
     if (task.copy_ready_event_ == nullptr) {
+        nvtxMarkA("p2p_recv_copy_done");
         task.state_ = TransferState::kDone;
         return true;
     }
@@ -666,6 +677,7 @@ bool P2PProxy::StepRecvDataCopy(RecvTransferTask& task) {
     query_error = cudaEventQuery(task.copy_ready_event_);
 
     if (query_error == cudaSuccess) {
+        nvtxMarkA("p2p_recv_copy_done");
         task.copy_ready_event_ = nullptr;
         task.state_ = TransferState::kDone;
         return true;
@@ -682,24 +694,23 @@ bool P2PProxy::StepRecvDataCopy(RecvTransferTask& task) {
 
 bool P2PProxy::StepRecvTailCommit(RecvOpContext& op_ctx, uint32_t capacity) {
     bool did_work = false;
-    if (op_ctx.tail_update_batch_id_.has_value()) {
+
+    while (!op_ctx.tail_update_batch_ids_.empty()) {
         TransferStatus tail_status;
-        engine_->getTransferStatus(op_ctx.tail_update_batch_id_.value(), 0,
+        engine_->getTransferStatus(op_ctx.tail_update_batch_ids_.front(), 0,
                                    tail_status);
         if (tail_status.s == TransferStatusEnum::COMPLETED) {
-            engine_->freeBatchID(op_ctx.tail_update_batch_id_.value());
-            op_ctx.tail_update_batch_id_.reset();
+            engine_->freeBatchID(op_ctx.tail_update_batch_ids_.front());
+            op_ctx.tail_update_batch_ids_.pop_front();
             did_work = true;
         } else if (tail_status.s == TransferStatusEnum::FAILED) {
-            engine_->freeBatchID(op_ctx.tail_update_batch_id_.value());
-            op_ctx.tail_update_batch_id_.reset();
+            engine_->freeBatchID(op_ctx.tail_update_batch_ids_.front());
+            op_ctx.tail_update_batch_ids_.pop_front();
             TORCH_CHECK(false, "P2P ctrl tail update failed.");
             return false;
+        } else {
+            break;
         }
-    }
-
-    if (op_ctx.tail_update_batch_id_.has_value()) {
-        return did_work;
     }
 
     uint32_t committed_tasks = 0;
@@ -733,7 +744,7 @@ bool P2PProxy::StepRecvTailCommit(RecvOpContext& op_ctx, uint32_t capacity) {
                       .target_offset = remote_tail_offset,
                       .length = sizeof(uint32_t),
                   }});
-    op_ctx.tail_update_batch_id_ = batch_id;
+    op_ctx.tail_update_batch_ids_.push_back(batch_id);
     did_work = true;
 
     return did_work;
@@ -741,7 +752,7 @@ bool P2PProxy::StepRecvTailCommit(RecvOpContext& op_ctx, uint32_t capacity) {
 
 bool P2PProxy::IsRecvDataPathCompleted(const RecvOpContext& op_ctx) const {
     return op_ctx.bytes_issued_ == op_ctx.total_bytes_ &&
-           op_ctx.tasks_.empty() && !op_ctx.tail_update_batch_id_.has_value();
+           op_ctx.tasks_.empty() && op_ctx.tail_update_batch_ids_.empty();
 }
 
 bool P2PProxy::StepSend() {
@@ -790,21 +801,68 @@ bool P2PProxy::StepSend() {
         if (!lane.active_send_op_.has_value()) {
             continue;
         }
+        std::string lane_range = "send_lane_" + std::to_string(peer_rank);
         auto& op_ctx = lane.active_send_op_.value();
+        bool lane_did_work = false;
         while (TryIssueSendTask(op_ctx, capacity)) {
-            did_work = true;
+            lane_did_work = true;
         }
         for (auto& task : op_ctx.tasks_) {
             if (task.state_ == TransferState::kDone) {
                 continue;
             }
             if (StepSendTransferTask(op_ctx, task)) {
-                did_work = true;
+                lane_did_work = true;
             }
         }
         if (StepSendHeadCommit(op_ctx, capacity)) {
-            did_work = true;
+            lane_did_work = true;
         }
+
+        // Report stall state at most once per stall episode.
+        if (!lane_did_work) {
+            if (op_ctx.bytes_issued_ < op_ctx.total_bytes_) {
+                if (!op_ctx.nvtx_wait_slot_reported) {
+                    std::string msg = lane_range + ":wait_slot";
+                    nvtxMarkA(msg.c_str());
+                    op_ctx.nvtx_wait_slot_reported = true;
+                }
+            } else if (!op_ctx.tasks_.empty()) {
+                bool has_pending_copy = false;
+                bool has_pending_transfer = false;
+                for (auto& task : op_ctx.tasks_) {
+                    if (task.state_ == TransferState::kDataCopy) {
+                        has_pending_copy = true;
+                        break;
+                    } else if (task.state_ == TransferState::kTransfer) {
+                        has_pending_transfer = true;
+                        break;
+                    }
+                }
+                if (has_pending_copy && !op_ctx.nvtx_wait_copy_reported) {
+                    std::string msg = lane_range + ":wait_copy";
+                    nvtxMarkA(msg.c_str());
+                    op_ctx.nvtx_wait_copy_reported = true;
+                } else if (has_pending_transfer &&
+                           !op_ctx.nvtx_wait_transfer_reported) {
+                    std::string msg = lane_range + ":wait_transfer";
+                    nvtxMarkA(msg.c_str());
+                    op_ctx.nvtx_wait_transfer_reported = true;
+                }
+            } else if (!op_ctx.head_update_batch_ids_.empty() &&
+                       !op_ctx.nvtx_wait_head_commit_reported) {
+                std::string msg = lane_range + ":wait_head_commit";
+                nvtxMarkA(msg.c_str());
+                op_ctx.nvtx_wait_head_commit_reported = true;
+            }
+        } else {
+            op_ctx.nvtx_wait_slot_reported = false;
+            op_ctx.nvtx_wait_copy_reported = false;
+            op_ctx.nvtx_wait_transfer_reported = false;
+            op_ctx.nvtx_wait_head_commit_reported = false;
+        }
+        did_work |= lane_did_work;
+
         if (IsSendOpCompleted(op_ctx)) {
             op_ctx.completed_->store(true, std::memory_order_release);
             lane.active_send_op_.reset();
@@ -859,21 +917,52 @@ bool P2PProxy::StepRecv() {
         if (!lane.active_recv_op_.has_value()) {
             continue;
         }
+        std::string lane_range = "recv_lane_" + std::to_string(peer_rank);
         auto& op_ctx = lane.active_recv_op_.value();
+        bool lane_did_work = false;
         while (TryIssueRecvTask(op_ctx, capacity)) {
-            did_work = true;
+            lane_did_work = true;
         }
         for (auto& task : op_ctx.tasks_) {
             if (task.state_ == TransferState::kDone) {
                 continue;
             }
             if (StepRecvTransferTask(task)) {
-                did_work = true;
+                lane_did_work = true;
             }
         }
         if (StepRecvTailCommit(op_ctx, capacity)) {
-            did_work = true;
+            lane_did_work = true;
         }
+
+        // Report stall state at most once per stall episode.
+        if (!lane_did_work) {
+            if (op_ctx.bytes_issued_ < op_ctx.total_bytes_) {
+                if (!op_ctx.nvtx_wait_head_reported) {
+                    std::string msg = lane_range + ":wait_head";
+                    nvtxMarkA(msg.c_str());
+                    op_ctx.nvtx_wait_head_reported = true;
+                }
+            } else if (!op_ctx.tasks_.empty()) {
+                bool has_pending_copy = false;
+                for (auto& task : op_ctx.tasks_) {
+                    if (task.state_ == TransferState::kDataCopy) {
+                        has_pending_copy = true;
+                        break;
+                    }
+                }
+                if (has_pending_copy && !op_ctx.nvtx_wait_copy_reported) {
+                    std::string msg = lane_range + ":wait_copy";
+                    nvtxMarkA(msg.c_str());
+                    op_ctx.nvtx_wait_copy_reported = true;
+                }
+            }
+        } else {
+            op_ctx.nvtx_wait_head_reported = false;
+            op_ctx.nvtx_wait_copy_reported = false;
+        }
+        did_work |= lane_did_work;
+
         if (IsRecvDataPathCompleted(op_ctx)) {
             if (!op_ctx.original_tensor_.is_contiguous()) {
                 op_ctx.original_tensor_.copy_(op_ctx.tensor_);

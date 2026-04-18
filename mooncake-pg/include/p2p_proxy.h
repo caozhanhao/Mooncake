@@ -15,8 +15,36 @@
 #include <queue>
 #include <thread>
 #include <unordered_map>
+#include <nvtx3/nvToolsExt.h>
 
 namespace mooncake {
+
+// RAII wrapper for nvtxRangeStartA / nvtxRangeEnd. Movable, not copyable.
+struct NvtxRangeHandle {
+    nvtxRangeId_t id = 0;
+    NvtxRangeHandle() = default;
+    explicit NvtxRangeHandle(nvtxRangeId_t id) : id(id) {}
+    NvtxRangeHandle(NvtxRangeHandle&& other) noexcept : id(other.id) {
+        other.id = 0;
+    }
+    NvtxRangeHandle& operator=(NvtxRangeHandle&& other) noexcept {
+        if (this != &other) {
+            end();
+            id = other.id;
+            other.id = 0;
+        }
+        return *this;
+    }
+    ~NvtxRangeHandle() { end(); }
+    void end() {
+        if (id) {
+            nvtxRangeEnd(id);
+            id = 0;
+        }
+    }
+    NvtxRangeHandle(const NvtxRangeHandle&) = delete;
+    NvtxRangeHandle& operator=(const NvtxRangeHandle&) = delete;
+};
 
 inline constexpr size_t kP2PBufferSize = 1u << 24;
 inline constexpr size_t kP2PNumSlots = 8;
@@ -151,6 +179,8 @@ class P2PProxy {
     struct SendOpContext {
         SendOpContext() = default;
         SendOpContext(SendOp&& op_in);
+        SendOpContext(SendOpContext&&) = default;
+        SendOpContext& operator=(SendOpContext&&) = default;
 
         at::Tensor tensor_;
         int peer_rank_ = -1;
@@ -158,8 +188,15 @@ class P2PProxy {
         std::shared_ptr<std::atomic<bool>> completed_;
         uint64_t total_bytes_ = 0;
         uint64_t bytes_issued_ = 0;
-        std::optional<BatchID> head_update_batch_id_;
+        std::deque<BatchID> head_update_batch_ids_;
         std::deque<SendTransferTask> tasks_;
+
+        // NVTX stall-state tracking
+        bool nvtx_wait_slot_reported = false;
+        bool nvtx_wait_copy_reported = false;
+        bool nvtx_wait_transfer_reported = false;
+        bool nvtx_wait_head_commit_reported = false;
+        NvtxRangeHandle nvtx_range;
     };
 
     struct RecvTransferTask {
@@ -178,6 +215,8 @@ class P2PProxy {
     struct RecvOpContext {
         RecvOpContext() = default;
         RecvOpContext(RecvOp&& op_in);
+        RecvOpContext(RecvOpContext&&) = default;
+        RecvOpContext& operator=(RecvOpContext&&) = default;
 
         at::Tensor tensor_;
         at::Tensor original_tensor_;
@@ -186,8 +225,13 @@ class P2PProxy {
         std::shared_ptr<std::atomic<bool>> completed_;
         uint64_t total_bytes_ = 0;
         uint64_t bytes_issued_ = 0;
-        std::optional<BatchID> tail_update_batch_id_;
+        std::deque<BatchID> tail_update_batch_ids_;
         std::deque<RecvTransferTask> tasks_;
+
+        // NVTX stall-state tracking: report each stall only once per stall episode.
+        bool nvtx_wait_head_reported = false;
+        bool nvtx_wait_copy_reported = false;
+        NvtxRangeHandle nvtx_range;
     };
 
     struct SendPeerLane {
@@ -195,6 +239,7 @@ class P2PProxy {
         std::optional<SendOpContext> active_send_op_;
         uint32_t local_head_ = 0;
         std::array<cudaEvent_t, kP2PNumSlots> copy_ready_events_;
+        std::optional<at::cuda::CUDAStream> copy_stream_;
     };
 
     struct RecvPeerLane {
@@ -202,6 +247,7 @@ class P2PProxy {
         std::optional<RecvOpContext> active_recv_op_;
         uint32_t local_tail_ = 0;
         std::array<cudaEvent_t, kP2PNumSlots> copy_ready_events_;
+        std::optional<at::cuda::CUDAStream> copy_stream_;
     };
 
     // Resources are allocated and released by constructor/destructor
@@ -244,6 +290,8 @@ class P2PProxy {
         void* recv_buffer_ = nullptr;
         P2PControlSlot* ctrl_send_region_ = nullptr;
         P2PControlSlot* ctrl_recv_region_ = nullptr;
+        bool ctrl_send_is_shm_ = false;
+        bool ctrl_recv_is_shm_ = false;
     };
 
     P2PDeviceWorker* device_worker_ = nullptr;

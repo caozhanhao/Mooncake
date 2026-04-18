@@ -65,6 +65,11 @@ class MooncakeBackend final : public ::c10d::Backend {
             options_);
     }
 
+    bool supportsCoalescing() const override { return true; }
+
+    void startCoalescing() override;
+    c10::intrusive_ptr<c10d::Work> endCoalescing() override;
+
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.
     c10::intrusive_ptr<c10d::Work> send(std::vector<at::Tensor>& tensors,
@@ -206,6 +211,10 @@ class MooncakeBackend final : public ::c10d::Backend {
     // can live longer than MooncakeBackend.
     std::shared_ptr<ConnectionContext> connection_ctx_;
     bool connectionPollerRegistered_{false};
+
+    bool isCoalescing_{false};
+    std::vector<std::shared_ptr<std::atomic<bool>>> coalescingCompletions_;
+    std::mutex coalescingMutex_;
 };
 
 }  // namespace mooncake
