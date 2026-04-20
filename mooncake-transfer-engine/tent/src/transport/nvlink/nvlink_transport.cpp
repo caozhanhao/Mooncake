@@ -31,6 +31,18 @@
 #include "tent/common/utils/random.h"
 #include "tent/common/utils/string_builder.h"
 
+#ifndef TENT_NVLINK_USE_COPY_KERNEL
+static inline cudaError_t nvlinkMemcpyAsync(void* dst, const void* src, size_t n,
+                                            cudaMemcpyKind kind,
+                                            cudaStream_t stream) {
+    return cudaMemcpyAsync(dst, src, n, kind, stream);
+}
+#else
+extern "C" cudaError_t nvlinkMemcpyAsync(void* dst, const void* src, size_t n,
+                                           cudaMemcpyKind kind,
+                                           cudaStream_t stream);
+#endif  // TENT_NVLINK_USE_COPY_KERNEL
+
 namespace mooncake {
 namespace tent {
 
@@ -162,8 +174,8 @@ void NVLinkTransport::startTransfer(NVLinkTask* task, NVLinkSubBatch* batch) {
     }
 
     if (!is_async) {
-        err = cudaMemcpyAsync(dst, src, task->request.length, kind,
-                              batch->sync_stream.get());
+        err = nvlinkMemcpyAsync(dst, src, task->request.length, kind,
+                                batch->sync_stream.get());
         if (err != cudaSuccess) {
             task->status_word = TransferStatusEnum::FAILED;
             return;
@@ -180,8 +192,8 @@ void NVLinkTransport::startTransfer(NVLinkTask* task, NVLinkSubBatch* batch) {
         return;
     }
 
-    err = cudaMemcpyAsync(dst, src, task->request.length, kind,
-                          batch->async_stream.get());
+    err = nvlinkMemcpyAsync(dst, src, task->request.length, kind,
+                            batch->async_stream.get());
 
     if (err != cudaSuccess) task->status_word = TransferStatusEnum::FAILED;
 }
