@@ -27,6 +27,8 @@ constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 constexpr int kBarrierDummyTensorSize = 1;
 
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
+size_t MooncakeBackend::collectiveTimeoutUs_ = kDefaultCollectiveTimeoutUs;
+int64_t MooncakeBackend::p2pTimeoutUs_ = kDefaultP2PTimeoutUs;
 // leaky singleton to avoid destructor fiasco problem
 TransferEngine* MooncakeBackend::engine_ = new TransferEngine(true);
 // worker_ is now owned per backend instance via MooncakeWorkerManager.
@@ -267,12 +269,14 @@ MooncakeBackend::MooncakeBackend(
                      .rank = rank_,
                      .size = size_,
                      .cuda_device_index = cuda_device_index,
+                     .p2p_timeout_us = &p2pTimeoutUs_,
                  });
     p2p_device_worker_->registerProxy(p2p_proxy_);
 
     meta_ = std::make_shared<TransferGroupMeta>();
     meta_->autoDeactivateOnFailure =
         options_ ? options_->autoDeactivateOnFailure_ : true;
+    meta_->collectiveTimeoutUs = &collectiveTimeoutUs_;
     connection_ctx_ = std::make_shared<ConnectionContext>(
         backendIndex_, rank, size, options_ && options_->isExtension_,
         local2global_rank_map_, store, meta_, p2p_proxy_, engine_);

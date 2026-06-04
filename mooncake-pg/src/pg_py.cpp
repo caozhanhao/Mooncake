@@ -131,6 +131,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
+    m.def("set_collective_timeout_us", &MooncakeBackend::setCollectiveTimeoutUs,
+          py::arg("us"),
+          "Set the default peer-liveness probe timeout (microseconds) for "
+          "collective operations.");
+    m.def("set_p2p_timeout_us", &MooncakeBackend::setP2PTimeoutUs,
+          py::arg("us"),
+          "Set the default P2P transfer timeout (microseconds).");
     m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
     m.def("set_transfer_engine", &setTransferEnginePy, py::arg("engine"),
           "Set an external TransferEngine to be used by MooncakeBackend. "

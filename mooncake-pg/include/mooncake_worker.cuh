@@ -46,6 +46,7 @@ struct TransferGroupMeta {
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     SegmentInfo segmentInfos[kMaxNumRanks];
     bool autoDeactivateOnFailure = true;
+    const size_t* collectiveTimeoutUs = nullptr;
 };
 
 __global__ struct Task {
@@ -121,7 +122,6 @@ class MooncakeWorker {
 
     static constexpr size_t kNumTasks_ = 4;
 
-    static constexpr size_t kPingTimeoutMicroseconds_ = 100;
     static constexpr size_t kDrainTasksTimeoutMs = 5000;  // 5s
 
     bool running_ = false;

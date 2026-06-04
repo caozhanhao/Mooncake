@@ -57,6 +57,9 @@ class MooncakeP2PShim final : public ::c10d::Backend {
 
 class MooncakeBackend final : public ::c10d::ProcessGroup {
    public:
+    static constexpr size_t kDefaultCollectiveTimeoutUs = 100000;  // 100 ms
+    static constexpr int64_t kDefaultP2PTimeoutUs = 3000000;       // 3 s
+
     struct MooncakeBackendOptions final : torch::CustomClassHolder {
         explicit MooncakeBackendOptions(at::Tensor activeRanks)
             : activeRanks_{activeRanks} {}
@@ -92,8 +95,8 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         // failedRanks, while leaving the active rank unchanged so that the
         // caller can decide whether and how to handle the failure.
         //
-        // Note that the upper layer is responsible for maintaining active rank 
-        // consistency. Any automatic deactivation in PG is local to the current 
+        // Note that the upper layer is responsible for maintaining active rank
+        // consistency. Any automatic deactivation in PG is local to the current
         // rank only; no cross-rank synchronization is performed implicitly.
         bool autoDeactivateOnFailure_ = true;
     };
@@ -174,6 +177,9 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
+    static void setCollectiveTimeoutUs(size_t us) { collectiveTimeoutUs_ = us; }
+    static void setP2PTimeoutUs(int64_t us) { p2pTimeoutUs_ = us; }
+
     static void setDeviceFilter(std::vector<std::string> filters) {
         engine_->setWhitelistFilters(std::move(filters));
     }
@@ -252,6 +258,8 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     const c10::intrusive_ptr<MooncakeBackendOptions> options_;
     bool isCpu_{false};
     static std::string hostIp_;
+    static size_t collectiveTimeoutUs_;
+    static int64_t p2pTimeoutUs_;
     void* send_buffer_[2];
     void* recv_buffer_[2];
     int32_t* cpu_sync_send_region_[2];

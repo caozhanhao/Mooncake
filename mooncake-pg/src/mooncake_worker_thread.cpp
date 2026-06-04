@@ -192,7 +192,8 @@ void MooncakeWorker::startWorker() {
                             if (status.s != TransferStatusEnum::COMPLETED) {
                                 if (status.s == TransferStatusEnum::FAILED ||
                                     (j != group->rank &&
-                                     diff.count() > kPingTimeoutMicroseconds_ &&
+                                     diff.count() >
+                                         *group->collectiveTimeoutUs &&
                                      group->engine->probePeerAliveByID(
                                          group->segmentIDs[j]) !=
                                          PeerLiveness::Alive)) {
@@ -203,8 +204,9 @@ void MooncakeWorker::startWorker() {
                                         group->peerConnected[j] = false;
                                         group->activeRanks[j] = false;
                                         // Do NOT modify activeRanksTensor,
-                                        // It may be a CUDA tensor, and modifying 
-                                        // it may trigger unintended synchronization.
+                                        // It may be a CUDA tensor, and
+                                        // modifying it may trigger unintended
+                                        // synchronization.
 
                                         LOG(ERROR) << "Rank " << group->rank
                                                    << " marking peer " << j
@@ -287,7 +289,7 @@ void MooncakeWorker::startWorker() {
                             status.s != TransferStatusEnum::COMPLETED) {
                             if (status.s == TransferStatusEnum::FAILED ||
                                 (j != group->rank &&
-                                 diff.count() > kPingTimeoutMicroseconds_ &&
+                                 diff.count() > *group->collectiveTimeoutUs &&
                                  group->engine->probePeerAliveByID(
                                      group->segmentIDs[j]) !=
                                      PeerLiveness::Alive)) {
@@ -307,7 +309,7 @@ void MooncakeWorker::startWorker() {
                             }
                         }
                     }
-                    if (diff.count() > kPingTimeoutMicroseconds_) {
+                    if (diff.count() > *group->collectiveTimeoutUs) {
                         // reset timer
                         activeTime[i] = clock::now();
                     }

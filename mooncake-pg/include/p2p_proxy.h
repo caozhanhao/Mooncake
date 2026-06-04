@@ -281,7 +281,7 @@ class P2PProxy {
         int rank = 0;
         int size = 0;
         int cuda_device_index = -1;
-        std::chrono::milliseconds transfer_timeout_ms{30000};
+        const int64_t* p2p_timeout_us = nullptr;
     };
 
     struct SendOp {
@@ -545,7 +545,7 @@ class P2PProxy {
     template <typename T>
     bool isTimeout(const T& obj) const {
         return std::chrono::steady_clock::now() - obj.last_update_time_ >
-               transfer_timeout_ms_;
+               std::chrono::microseconds(*p2p_timeout_us_);
     }
 
    private:
@@ -565,7 +565,7 @@ class P2PProxy {
     int rank_ = 0;
     int size_ = 0;
     int cuda_device_index_ = -1;
-    std::chrono::milliseconds transfer_timeout_ms_{5000};  // 5s
+    const int64_t* p2p_timeout_us_ = nullptr;
     P2PResources resources_;
     bool resource_abandoned_{false};
 

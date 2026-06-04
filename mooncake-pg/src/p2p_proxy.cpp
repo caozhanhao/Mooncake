@@ -164,7 +164,7 @@ P2PProxy::P2PProxy(TransferEngine* engine, const Options& options)
       rank_(options.rank),
       size_(options.size),
       cuda_device_index_(options.cuda_device_index),
-      transfer_timeout_ms_(options.transfer_timeout_ms) {
+      p2p_timeout_us_(options.p2p_timeout_us) {
     if (!is_cpu_ && cuda_device_index_ < 0) {
         int current_device = -1;
         const cudaError_t get_device_error = cudaGetDevice(&current_device);
