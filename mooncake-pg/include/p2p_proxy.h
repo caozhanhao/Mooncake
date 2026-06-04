@@ -276,6 +276,8 @@ class P2PProxy {
 
     using OpStatus = MooncakeP2PWork::Status;
 
+    enum class IssueResult : uint8_t { kIssued, kNoCredit, kTimeout };
+
     struct Options {
         bool is_cpu = false;
         int rank = 0;
@@ -313,7 +315,6 @@ class P2PProxy {
     void enqueueRecv(RecvOp op);
 
     void resetPeerState(int peer_rank);
-    void reportFailedOp(int peer_rank, int* failed_ranks);
 
     /**
      * @brief Waits for all active P2P send and receive tasks to complete.
@@ -473,7 +474,7 @@ class P2PProxy {
     // to the peer to write data, and consumes AckSlots that the peer writes
     // back to acknowledge finished transfers.
     struct RecvPeerLane {
-        std::deque<RecvOp> pending_recv_ops_;
+        std::deque<RecvOpContext> pending_recv_ops_;
         std::optional<RecvOpContext> active_recv_op_;
         // Sequence number of the next CreditSlot to issue to this peer.
         uint64_t credit_issue_seq_ = 0;
@@ -503,7 +504,7 @@ class P2PProxy {
     bool isRecvOpCompleted(const RecvOpContext& op_ctx) const;
     void performRecvReset(int peer_rank);
 
-    bool tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane);
+    IssueResult tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane);
     bool stepSendTask(SendOpContext& op_ctx, SendTransferTask& task);
     bool stepSendCopyIn(SendTransferTask& task);
     bool stepSendWriteRemote(SendOpContext& op_ctx, SendTransferTask& task);
@@ -518,10 +519,14 @@ class P2PProxy {
     void releaseRecvTaskResources(RecvTransferTask& task) const;
     void resetSendLane(SendPeerLane& lane);
     void resetRecvLane(RecvPeerLane& lane);
-    void resetPeerControlLanes(int peer_rank);
-    // Clean up the active op on a lane (release tasks, mark kFailed).
+    void resetPeerCreditLanes(int peer_rank);
+    void resetPeerAckLanes(int peer_rank);
+    // Clean up the active op on a lane
     void cleanupFailedSendOp(SendOpContext& op_ctx);
     void cleanupFailedRecvOp(RecvOpContext& op_ctx);
+    // Clean up, mark kFailed, and report the failure
+    void handleFailedSendOp(SendOpContext& op_ctx);
+    void handleFailedRecvOp(RecvOpContext& op_ctx);
 
     // Control lane addressing.
     //
@@ -577,7 +582,7 @@ class P2PProxy {
     std::queue<SendOpContext> send_queue_;
     std::mutex send_queue_mutex_;
 
-    std::queue<RecvOp> recv_queue_;
+    std::queue<RecvOpContext> recv_queue_;
     std::mutex recv_queue_mutex_;
 
     std::array<std::atomic<bool>, kMaxNumRanks> reset_send_req_;
