@@ -274,7 +274,7 @@ class P2PProxy {
    public:
     friend class P2PDeviceWorker;
 
-    enum class OpStatus : uint8_t { kPending = 0, kSuccess = 1, kFailed = 2 };
+    using OpStatus = MooncakeP2PWork::Status;
 
     struct Options {
         bool is_cpu = false;
@@ -289,6 +289,7 @@ class P2PProxy {
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         std::shared_ptr<std::atomic<OpStatus>> status_;
+        int* failed_ranks_ = nullptr;
     };
 
     struct RecvOp {
@@ -297,6 +298,7 @@ class P2PProxy {
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         std::shared_ptr<std::atomic<OpStatus>> status_;
+        int* failed_ranks_ = nullptr;
     };
 
     P2PProxy(TransferEngine* engine, const Options& options);
@@ -311,6 +313,7 @@ class P2PProxy {
     void enqueueRecv(RecvOp op);
 
     void resetPeerState(int peer_rank);
+    void reportFailedOp(int peer_rank, int* failed_ranks);
 
     /**
      * @brief Waits for all active P2P send and receive tasks to complete.
@@ -405,6 +408,7 @@ class P2PProxy {
         // staging buffers.  When bytes_staged_ == total_bytes_ every chunk
         // has at least entered the Copy-In stage.
         uint64_t bytes_staged_ = 0;
+        int* failed_ranks_ = nullptr;
 
         std::chrono::steady_clock::time_point last_update_time_;
     };
@@ -447,6 +451,7 @@ class P2PProxy {
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         uint64_t total_bytes_ = 0;
+        int* failed_ranks_ = nullptr;
         // Number of bytes for which a RecvPool chunk has been reserved and a
         // CreditSlot has been sent to the peer.  When bytes_credited_ ==
         // total_bytes_ the entire tensor has been offered to the sender.
@@ -506,8 +511,6 @@ class P2PProxy {
     bool isSendOpCompleted(const SendOpContext& op_ctx) const;
     void performSendReset(int peer_rank);
 
-    void reportBrokenPeer(int peer_rank);
-
     // These helpers are used only during reset or shutdown.
     // In the normal execution path, task and lane resources are released
     // incrementally as work progresses.
@@ -516,6 +519,9 @@ class P2PProxy {
     void resetSendLane(SendPeerLane& lane);
     void resetRecvLane(RecvPeerLane& lane);
     void resetPeerControlLanes(int peer_rank);
+    // Clean up the active op on a lane (release tasks, mark kFailed).
+    void cleanupFailedSendOp(SendOpContext& op_ctx);
+    void cleanupFailedRecvOp(RecvOpContext& op_ctx);
 
     // Control lane addressing.
     //

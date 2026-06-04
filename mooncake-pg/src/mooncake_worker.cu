@@ -9,160 +9,13 @@
 
 namespace mooncake {
 
-class MooncakeWorkCpu : public ::c10d::Work {
-   public:
-    MooncakeWorkCpu(c10d::OpType opType,
-                    c10::intrusive_ptr<c10::ivalue::Future> future,
-                    std::shared_ptr<TransferGroupMeta> meta)
-        : Work(-1, opType),
-          future_(std::move(future)),
-          meta_(std::move(meta)) {}
-
-    bool isCompleted() override { return future_->completed(); }
-
-    bool wait(std::chrono::milliseconds timeout) override {
-        future_->wait();
-        return future_->completed() && !future_->hasError();
-    }
-
-   private:
-    c10::intrusive_ptr<c10::ivalue::Future> future_;
-    std::shared_ptr<TransferGroupMeta> meta_;
-};
-
-class MooncakeWorkCuda : public ::c10d::Work {
-   public:
-    MooncakeWorkCuda(c10d::OpType opType, std::shared_ptr<torch::Event> event,
-                     std::shared_ptr<TransferGroupMeta> meta,
-                     const MooncakeWorker* worker,
-                     std::vector<CudaTaskSubmissionToken> submitted_tasks)
-        : Work(-1, opType),
-          event_(std::move(event)),
-          meta_(std::move(meta)),
-          worker_(worker),
-          submitted_tasks_(std::move(submitted_tasks)) {}
-
-    bool isCompleted() override { return event_->query(); }
-
-    bool wait(std::chrono::milliseconds timeout) override {
-        // Wait until the task has been submitted to TransferEngine:
-        // This tries to ensure that the CUDA kernels required for the transfer
-        // have been launched by the time `waitUntilTasksSubmitted` returns.
-        //
-        // Why is this needed? PyTorch documentation implies that collective
-        // operations should be enqueued when `wait()` returns. In practice, we
-        // found that violating this causes hangs.
-        //
-        // Our current hypothesis for the hang is: PyTorch assumes the kernels
-        // needed for the transfer are already launched when `wait` returns
-        // true. It may then launch subsequent operations after the collective
-        // (e.g., `.cpu()`). Such operations may acquire a process-wide lock in
-        // the CUDA runtime. Also, they may rely on the data produced by the
-        // collective, thus causing a synchronization on enq_stream. However,
-        // holding that runtime lock prevents cudaMemcpy(Async) in TE/TENT from
-        // launching. This means the transfer can't finish, and enq_stream won't
-        // complete. Thus, a deadlock occurs.
-        // (In practice, we found that replacing all cudaMemcpyAsync in TENT
-        // with cuMemcpyAsync actually alleviates this, which further suggests a
-        // deadlock in the CUDA runtime. However, that change is too invasive
-        // for TE/TENT, so we do not adopt it here.)
-        //
-        // Strictly speaking, the wait is needed for another reason: The current
-        // stream will be blocked on the event below. Any subsequent work on
-        // `current_stream` will wait on that event, which effectively waits for
-        // the task to be done. Therefore, we must ensure all kernels needed for
-        // the transfer task are launched BEFORE blocking the current stream, in
-        // case TE/TENT use `current_stream` to launch those kernels (though it
-        // is rare).
-        //
-        // Please note that this logic relies on the assumption that TE/TENT
-        // will launch all CUDA operations in `submitTransfer`.
-        // Unfortunately, TcpTransport in TE and TENT currently violates this
-        // assumption (cudaMemcpy(Async) may be called later from a callback),
-        // which can cause hangs in PG when a CUDA operation such as
-        // `x.cpu().item()` follows the collective. For TE's TcpTransport, the
-        // use of cudaMemcpy on the default stream may also contribute to the
-        // hang.
-        //
-        // Besides, for CPU-only transports (like RdmaTransport),
-        // waitUntilTasksSubmitted is totally unnecessary, but we keep it for
-        // uniform behavior to avoid invasive changes to TE/TENT.
-        bool submitted = true;
-        if (at::cuda::currentStreamCaptureStatus() ==
-            c10::cuda::CaptureStatus::None) {
-            // Normal execution: block until tasks are submitted.
-            submitted =
-                worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
-        } else {
-            // During CUDA graph capture, kernels are recorded but not actually
-            // executed. The enqueueTaskKernel would never run, so
-            // waitUntilTasksSubmitted would hang because the CPU worker thread
-            // never sees task.active == true.
-            //
-            // Note that this also means NvlinkTransport (and TcpTransport too,
-            // of course) won't work with CUDA Graphs: Kernels launched inside
-            // TE/TENT can't be captured by the graph, and during replay they
-            // are not ordered with the graph execution. This may trigger the
-            // same deadlock described above.
-        }
-        if (!submitted) return false;
-
-        // Once all tasks have been submitted, use the event to synchronize
-        // the current stream and the enqueue stream, but do not wait on this
-        // event.
-        //
-        // See PyTorch docs for more details:
-        // https://docs.pytorch.org/docs/stable/distributed.html#synchronous-and-asynchronous-collective-operations
-        //   "wait() - in the case of CPU collectives, will block the process
-        //    until the operation is completed. In the case of CUDA collectives,
-        //    will block the currently active CUDA stream until the operation
-        //    is completed (but will not block the CPU)."
-        auto current_stream = at::cuda::getCurrentCUDAStream();
-        event_->block(current_stream);
-        return true;
-    }
-
-   protected:
-    std::shared_ptr<torch::Event> event_;
-    std::shared_ptr<TransferGroupMeta> meta_;
-    const MooncakeWorker* worker_;
-    std::vector<CudaTaskSubmissionToken> submitted_tasks_;
-};
-
-class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
-   public:
-    using MooncakeWorkCuda::MooncakeWorkCuda;
-
-    bool wait(std::chrono::milliseconds timeout) override {
-        // Skip host-side synchronization during CUDA graph capture.
-        // cudaEventSynchronize is not permitted while a stream is capturing.
-        if (at::cuda::currentStreamCaptureStatus() !=
-            c10::cuda::CaptureStatus::None) {
-            // We still need stream-level synchronization so that subsequent
-            // operations on the capture stream are ordered after the barrier
-            // task on the enqueue stream.
-            auto current_stream = at::cuda::getCurrentCUDAStream();
-            event_->block(current_stream);
-            return true;
-        }
-
-        if (timeout == kNoTimeout) {
-            event_->synchronize();
-            return true;
-        }
-
-        BackoffWaiter waiter(
-            BackoffWaiterConfig::constantSleep(std::chrono::microseconds(10)));
-        return waiter.wait_for(timeout, [this] { return event_->query(); });
-    }
-};
-
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
                                   uint64_t submitSequence, void* meta,
                                   Task* tasks, int numRanks,
                                   const bool* activeRanks,
-                                  int* activeRanksTensor, size_t taskId) {
+                                  int* activeRanksTensor,
+                                  int* failedRanksHostPtr, size_t taskId) {
     // Copy task into slot
     tasks[taskId].opType = opType;
     tasks[taskId].tensorSize = tensorSize;
@@ -170,6 +23,7 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
     tasks[taskId].bufferOffset = bufferOffset;
     tasks[taskId].submitSequence = submitSequence;
     tasks[taskId].transferGroupMeta = meta;
+    tasks[taskId].failedRanksHost = failedRanksHostPtr;
 
     // Publish task metadata before notifying the host worker thread.
     __threadfence_system();
@@ -187,7 +41,8 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
 template <typename scalar_t>
 __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                              size_t numElements, size_t numRanks,
-                             c10d::ReduceOp::RedOpType op, bool* activeRanks) {
+                             c10d::ReduceOp::RedOpType op, bool* activeRanks,
+                             int* failedRanks) {
     size_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
     for (size_t elem_idx = thread_idx; elem_idx < numElements;
@@ -195,7 +50,9 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
         bool valid = false;
         scalar_t acc = 0;
         for (size_t rank = 0; rank < numRanks; ++rank) {
-            if (activeRanks[rank]) {
+            bool shouldInclude =
+                activeRanks[rank] && (!failedRanks || failedRanks[rank] == 0);
+            if (shouldInclude) {
                 if (!valid) {
                     acc = src[rank * numElements + elem_idx];
                     valid = true;
@@ -240,7 +97,7 @@ void preload_reduce_kernel(const char* name) {
 
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                        cudaStream_t stream) {
+                        int* failedRanks, cudaStream_t stream) {
     TORCH_CHECK(op == c10d::ReduceOp::SUM || op == c10d::ReduceOp::MIN ||
                     op == c10d::ReduceOp::MAX || op == c10d::ReduceOp::PRODUCT,
                 "Only support SUM/MIN/MAX/PRODUCT for reduction.");
@@ -251,42 +108,47 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
         case c10::kByte:
             reduceKernel<<<64, 256, 0, stream>>>((uint8_t*)ptr, (uint8_t*)src,
                                                  num, numRanks, op.op_,
-                                                 activeRanks);
+                                                 activeRanks, failedRanks);
             break;
         case c10::kChar:
-            reduceKernel<<<64, 256, 0, stream>>>(
-                (int8_t*)ptr, (int8_t*)src, num, numRanks, op.op_, activeRanks);
+            reduceKernel<<<64, 256, 0, stream>>>((int8_t*)ptr, (int8_t*)src,
+                                                 num, numRanks, op.op_,
+                                                 activeRanks, failedRanks);
             break;
         case c10::kShort:
             reduceKernel<<<64, 256, 0, stream>>>((int16_t*)ptr, (int16_t*)src,
                                                  num, numRanks, op.op_,
-                                                 activeRanks);
+                                                 activeRanks, failedRanks);
             break;
         case c10::kInt:
             reduceKernel<<<64, 256, 0, stream>>>((int*)ptr, (int*)src, num,
-                                                 numRanks, op.op_, activeRanks);
+                                                 numRanks, op.op_, activeRanks,
+                                                 failedRanks);
             break;
         case c10::kLong:
             reduceKernel<<<64, 256, 0, stream>>>((int64_t*)ptr, (int64_t*)src,
                                                  num, numRanks, op.op_,
-                                                 activeRanks);
+                                                 activeRanks, failedRanks);
             break;
         case c10::kFloat:
             reduceKernel<<<64, 256, 0, stream>>>((float*)ptr, (float*)src, num,
-                                                 numRanks, op.op_, activeRanks);
+                                                 numRanks, op.op_, activeRanks,
+                                                 failedRanks);
             break;
         case c10::kDouble:
-            reduceKernel<<<64, 256, 0, stream>>>(
-                (double*)ptr, (double*)src, num, numRanks, op.op_, activeRanks);
+            reduceKernel<<<64, 256, 0, stream>>>((double*)ptr, (double*)src,
+                                                 num, numRanks, op.op_,
+                                                 activeRanks, failedRanks);
             break;
         case c10::kBool:
             reduceKernel<<<64, 256, 0, stream>>>((bool*)ptr, (bool*)src, num,
-                                                 numRanks, op.op_, activeRanks);
+                                                 numRanks, op.op_, activeRanks,
+                                                 failedRanks);
             break;
         case c10::kBFloat16:
-            reduceKernel<<<64, 256, 0, stream>>>((at::BFloat16*)ptr,
-                                                 (at::BFloat16*)src, num,
-                                                 numRanks, op.op_, activeRanks);
+            reduceKernel<<<64, 256, 0, stream>>>(
+                (at::BFloat16*)ptr, (at::BFloat16*)src, num, numRanks, op.op_,
+                activeRanks, failedRanks);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
@@ -312,13 +174,15 @@ T applyReduceOp(const T& a, const T& b, c10d::ReduceOp op) {
 
 template <typename T>
 void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
-               c10d::ReduceOp op, bool* activeRanks) {
+               c10d::ReduceOp op, bool* activeRanks, int* failedRanks) {
     at::parallel_for(0, numElements, 1024, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
             bool valid = false;
             T acc{};
             for (int64_t rank = 0; rank < numRanks; ++rank) {
-                if (activeRanks[rank]) {
+                bool shouldInclude = activeRanks[rank] &&
+                                     (!failedRanks || failedRanks[rank] == 0);
+                if (shouldInclude) {
                     if (!valid) {
                         acc = src[i + rank * numElements];
                         valid = true;
@@ -334,39 +198,43 @@ void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
 }
 
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
-                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks) {
+                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
+                     int* failedRanks) {
     auto ptr = (char*)dst.data_ptr() + pos;
     size_t num = realSize / dst.element_size();
 
     switch (dst.scalar_type()) {
         case c10::kByte:
             reduceCpu((uint8_t*)ptr, (uint8_t*)src, num, numRanks, op,
-                      activeRanks);
+                      activeRanks, failedRanks);
             break;
         case c10::kChar:
             reduceCpu((int8_t*)ptr, (int8_t*)src, num, numRanks, op,
-                      activeRanks);
+                      activeRanks, failedRanks);
             break;
         case c10::kShort:
             reduceCpu((int16_t*)ptr, (int16_t*)src, num, numRanks, op,
-                      activeRanks);
+                      activeRanks, failedRanks);
             break;
         case c10::kInt:
-            reduceCpu((int*)ptr, (int*)src, num, numRanks, op, activeRanks);
+            reduceCpu((int*)ptr, (int*)src, num, numRanks, op, activeRanks,
+                      failedRanks);
             break;
         case c10::kLong:
             reduceCpu((int64_t*)ptr, (int64_t*)src, num, numRanks, op,
-                      activeRanks);
+                      activeRanks, failedRanks);
             break;
         case c10::kFloat:
-            reduceCpu((float*)ptr, (float*)src, num, numRanks, op, activeRanks);
+            reduceCpu((float*)ptr, (float*)src, num, numRanks, op, activeRanks,
+                      failedRanks);
             break;
         case c10::kDouble:
             reduceCpu((double*)ptr, (double*)src, num, numRanks, op,
-                      activeRanks);
+                      activeRanks, failedRanks);
             break;
         case c10::kBool:
-            reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op, activeRanks);
+            reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op, activeRanks,
+                      failedRanks);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
@@ -417,6 +285,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::shared_ptr<TransferGroupMeta>& meta,
     const std::shared_ptr<ConnectionContext>& connection_ctx,
+    FailedRanks failedRanks,
     const std::function<void(void* dst, size_t pos, size_t realSize)>&
         tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize)>&
@@ -436,9 +305,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     std::weak_ptr<std::function<void()>> weakProcessNextChunk =
         processNextChunk;
 
+    int* failedRanksPtr = failedRanks.data();
+
     *processNextChunk = [this, weakProcessNextChunk, state, opType, tensorSize,
                          chunkSize, broadcastRoot, meta, tensorToBuffer,
-                         bufferToTensor, future]() {
+                         bufferToTensor, future, failedRanksPtr]() {
         auto processNextChunk = weakProcessNextChunk.lock();
 
         if (state->currentPos >= tensorSize) {
@@ -457,6 +328,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         tasks_[taskId].broadcastRoot = broadcastRoot;
         tasks_[taskId].bufferOffset = bufferOffset;
         tasks_[taskId].transferGroupMeta = meta.get();
+        tasks_[taskId].failedRanksHost = failedRanksPtr;
         tensorToBuffer(
             (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
             state->currentPos, realSize);
@@ -485,14 +357,15 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
 
     (*processNextChunk)();
 
-    return c10::make_intrusive<MooncakeWorkCpu>(opType, future, meta);
+    return c10::make_intrusive<MooncakeWorkCpu>(opType, future, meta,
+                                                std::move(failedRanks));
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::shared_ptr<TransferGroupMeta>& meta,
     const std::shared_ptr<ConnectionContext>& connection_ctx,
-    const at::cuda::CUDAStream& issue_stream,
+    const at::cuda::CUDAStream& issue_stream, FailedRanks failedRanks,
     const std::function<void(void* dst, size_t pos, size_t realSize,
                              const at::cuda::CUDAStream&)>& tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize,
@@ -533,7 +406,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
         enqueueTaskKernel<<<1, 1, 0, enq_stream>>>(
             opType, realSize, broadcastRoot, bufferOffset, taskSequence,
             meta.get(), tasks_device_, meta->size, meta->activeRanksDevice,
-            meta->activeRanksTensor.data_ptr<int>(), taskId);
+            meta->activeRanksTensor.data_ptr<int>(), failedRanks.data(),
+            taskId);
         bufferToTensor(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
             pos, realSize, enq_stream);
@@ -547,10 +421,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
 
     if (opType == c10d::OpType::BARRIER) {
         return c10::make_intrusive<MooncakeBarrierWorkCuda>(
-            opType, event_end, meta, this, std::move(submitted_tasks));
+            opType, event_end, meta, this, std::move(submitted_tasks),
+            std::move(failedRanks));
     }
     return c10::make_intrusive<MooncakeWorkCuda>(opType, event_end, meta, this,
-                                                 std::move(submitted_tasks));
+                                                 std::move(submitted_tasks),
+                                                 std::move(failedRanks));
 }
 
 }  // namespace mooncake

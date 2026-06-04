@@ -317,14 +317,35 @@ void P2PProxy::performRecvReset(int peer_rank) {
     resetPeerControlLanes(peer_rank);
 }
 
-void P2PProxy::reportBrokenPeer(int peer_rank) {
-    resetPeerState(peer_rank);
-    // Set peerConnected to notify the connection poller to reconnect it.
-    meta_->peerConnected[peer_rank] = false;
-    meta_->activeRanks[peer_rank] = false;
-    meta_->activeRanksTensor[peer_rank] = 0;
-    LOG(ERROR) << "Rank " << meta_->rank << " marking peer " << peer_rank
-               << " as broken during P2P transfer.";
+void P2PProxy::cleanupFailedSendOp(SendOpContext& op_ctx) {
+    for (auto& task : op_ctx.tasks_) {
+        releaseSendTaskResources(task);
+    }
+    op_ctx.tasks_.clear();
+    op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
+    active_send_tasks_.fetch_sub(1, std::memory_order_release);
+}
+
+void P2PProxy::cleanupFailedRecvOp(RecvOpContext& op_ctx) {
+    for (auto& task : op_ctx.tasks_) {
+        releaseRecvTaskResources(task);
+    }
+    op_ctx.tasks_.clear();
+    op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
+    active_recv_tasks_.fetch_sub(1, std::memory_order_release);
+}
+
+void P2PProxy::reportFailedOp(int peer_rank, int* failed_ranks) {
+    failed_ranks[peer_rank] = 1;
+    if (meta_->autoDeactivateOnFailure) {
+        resetPeerState(peer_rank);
+        // Set peerConnected to notify the connection poller to reconnect it.
+        meta_->peerConnected[peer_rank] = false;
+        meta_->activeRanks[peer_rank] = false;
+        meta_->activeRanksTensor[peer_rank] = 0;
+    }
+    LOG(ERROR) << "Rank " << meta_->rank << ": P2P op to peer " << peer_rank
+               << " failed.";
 }
 
 void P2PProxy::releaseSendTaskResources(SendTransferTask& task) const {
@@ -361,13 +382,7 @@ void P2PProxy::resetSendLane(SendPeerLane& lane) {
     lane.pending_send_ops_.clear();
 
     if (lane.active_send_op_.has_value()) {
-        auto& op_ctx = lane.active_send_op_.value();
-        for (auto& task : op_ctx.tasks_) {
-            releaseSendTaskResources(task);
-        }
-        op_ctx.tasks_.clear();
-        op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
-        active_send_tasks_.fetch_sub(1, std::memory_order_release);
+        cleanupFailedSendOp(*lane.active_send_op_);
         lane.active_send_op_.reset();
     }
     lane.credit_consume_seq_ = 0;
@@ -381,13 +396,7 @@ void P2PProxy::resetRecvLane(RecvPeerLane& lane) {
     lane.pending_recv_ops_.clear();
 
     if (lane.active_recv_op_.has_value()) {
-        auto& op_ctx = lane.active_recv_op_.value();
-        for (auto& task : op_ctx.tasks_) {
-            releaseRecvTaskResources(task);
-        }
-        op_ctx.tasks_.clear();
-        op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
-        active_recv_tasks_.fetch_sub(1, std::memory_order_release);
+        cleanupFailedRecvOp(*lane.active_recv_op_);
         lane.active_recv_op_.reset();
     }
     lane.credit_issue_seq_ = 0;
@@ -498,7 +507,8 @@ P2PProxy::SendOpContext::SendOpContext(SendOp&& op_in)
     : status_(std::move(op_in.status_)),
       tensor_(std::move(op_in.tensor_)),
       peer_rank_(op_in.peer_rank_),
-      cuda_stream_(op_in.cuda_stream_) {
+      cuda_stream_(op_in.cuda_stream_),
+      failed_ranks_(op_in.failed_ranks_) {
     total_bytes_ =
         tensor_.numel() * static_cast<uint64_t>(tensor_.element_size());
     last_update_time_ = std::chrono::steady_clock::now();
@@ -522,7 +532,8 @@ P2PProxy::RecvOpContext::RecvOpContext(RecvOp&& op_in)
       tensor_(std::move(op_in.tensor_)),
       original_tensor_(std::move(op_in.original_tensor_)),
       peer_rank_(op_in.peer_rank_),
-      cuda_stream_(op_in.cuda_stream_) {
+      cuda_stream_(op_in.cuda_stream_),
+      failed_ranks_(op_in.failed_ranks_) {
     total_bytes_ =
         tensor_.numel() * static_cast<uint64_t>(tensor_.element_size());
 }
@@ -1043,7 +1054,8 @@ bool P2PProxy::stepSend() {
         }
 
         if (op_failed) {
-            reportBrokenPeer(peer_rank);
+            cleanupFailedSendOp(op_ctx);
+            reportFailedOp(peer_rank, op_ctx.failed_ranks_);
             did_work = true;
             continue;
         }
@@ -1236,7 +1248,8 @@ bool P2PProxy::stepRecv() {
         }
 
         if (op_failed) {
-            reportBrokenPeer(peer_rank);
+            cleanupFailedRecvOp(op_ctx);
+            reportFailedOp(peer_rank, op_ctx.failed_ranks_);
             did_work = true;
             continue;
         }

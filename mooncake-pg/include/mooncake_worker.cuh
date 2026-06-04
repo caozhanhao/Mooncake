@@ -9,6 +9,7 @@
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <transfer_engine.h>
+#include <work_handles.h>
 
 #include <memory>
 #include <atomic>
@@ -44,6 +45,7 @@ struct TransferGroupMeta {
     int backendIndex;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     SegmentInfo segmentInfos[kMaxNumRanks];
+    bool autoDeactivateOnFailure = true;
 };
 
 __global__ struct Task {
@@ -55,22 +57,19 @@ __global__ struct Task {
     uint64_t submitSequence = 0;
     BatchID batchID;
     void* transferGroupMeta;
+    int* failedRanksHost = nullptr;
 };
 
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                        cudaStream_t stream);
+                        int* failedRanks, cudaStream_t stream);
 
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
-                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks);
+                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
+                     int* failedRanks);
 void preloadReduceKernels();
 
 class ConnectionContext;
-
-struct CudaTaskSubmissionToken {
-    size_t task_id;
-    uint64_t sequence;
-};
 
 class MooncakeWorker {
    public:
@@ -81,6 +80,7 @@ class MooncakeWorker {
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         const std::shared_ptr<TransferGroupMeta>& meta,
         const std::shared_ptr<ConnectionContext>& connection_ctx,
+        FailedRanks failedRanks,
         const std::function<void(void* dst, size_t pos, size_t realSize)>&
             tensorToBuffer,
         const std::function<void(void* src, size_t pos, size_t realSize)>&
@@ -90,7 +90,7 @@ class MooncakeWorker {
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         const std::shared_ptr<TransferGroupMeta>& meta,
         const std::shared_ptr<ConnectionContext>& connection_ctx,
-        const at::cuda::CUDAStream& issue_stream,
+        const at::cuda::CUDAStream& issue_stream, FailedRanks failedRanks,
         const std::function<void(void* dst, size_t pos, size_t realSize,
                                  const at::cuda::CUDAStream&)>& tensorToBuffer,
         const std::function<void(void* src, size_t pos, size_t realSize,

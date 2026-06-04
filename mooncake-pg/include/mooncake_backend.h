@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <mooncake_worker.cuh>
+#include <work_handles.h>
 #include <connection_poller.h>
 #include <p2p_proxy.h>
 #include <sys/types.h>
@@ -66,6 +67,12 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
             : activeRanks_{activeRanks},
               isExtension_{isExtension},
               maxWorldSize_{maxWorldSize} {}
+        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
+                               int maxWorldSize, bool autoDeactivateOnFailure)
+            : activeRanks_{activeRanks},
+              isExtension_{isExtension},
+              maxWorldSize_{maxWorldSize},
+              autoDeactivateOnFailure_{autoDeactivateOnFailure} {}
 
         ~MooncakeBackendOptions() override = default;
 
@@ -75,6 +82,20 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         // When > 0, the backend may pre-size internal rank metadata to this
         // value (while PyTorch's group_size() remains unchanged).
         int maxWorldSize_ = -1;
+
+        // Controls whether PG automatically deactivates failed ranks on
+        // timeout or operation failure.
+        //
+        // When set to true (default), failed ranks are removed from the local
+        // active rank automatically.
+        // When set to false, PG only reports failures through per-operation
+        // failedRanks, while leaving the active rank unchanged so that the
+        // caller can decide whether and how to handle the failure.
+        //
+        // Note that the upper layer is responsible for maintaining active rank 
+        // consistency. Any automatic deactivation in PG is local to the current 
+        // rank only; no cross-rank synchronization is performed implicitly.
+        bool autoDeactivateOnFailure_ = true;
     };
 
     /**
@@ -205,6 +226,11 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     std::vector<bool> getPeerState(const std::vector<int>& ranks);
 
     void recoverRanks(const std::vector<int>& ranks);
+
+    // alias to recoverRanks
+    void activateRank(const std::vector<int>& ranks);
+
+    void deactivateRank(const std::vector<int>& ranks, bool disconnect = false);
 
     void joinGroup();
 

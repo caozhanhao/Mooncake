@@ -42,6 +42,7 @@ setup(
                 "src/mooncake_worker.cu",
                 "src/mooncake_worker_thread.cpp",
                 "src/connection_poller.cpp",
+                "src/work_handles.cpp",
             ],
             extra_compile_args={
                 "cxx": [
