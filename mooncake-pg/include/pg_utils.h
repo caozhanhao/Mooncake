@@ -4,6 +4,8 @@
 #pragma once
 
 #include <chrono>
+#include <mutex>
+#include <queue>
 #include <thread>
 #include <algorithm>
 #include <cstdint>
@@ -181,6 +183,61 @@ class BackoffWaiter {
     uint32_t yield_count_{0};
     std::chrono::microseconds current_sleep_;
 };
+// =========================================================================
+// ThreadSafeQueue — lock-free single-producer, single-consumer queue with
+// mutex.  Used for TransferObservationEvent from worker thread → Agent
+// executor.  try_dequeue is non-blocking; enqueue never waits.
+// =========================================================================
+
+template <typename T>
+class ThreadSafeQueue {
+   public:
+    ThreadSafeQueue() = default;
+
+    void enqueue(T item) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.push(std::move(item));
+    }
+
+    bool try_dequeue(T& item) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) return false;
+        item = std::move(queue_.front());
+        queue_.pop();
+        return true;
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::queue<T> queue_;
+};
+
+// =========================================================================
+// overloaded — helper for std::visit exhaustive pattern matching.
+//
+// Usage:
+//   std::visit(overloaded{
+//       [](const TypeA& a) { ... },
+//       [](const TypeB& b) { ... },
+//   }, variant);
+//
+// If a variant alternative is missing, the compiler emits a hard error
+// (no matching operator()), giving exhaustiveness checking for free.
+// =========================================================================
+
+template <class... Ts>
+struct overloaded : Ts... {
+    using Ts::operator()...;
+};
+
+template <class... Ts>
+overloaded(Ts...) -> overloaded<Ts...>;
+
 }  // namespace mooncake
 
 #endif

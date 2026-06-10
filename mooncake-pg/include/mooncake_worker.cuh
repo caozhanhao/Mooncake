@@ -14,6 +14,8 @@
 #include <cstdint>
 #endif
 
+#include "control_plane/types.h"
+
 #include <cuda_alike.h>
 #include <transfer_engine.h>
 #include <work_handles.h>
@@ -25,39 +27,41 @@
 #include <unordered_map>
 #include <vector>
 
+#if !defined(__MUSA__)
+#include "control_plane/rpc.h"
+#endif
+
 namespace mooncake {
 
 static constexpr size_t kBufferSize = 1u << 24;
-static constexpr size_t kMaxNumRanks = 64;
 
-struct SegmentInfo {
-    uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2],
-        warmup_buffer[2];
-    uint64_t p2p_credit_region;
-    uint64_t p2p_ack_region;
-};
+class MooncakeBackend;
 
 struct TransferGroupMeta {
+    // ---- Always present (MUSA-safe) ----
     int rank;
-    int size;        // capacity: number of slots allocated (incl. inactive)
-    int activeSize;  // visible group size: number of ranks that participate
-    int taskCount;
-    bool* activeRanks;
-    bool* activeRanksDevice;
-#if !defined(__MUSA__)
-    at::Tensor activeRanksTensor;
-#endif
-    bool peerConnected[kMaxNumRanks]{};
-    TransferEngine* engine;
-#if !defined(__MUSA__)
-    c10::intrusive_ptr<::c10d::Store> store;
-#endif
-    int bufferBaseIndex;
-    int backendIndex;
-    TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
-    SegmentInfo segmentInfos[kMaxNumRanks];
+    int size;                // slot capacity (max_group_size_)
+    int activeSize;          // count of active members
+    int taskCount;           // round-robin buffer offset counter
+    TransferEngine* engine;  // shared TE handle
     bool autoDeactivateOnFailure = true;
     const size_t* collectiveTimeoutUs = nullptr;
+    GroupId group_id = 0;
+    MooncakeBackend* backend = nullptr;  // for GroupView / endpoint access
+
+    // GPU kernel needs these (cudaHostAlloc mapped → safe from MUSA path).
+    bool* activeRanks = nullptr;
+    bool* activeRanksDevice = nullptr;
+
+    // ---- MUSA-guarded (torch-dependent types) ----
+#if !defined(__MUSA__)
+    // Per-backend local endpoint (buffer / sync / P2P addresses).
+    GroupEndpointInfo local_endpoint_info;
+    // View epoch for worker validity check.
+    std::atomic<uint64_t> groupEpoch{0};
+    // GPU tensor mirror of activeRanks; synced inside GPU kernel.
+    at::Tensor activeRanksTensor;
+#endif
 };
 
 #if defined(__CUDACC__) || defined(__MUSA__)
@@ -74,6 +78,7 @@ __global__
     BatchID batchID;
     void* transferGroupMeta;
     int* failedRanksHost = nullptr;
+    int* attemptedRanksHost = nullptr;  // per-op attempted bitmap (new)
 };
 
 #if !defined(__MUSA__)
@@ -86,8 +91,6 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
                      int* failedRanks);
 void preloadReduceKernels();
 
-class ConnectionContext;
-
 class MooncakeWorker {
    public:
     explicit MooncakeWorker(int cuda_device_index = -1);
@@ -95,9 +98,7 @@ class MooncakeWorker {
 
     c10::intrusive_ptr<c10d::Work> putTaskCpu(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
-        const std::shared_ptr<TransferGroupMeta>& meta,
-        const std::shared_ptr<ConnectionContext>& connection_ctx,
-        FailedRanks failedRanks,
+        const std::shared_ptr<TransferGroupMeta>& meta, FailedRanks failedRanks,
         const std::function<void(void* dst, size_t pos, size_t realSize)>&
             tensorToBuffer,
         const std::function<void(void* src, size_t pos, size_t realSize)>&
@@ -106,7 +107,6 @@ class MooncakeWorker {
     c10::intrusive_ptr<c10d::Work> putTaskCuda(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         const std::shared_ptr<TransferGroupMeta>& meta,
-        const std::shared_ptr<ConnectionContext>& connection_ctx,
         const at::cuda::CUDAStream& issue_stream, FailedRanks failedRanks,
         const std::function<void(void* dst, size_t pos, size_t realSize,
                                  const at::cuda::CUDAStream&)>& tensorToBuffer,
@@ -158,11 +158,7 @@ class MooncakeWorker {
 
 class MooncakeWorkerManager {
    public:
-    static MooncakeWorkerManager& GetInstance() {
-        // leaky singleton to avoid destructor fiasco problem
-        static MooncakeWorkerManager* manager = new MooncakeWorkerManager;
-        return *manager;
-    }
+    MooncakeWorkerManager() = default;
 
     std::shared_ptr<MooncakeWorker> GetCPUWorker();
     std::shared_ptr<MooncakeWorker> GetCUDAWorker(int cuda_device_index);

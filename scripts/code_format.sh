@@ -67,8 +67,8 @@ print_error() {
 
 # Find clang-format binary (require version 20)
 find_clang_format() {
-    if command -v clang-format-20 &> /dev/null; then
-        echo "clang-format-20"
+    if command -v clang-format &> /dev/null; then
+        echo "clang-format"
         return 0
     else
         {

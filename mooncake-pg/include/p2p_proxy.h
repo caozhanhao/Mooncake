@@ -524,7 +524,9 @@ class P2PProxy {
     // Clean up the active op on a lane
     void cleanupFailedSendOp(SendOpContext& op_ctx);
     void cleanupFailedRecvOp(RecvOpContext& op_ctx);
-    // Clean up, mark kFailed, and report the failure
+    // Reset P2P session and push transfer observation to Agent.
+    void reportPeerFailure(int peer_rank);
+    // Clean up, mark kFailed, and report the failure.
     void handleFailedSendOp(SendOpContext& op_ctx);
     void handleFailedRecvOp(RecvOpContext& op_ctx);
 
@@ -552,6 +554,13 @@ class P2PProxy {
         return std::chrono::steady_clock::now() - obj.last_update_time_ >
                std::chrono::microseconds(*p2p_timeout_us_);
     }
+
+    // Map InGroupRank → GlobalRank via the backend.
+    GlobalRank toGlobalRank(int local_rank) const;
+    // Resolve the TE L4 handle for a peer (InGroupRank → GlobalRank → TE).
+    std::optional<PeerReadHandle> resolvePeer(int local_rank) const;
+    // Get the remote endpoint info for a peer via GroupView.
+    const GroupEndpointInfo* getRemoteEndpoint(int local_rank) const;
 
    private:
     struct P2PResources {
@@ -662,11 +671,7 @@ class P2PDeviceWorker {
 
 class P2PDeviceWorkerManager {
    public:
-    static P2PDeviceWorkerManager& getInstance() {
-        // leaky singleton to avoid destructor fiasco problem
-        static P2PDeviceWorkerManager* manager = new P2PDeviceWorkerManager;
-        return *manager;
-    }
+    P2PDeviceWorkerManager() = default;
 
     std::shared_ptr<P2PDeviceWorker> getCPUWorker(TransferEngine* engine);
     std::shared_ptr<P2PDeviceWorker> getCUDAWorker(int cuda_device_index,
