@@ -75,20 +75,25 @@ async_simple::coro::Lazy<std::shared_ptr<coro_rpc::coro_rpc_client>>
 getOrCreateClientAsync(std::shared_ptr<RpcSharedState> state,
                        const std::string& addr);
 
-// Fire-and-forget coroutine: connect, call, discard result.
+// Fire-and-forget coroutine: connect, send_request, discard result.
+// Uses send_request<Func, Req> with explicit Args... to avoid GCC 11
+// overload resolution issues with non-type template parameters.
 template <auto Func, typename Req>
 async_simple::coro::Lazy<void> sendCoroutine(
     std::shared_ptr<RpcSharedState> state, const std::string& addr, Req req) {
     auto client = co_await getOrCreateClientAsync(state, addr);
     if (!client) co_return;
     try {
-        auto result = co_await client->call<Func>(req);
-        (void)result;
+        auto send_lazy =
+            co_await client->send_request<Func, Req>(std::move(req));
+        co_await std::move(send_lazy);
     } catch (...) {
     }
 }
 
-// Async call with callback coroutine: connect, call, invoke callback.
+// Async call with callback coroutine: connect, send_request, invoke callback.
+// Uses send_request<Func, Req> with explicit Args... to avoid GCC 11
+// overload resolution issues with non-type template parameters.
 // Callback type is templated to avoid requiring std::function (which needs
 // CopyConstructible) — the caller's lambda is moved into cb.
 template <auto Func, typename Req, typename ResponseType, typename Callback>
@@ -101,12 +106,16 @@ async_simple::coro::Lazy<void> callAsyncCoroutine(
         co_return;
     }
     try {
-        auto result = co_await client->call<Func>(req);
-        if (result) {
-            cb(std::move(result.value()));
+        // send_request returns Lazy<Lazy<async_rpc_result<T>>>.
+        // Outer co_await: request sent.  Inner co_await: response received.
+        auto send_lazy =
+            co_await client->send_request<Func, Req>(std::move(req));
+        auto res = co_await std::move(send_lazy);
+        if (res) {
+            cb(std::move(res.value().result()));
         } else {
             LOG(ERROR) << "RpcClient: async rpc to " << addr
-                       << " failed: " << result.error().msg;
+                       << " failed: " << res.error().msg;
             cb(ResponseType{});
         }
     } catch (const std::exception& e) {
@@ -135,9 +144,10 @@ class RpcClient {
     template <auto Func, typename Req>
     auto call(const std::string& addr, Req req,
               std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
-        using RpcResult = decltype(async_simple::coro::syncAwait(
-            std::declval<coro_rpc::coro_rpc_client&>().call<Func>(req)));
-        using ResponseType = decltype(std::declval<RpcResult>().value());
+        // Derive ResponseType directly from the function pointer to avoid
+        // instantiating call<Func> (which has overload resolution issues
+        // with GCC 11 and non-type template parameters).
+        using ResponseType = decltype(coro_rpc::get_return_type<Func>());
 
         coro_rpc::coro_rpc_client::config config;
         config.connect_timeout_duration = std::chrono::seconds(3);
@@ -162,9 +172,10 @@ class RpcClient {
     // ---- Async RPC with callback ----
     template <auto Func, typename Req, typename Callback>
     void callAsync(const std::string& addr, Req req, Callback cb) {
-        using RpcResult = decltype(async_simple::coro::syncAwait(
-            std::declval<coro_rpc::coro_rpc_client&>().call<Func>(req)));
-        using ResponseType = decltype(std::declval<RpcResult>().value());
+        // Derive ResponseType directly from the function pointer to avoid
+        // instantiating call<Func> (which has overload resolution issues
+        // with GCC 11 and non-type template parameters).
+        using ResponseType = decltype(coro_rpc::get_return_type<Func>());
 
         auto task =
             rpc_detail::callAsyncCoroutine<Func, Req, ResponseType, Callback>(
