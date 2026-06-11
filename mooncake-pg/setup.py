@@ -86,6 +86,7 @@ setup(
                 "src/control_plane/agent_host.cpp",
                 "src/control_plane/coordinator.cpp",
                 "src/control_plane/coordinator_host.cpp",
+                "src/control_plane/rpc_runtime.cpp",
                 "src/control_plane/te_link_manager.cpp",
             ],
             extra_compile_args={"cxx": cxx_args, "nvcc": device_args},

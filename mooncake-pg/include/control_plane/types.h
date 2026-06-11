@@ -11,6 +11,7 @@ using GroupId = int32_t;      // process group ID (= backendIndex)
 using InGroupRank = int32_t;  // group-local namespace
 
 constexpr GlobalRank kInvalidGlobalRank = -1;
+constexpr GroupId kInvalidGroupId = -1;
 constexpr int kMaxNumRanks = 64;
 
 // Epoch sentinels.  All epochs start at kInvalidEpoch (0) and only increase

@@ -33,7 +33,6 @@ struct RankConnectionMetadata {
     std::string agent_addr;
     std::string te_server_name;
     // Warmup region addresses for TELinkManager handshake.
-    uint64_t warmup_send_addr = 0;
     uint64_t warmup_recv_addr = 0;
 };
 
@@ -79,7 +78,7 @@ struct ProposeViewUpdateRequest {
     GroupId group_id = 0;
     GlobalRank source_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
-    std::vector<GlobalRank> target_ranks;
+    std::vector<GlobalRank> requested_ranks;  // ranks to activate/deactivate
     bool is_activate = false;
 };
 
@@ -218,11 +217,15 @@ struct MarkBackendViewStale {
     GroupId group_id = 0;
 };
 
+struct NotifyTEUnreachable {
+    GlobalRank peer = kInvalidGlobalRank;
+};
+
 using AgentEffect =
     std::variant<SendTransferObservation, EnablePeerProbe, DisconnectLink,
                  StopReconnect, ClearPeerMetadata, DisconnectAllLinks,
                  ClearAllPeerMetadata, PublishRankStateSnapshot,
-                 ApplyViewToBackend, MarkBackendViewStale>;
+                 ApplyViewToBackend, MarkBackendViewStale, NotifyTEUnreachable>;
 
 // Results produced by the Coordinator/Agent state machine
 

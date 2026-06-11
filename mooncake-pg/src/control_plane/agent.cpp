@@ -10,6 +10,10 @@ namespace mooncake {
 
 AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     : rank_(rank), max_world_size_(max_world_size) {
+    CHECK_GT(max_world_size_, 0);
+    CHECK_LE(max_world_size_, kMaxNumRanks)
+        << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
+        << kMaxNumRanks << ")";
     global_rank_states_.fill(RankState::OFFLINE);
     link_connected_.fill(false);
     link_status_cache_.fill(0);
@@ -69,6 +73,8 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
         .te_server_name = push.te_server_name,
         .warmup_recv_addr = push.warmup_recv_addr,
     };
+    // Seed the debounce cache so the first transfer failure triggers a report.
+    link_status_cache_[push.rank] = 1;
 
     effects.push_back(
         EnablePeerProbe{push.rank, push.te_server_name, push.warmup_recv_addr});
@@ -135,11 +141,10 @@ AgentApplyResult AgentStateMachine::handleLinkStateChanged(GlobalRank peer,
         return effects;
     }
     link_connected_[peer] = connected;
-    // NOTE: Do NOT touch link_status_cache_ here — it is reserved for
-    // transfer-observation debounce.  Physical link state is reported
-    // via link_connected_ in buildHeartbeat.
 
-    syncRankStateSnapshot(effects);
+    if (!connected) {
+        effects.push_back(NotifyTEUnreachable{peer});
+    }
     return effects;
 }
 
@@ -198,9 +203,12 @@ AgentApplyResult AgentStateMachine::applyRegisterResponse(
     }
 
     // Populate connection metadata and trigger peer probes.
+    // Seed the debounce cache to 1 so the FIRST transfer failure to any
+    // peer triggers a TransferObservationReport (1→0 transition).
     for (const auto& conn : resp.rank_connections) {
         if (conn.rank == rank_) continue;
         rank_connections_[conn.rank] = conn;
+        link_status_cache_[conn.rank] = 1;
         effects.push_back(EnablePeerProbe{conn.rank, conn.te_server_name,
                                           conn.warmup_recv_addr});
     }

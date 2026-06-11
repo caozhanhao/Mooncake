@@ -5,6 +5,8 @@
 #include <torch/python.h>
 #include <torch/torch.h>
 
+#include <mutex>
+
 #include "control_plane/agent_host.h"
 
 namespace py = pybind11;
@@ -14,23 +16,25 @@ namespace mooncake {
 // Process-level context — definition in mooncake_backend.h.
 static MooncakeProcessContext g_ctx;
 
+static std::once_flag g_init_control_plane_once;
+
 static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
                                    int rank, int max_world_size) {
-    // Rank 0 hosts the Coordinator in-process.  It must start BEFORE
-    // AgentHost so the coordinator_addr key is in the Store when
-    // AgentHost::start() reads it.
-    if (rank == 0 && !g_ctx.coordinator_host) {
-        g_ctx.coordinator_host = std::make_unique<CoordinatorHost>(
-            store, g_ctx.host_ip, max_world_size);
-        g_ctx.coordinator_host->start();
-    }
+    std::call_once(g_init_control_plane_once, [&] {
+        // Rank 0 hosts the Coordinator in-process.  It must start BEFORE
+        // AgentHost so the coordinator_addr key is in the Store when
+        // AgentHost::start() reads it.
+        if (rank == 0) {
+            g_ctx.coordinator_host = std::make_unique<CoordinatorHost>(
+                store, g_ctx.host_ip, max_world_size);
+            g_ctx.coordinator_host->start();
+        }
 
-    if (!g_ctx.agent_host) {
         g_ctx.agent_host = std::make_unique<AgentHost>(
             store, g_ctx.host_ip, static_cast<GlobalRank>(rank), max_world_size,
             g_ctx.te_link_manager);
         g_ctx.agent_host->start();
-    }
+    });
     return *g_ctx.agent_host;
 }
 

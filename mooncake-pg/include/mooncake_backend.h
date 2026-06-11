@@ -59,6 +59,15 @@ struct MooncakeProcessContext {
     std::unique_ptr<CoordinatorHost> coordinator_host;
 
     std::unique_ptr<AgentHost> agent_host;
+
+    MooncakeProcessContext() = default;
+
+    // Non-copyable, non-movable: engine pointer points to either owned_engine
+    // or external_engine, and would dangle after a move.
+    MooncakeProcessContext(const MooncakeProcessContext&) = delete;
+    MooncakeProcessContext& operator=(const MooncakeProcessContext&) = delete;
+    MooncakeProcessContext(MooncakeProcessContext&&) = delete;
+    MooncakeProcessContext& operator=(MooncakeProcessContext&&) = delete;
 };
 
 // Forward declaration – MooncakeP2PShim holds a non-owning pointer to
@@ -255,14 +264,9 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     at::Tensor getActiveRanksTensor() { return meta_->activeRanksTensor; }
 
-    // Returns the current GroupView epoch (atomically loaded).
-    // 0 if no view has been applied yet.
-    // Uses a dedicated atomic to avoid a data race with applyViewChange()
-    // which writes group_view_ from the executor thread while worker threads
-    // call getGroupEpoch().
-    uint64_t getGroupEpoch() const {
-        return group_epoch_.load(std::memory_order_acquire);
-    }
+    // Returns the current GroupView epoch.  Reads through the RCU snapshot
+    // so view and epoch are always consistent (no torn snapshot).
+    uint64_t getGroupEpoch() const { return getGroupView()->epoch; }
 
     int getNumSyncedRanks();
 
@@ -322,7 +326,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
             local_rank < static_cast<int>(rank_order->size())) {
             return (*rank_order)[local_rank];
         }
-        return static_cast<GlobalRank>(local_rank);
+        return kInvalidGlobalRank;
     }
     AgentInterface& getAgent() { return agent_; }
     MooncakeProcessContext& getProcessContext() { return ctx_; }
@@ -347,7 +351,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         std::make_shared<const GroupView>()};
     std::shared_ptr<const std::vector<GlobalRank>> rank_order_ptr_{
         std::make_shared<const std::vector<GlobalRank>>()};
-    std::atomic<uint64_t> group_epoch_{0};
     std::shared_ptr<TransferGroupMeta> meta_;
     bool isShutdown_{false};
     GroupId group_id_ = 0;

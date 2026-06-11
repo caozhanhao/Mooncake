@@ -37,8 +37,10 @@ class AgentStateMachine {
     AgentApplyResult prepareCleanSlateRegister();
     AgentApplyResult markOffline();
 
-    // Set the agent session epoch (called by Host after incrementing).
-    void setAgentSessionEpoch(uint64_t epoch) { agent_session_epoch_ = epoch; }
+    // Set the agent session epoch (called by Host on executor thread).
+    void setAgentSessionEpoch(uint64_t epoch) {
+        agent_session_epoch_.store(epoch, std::memory_order_release);
+    }
 
     // ---- Transfer observation processing ----
 
@@ -61,14 +63,19 @@ class AgentStateMachine {
     // ---- State access for Host ----
 
     RankState getSelfRankState() const { return rank_state_; }
-    uint64_t getAgentSessionEpoch() const { return agent_session_epoch_; }
+    uint64_t getAgentSessionEpoch() const {
+        return agent_session_epoch_.load(std::memory_order_acquire);
+    }
 
    private:
     GlobalRank rank_;
     int max_world_size_;
 
     RankState rank_state_ = RankState::OFFLINE;
-    uint64_t agent_session_epoch_ = 0;
+    // Monotonically incremented on (re-)registration.  Written only from
+    // the executor thread; read from caller threads (proposeActivate / etc.)
+    // via the atomic accessors above.
+    std::atomic<uint64_t> agent_session_epoch_{0};
 
     struct GroupEntry {
         GroupDescriptor descriptor;

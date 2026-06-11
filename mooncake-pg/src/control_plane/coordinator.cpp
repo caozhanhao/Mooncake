@@ -1,6 +1,8 @@
 #include "control_plane/coordinator.h"
 
 #include <algorithm>
+#include <bit>
+#include <numeric>
 #include <set>
 
 #include <glog/logging.h>
@@ -14,6 +16,10 @@ namespace mooncake {
 CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
     int max_world_size)
     : max_world_size_(max_world_size) {
+    CHECK_GT(max_world_size_, 0);
+    CHECK_LE(max_world_size_, kMaxNumRanks)
+        << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
+        << kMaxNumRanks << ")";
     for (int i = 0; i < kMaxNumRanks; ++i) {
         ranks_[i].link_status.assign(max_world_size_, 0);
         ranks_[i].link_status[i] = 1;
@@ -166,7 +172,7 @@ CentralizedCoordinatorStateMachine::handleViewUpdate(
     }
 
     // Validate all targets are within valid GlobalRank range.
-    for (GlobalRank rank : req.target_ranks) {
+    for (GlobalRank rank : req.requested_ranks) {
         if (!rankInValidRange(rank)) {
             result.effects.push_back(
                 ReplyViewUpdateEffect{propose_id,
@@ -194,7 +200,7 @@ CentralizedCoordinatorStateMachine::handleViewUpdate(
         auto& rank_order = desc_it->second.rank_order;
 
         // Append new ranks to rank_order.
-        for (GlobalRank rank : req.target_ranks) {
+        for (GlobalRank rank : req.requested_ranks) {
             if (std::find(rank_order.begin(), rank_order.end(), rank) ==
                 rank_order.end()) {
                 rank_order.push_back(rank);
@@ -202,12 +208,12 @@ CentralizedCoordinatorStateMachine::handleViewUpdate(
         }
 
         // Check activatable before applying changes.
-        for (GlobalRank rank : req.target_ranks) {
+        for (GlobalRank rank : req.requested_ranks) {
             if (!view.members[rank].active) changed = true;
         }
 
         if (changed &&
-            !isActivatableSet(req.group_id, req.target_ranks, view)) {
+            !isActivatableSet(req.group_id, req.requested_ranks, view)) {
             result.effects.push_back(
                 ReplyViewUpdateEffect{propose_id,
                                       {ViewUpdateStatus::Rejected,
@@ -218,12 +224,12 @@ CentralizedCoordinatorStateMachine::handleViewUpdate(
         }
 
         // Apply.
-        for (GlobalRank rank : req.target_ranks) {
+        for (GlobalRank rank : req.requested_ranks) {
             view.members[rank].active = true;
         }
     } else {
         // deactivate
-        for (GlobalRank rank : req.target_ranks) {
+        for (GlobalRank rank : req.requested_ranks) {
             if (view.members[rank].active) {
                 view.members[rank].active = false;
                 changed = true;
@@ -474,18 +480,8 @@ bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
            ranks_[a].link_status[b] != 0 && ranks_[b].link_status[a] != 0;
 }
 
-// findHealthySet — maximum clique on the mutual-connectivity graph.
-//
-// Uses a simple exhaustive search + branch-and-bound.  kMaxNumRanks = 64
-// and this runs on the control-plane (not the hot path), so correctness and
-// determinism are prioritized over asymptotic optimality.
-//
-// Tie-breaking: among equally-sized maximum cliques, prefer the one that
-// contains Rank 0.  If Rank 0 is not in any of them (or is OFFLINE), fall
-// back to lexicographically smallest rank list.
 std::vector<GlobalRank> CentralizedCoordinatorStateMachine::findHealthySet()
     const {
-    // Collect nodes with state >= SYNCED.
     std::vector<GlobalRank> candidates;
     for (int i = 0; i < max_world_size_; ++i) {
         if (ranks_[i].state != RankState::OFFLINE) {
@@ -496,75 +492,67 @@ std::vector<GlobalRank> CentralizedCoordinatorStateMachine::findHealthySet()
     int n = static_cast<int>(candidates.size());
     if (n == 0) return {};
 
-    // Build adjacency bitmap for fast edge checks.
-    // adj[i] is a bitmask of nodes connected to i.
-    std::vector<uint64_t> adj(n, 0);
+    std::vector<std::vector<uint8_t>> adj(n, std::vector<uint8_t>(n, 0));
     for (int i = 0; i < n; ++i) {
         for (int j = 0; j < n; ++j) {
             if (isMutuallyConnected(candidates[i], candidates[j])) {
-                adj[i] |= (1ULL << j);
+                adj[i][j] = 1;
             }
         }
     }
 
-    // Branch-and-bound maximum clique search.
     std::vector<GlobalRank> best;
     std::vector<GlobalRank> current;
 
-    // Evaluate whether a clique is "better" than the current best.
     auto isBetter = [&](const std::vector<GlobalRank>& a,
                         const std::vector<GlobalRank>& b) -> bool {
         if (a.size() != b.size()) return a.size() > b.size();
-        // Tie-breaking: prefer the one containing Rank 0.
         bool a_has_0 = std::find(a.begin(), a.end(), 0) != a.end();
         bool b_has_0 = std::find(b.begin(), b.end(), 0) != b.end();
         if (a_has_0 != b_has_0) return a_has_0;
-        // Both have or don't have Rank 0 → lexicographically smallest.
         return std::lexicographical_compare(a.begin(), a.end(), b.begin(),
                                             b.end());
     };
 
-    // Step limit: max clique is NP-hard.  In the worst case (Moon-Moser
-    // graph) it can explore ~3^(N/3) states.  kMaxSearchSteps caps the
-    // recursion depth to prevent the single-threaded executor from hanging
-    // when the topology degrades into pathological connectivity patterns.
-    // If we hit the limit, we keep the best clique found so far — which is
-    // a valid (just not necessarily maximal) healthy set.
     static constexpr int kMaxSearchSteps = 100000;
     int search_steps = 0;
 
-    std::function<void(int, uint64_t)> search = [&](int start,
-                                                    uint64_t allowed) {
-        if (++search_steps > kMaxSearchSteps) return;
-        // Upper bound: current.size() + popcount(allowed).
-        int remaining = __builtin_popcountll(allowed);
-        if (current.size() + remaining <= best.size()) return;
+    std::function<void(const std::vector<int>&)> search =
+        [&](const std::vector<int>& allowed) {
+            if (++search_steps > kMaxSearchSteps) return;
 
-        for (int i = start; i < n; ++i) {
-            if (!(allowed & (1ULL << i))) continue;
+            if (current.size() + allowed.size() <= best.size()) return;
 
-            current.push_back(candidates[i]);
-            uint64_t next_allowed = allowed & adj[i];
-            // Only consider j > i to avoid permutations.
-            uint64_t mask = ~((1ULL << (i + 1)) - 1);
-            next_allowed &= mask;
+            for (size_t i = 0; i < allowed.size(); ++i) {
+                int v = allowed[i];
 
-            search(i + 1, next_allowed);
+                current.push_back(candidates[v]);
 
-            if (isBetter(current, best)) {
-                best = current;
+                std::vector<int> next_allowed;
+                next_allowed.reserve(allowed.size() - i - 1);
+
+                for (size_t j = i + 1; j < allowed.size(); ++j) {
+                    int u = allowed[j];
+                    if (adj[v][u]) {
+                        next_allowed.push_back(u);
+                    }
+                }
+
+                search(next_allowed);
+
+                if (isBetter(current, best)) {
+                    best = current;
+                }
+                current.pop_back();
             }
-            current.pop_back();
-        }
-    };
+        };
 
-    // n == 64 is valid (kMaxNumRanks), but (1ULL << 64) is UB.
-    uint64_t all_allowed = (n == 64) ? ~0ULL : ((1ULL << n) - 1);
-    search(0, all_allowed);
+    std::vector<int> initial_allowed(n);
+    std::iota(initial_allowed.begin(), initial_allowed.end(), 0);
 
-    // If best is still empty, return just the local rank if it's a candidate.
+    search(initial_allowed);
+
     if (best.empty() && !candidates.empty()) {
-        // Choose the first candidate (which is the smallest rank).
         best.push_back(candidates[0]);
     }
 
@@ -798,7 +786,6 @@ RegisterResponse CentralizedCoordinatorStateMachine::buildRegisterResponse(
         conn.agent_session_epoch = ranks_[i].agent_session_epoch;
         conn.agent_addr = ranks_[i].agent_addr;
         conn.te_server_name = ranks_[i].te_server_name;
-        conn.warmup_send_addr = ranks_[i].warmup_send_addr;
         conn.warmup_recv_addr = ranks_[i].warmup_recv_addr;
         resp.rank_connections.push_back(conn);
     }

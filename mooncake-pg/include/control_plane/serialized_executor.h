@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -26,7 +27,8 @@ namespace mooncake {
 //   - The tick callback and all tasks run on the executor thread.
 class SerializedExecutor {
    public:
-    explicit SerializedExecutor(std::string name) : name_(std::move(name)) {}
+    SerializedExecutor() = default;
+    explicit SerializedExecutor(std::string /*name*/) {}
 
     ~SerializedExecutor() { shutdown(); }
 
@@ -55,18 +57,41 @@ class SerializedExecutor {
             leftover.swap(queue_);
         }
         for (auto& task : leftover) {
-            task();
+            try {
+                task();
+            } catch (const std::exception& e) {
+                fprintf(stderr,
+                        "SerializedExecutor: unhandled exception in "
+                        "leftover task during shutdown: %s\n",
+                        e.what());
+            } catch (...) {
+                fprintf(stderr,
+                        "SerializedExecutor: unhandled non-std exception "
+                        "in leftover task during shutdown\n");
+            }
         }
     }
 
     // Post a task to the executor.  May be called from any thread.
     // Tasks are processed in FIFO order on the executor thread.
-    void post(std::function<void()> task) {
+    // Returns false if the executor is not running (task is silently dropped).
+    bool post(std::function<void()> task) {
+        if (!running_.load(std::memory_order_acquire)) {
+            return false;
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            // Double-check: running_ may have flipped between the check above
+            // and acquiring the mutex.  If the executor has stopped, drop
+            // the task to avoid leaking it (shutdown already drained the
+            // queue).
+            if (!running_.load(std::memory_order_acquire)) {
+                return false;
+            }
             queue_.push_back(std::move(task));
         }
         cv_.notify_one();
+        return true;
     }
 
     // Set a callback that fires after every batch of tasks, even empty
@@ -91,15 +116,38 @@ class SerializedExecutor {
                 batch.swap(queue_);
             }
             for (auto& task : batch) {
-                task();
+                try {
+                    task();
+                } catch (const std::exception& e) {
+                    // Log and swallow: a single bad task must not kill the
+                    // loop.
+                    fprintf(stderr,
+                            "SerializedExecutor: unhandled exception in "
+                            "task: %s\n",
+                            e.what());
+                } catch (...) {
+                    fprintf(stderr,
+                            "SerializedExecutor: unhandled non-std exception "
+                            "in task\n");
+                }
             }
             if (tick_callback_) {
-                tick_callback_();
+                try {
+                    tick_callback_();
+                } catch (const std::exception& e) {
+                    fprintf(stderr,
+                            "SerializedExecutor: unhandled exception in "
+                            "tick callback: %s\n",
+                            e.what());
+                } catch (...) {
+                    fprintf(stderr,
+                            "SerializedExecutor: unhandled non-std exception "
+                            "in tick callback\n");
+                }
             }
         }
     }
 
-    std::string name_;
     std::thread thread_;
     std::atomic<bool> running_{false};
     std::mutex mutex_;

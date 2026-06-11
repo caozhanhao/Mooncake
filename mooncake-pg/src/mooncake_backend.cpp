@@ -202,10 +202,9 @@ MooncakeBackend::MooncakeBackend(
     meta_->size = max_group_size_;  // slot capacity
     meta_->activeSize = size;
     meta_->taskCount = 0;
-    meta_->autoDeactivateOnFailure =
-        options_ ? options_->autoDeactivateOnFailure_ : true;
     meta_->collectiveTimeoutUs = &ctx_.collective_timeout_us;
     meta_->engine = ctx_.engine;
+    meta_->backend = this;
     p2p_proxy_->bindMeta(meta_);
 
     // Legacy activeRanks allocation (for backward compat with GPU kernel).
@@ -240,21 +239,33 @@ MooncakeBackend::MooncakeBackend(
         (uint64_t)p2p_proxy_->credit_region();
     local_endpoint_info_.p2p_ack_region = (uint64_t)p2p_proxy_->ack_region();
 
-    // Set backend pointer and local endpoint in meta for worker thread access.
-    meta_->backend = this;
-    meta_->local_endpoint_info = local_endpoint_info_;
+    // Populate segmentInfos for local rank (worker thread access).
+    meta_->segmentInfos[rank].send_buffer[0] = (uint64_t)send_buffer_[0];
+    meta_->segmentInfos[rank].send_buffer[1] = (uint64_t)send_buffer_[1];
+    meta_->segmentInfos[rank].recv_buffer[0] = (uint64_t)recv_buffer_[0];
+    meta_->segmentInfos[rank].recv_buffer[1] = (uint64_t)recv_buffer_[1];
+    meta_->segmentInfos[rank].send_sync[0] = (uint64_t)cpu_sync_send_region_[0];
+    meta_->segmentInfos[rank].send_sync[1] = (uint64_t)cpu_sync_send_region_[1];
+    meta_->segmentInfos[rank].recv_sync[0] = (uint64_t)cpu_sync_recv_region_[0];
+    meta_->segmentInfos[rank].recv_sync[1] = (uint64_t)cpu_sync_recv_region_[1];
+    meta_->segmentInfos[rank].p2p_credit_region =
+        (uint64_t)p2p_proxy_->credit_region();
+    meta_->segmentInfos[rank].p2p_ack_region =
+        (uint64_t)p2p_proxy_->ack_region();
 
     // ---- Agent-based bootstrap (new path) ----
     // Register this group with the Agent, publish local endpoint, and block
     // until the Coordinator returns the authoritative GroupView.
     {
         group_id_ = static_cast<int32_t>(ctx_.next_group_id);
+        meta_->group_id = group_id_;
 
         // Build GroupDeclaration.
         GroupDeclaration declaration;
         declaration.descriptor.group_id = group_id_;
         declaration.descriptor.rank_order = std::move(initial_rank_order);
-        declaration.auto_deactivate = meta_->autoDeactivateOnFailure;
+        declaration.auto_deactivate =
+            options_ ? options_->autoDeactivateOnFailure_ : true;
 
         // Build initial_view: founding members (ranks 0..size-1) are active.
         // Other ranks' endpoints arrive via publishEndpoint.
@@ -268,8 +279,6 @@ MooncakeBackend::MooncakeBackend(
             local_endpoint_info_;
         declaration.initial_view.members[rank].endpoint_epoch =
             kInitialEndpointEpoch;
-
-        meta_->group_id = group_id_;
 
         // Register with Agent (declares group to Coordinator asynchronously).
         agent_.registerGroup(declaration, this);
@@ -1040,20 +1049,45 @@ void MooncakeBackend::applyViewChange(const GroupDescriptor& descriptor,
         rank_order_ptr_ = std::move(new_rank_order);
     }
 
-    // Publish epoch atomically for lock-free read by worker threads.
-    group_epoch_.store(view.epoch, std::memory_order_release);
-
-    // Sync meta fields for worker thread access.
-    if (meta_) {
-        meta_->groupEpoch.store(view.epoch, std::memory_order_release);
-    }
-
-    // Sync meta->activeRanks from GroupView for GPU kernel access.
+    // Sync TransferGroupMeta for worker thread access.
     if (meta_ && meta_->activeRanks) {
         for (int i = 0;
              i < static_cast<int>(view.members.size()) && i < meta_->size;
              ++i) {
             meta_->activeRanks[i] = view.members[i].active;
+
+            // Update segmentIDs and segmentInfos from GroupView +
+            // TELinkManager.
+            if (view.members[i].active &&
+                view.members[i].endpoint_epoch != kInvalidEpoch) {
+                // Resolve TE segment ID via TELinkManager.
+                auto handle = ctx_.te_link_manager.resolvePeer(
+                    static_cast<GlobalRank>(i));
+                if (handle) {
+                    meta_->segmentIDs[i] = handle->target_id;
+                }
+                // Copy endpoint info from view.
+                meta_->segmentInfos[i].send_buffer[0] =
+                    view.members[i].endpoint_info.send_buffer[0];
+                meta_->segmentInfos[i].send_buffer[1] =
+                    view.members[i].endpoint_info.send_buffer[1];
+                meta_->segmentInfos[i].recv_buffer[0] =
+                    view.members[i].endpoint_info.recv_buffer[0];
+                meta_->segmentInfos[i].recv_buffer[1] =
+                    view.members[i].endpoint_info.recv_buffer[1];
+                meta_->segmentInfos[i].send_sync[0] =
+                    view.members[i].endpoint_info.send_sync[0];
+                meta_->segmentInfos[i].send_sync[1] =
+                    view.members[i].endpoint_info.send_sync[1];
+                meta_->segmentInfos[i].recv_sync[0] =
+                    view.members[i].endpoint_info.recv_sync[0];
+                meta_->segmentInfos[i].recv_sync[1] =
+                    view.members[i].endpoint_info.recv_sync[1];
+                meta_->segmentInfos[i].p2p_credit_region =
+                    view.members[i].endpoint_info.p2p_credit_region;
+                meta_->segmentInfos[i].p2p_ack_region =
+                    view.members[i].endpoint_info.p2p_ack_region;
+            }
         }
     }
 
@@ -1079,7 +1113,12 @@ void MooncakeBackend::markViewStale() {
     auto empty_view = std::make_shared<const GroupView>();
     std::lock_guard<std::mutex> lock(view_mutex_);
     group_view_ptr_ = std::move(empty_view);
-    group_epoch_.store(kInvalidEpoch, std::memory_order_release);
+    // Mark all peers as inactive so worker threads stop using them.
+    if (meta_ && meta_->activeRanks) {
+        for (int i = 0; i < meta_->size; ++i) {
+            meta_->activeRanks[i] = false;
+        }
+    }
 }
 
 GroupEndpointPublication MooncakeBackend::buildEndpointMetadata() const {

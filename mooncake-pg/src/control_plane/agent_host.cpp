@@ -85,7 +85,6 @@ void AgentHost::start() {
                           AgentHost::kCoordinatorAddrTimeout)
                           .count()
                    << "s waiting for coordinator_addr in Store";
-        std::abort();
     }
 
     // Set up periodic tick.
@@ -98,14 +97,15 @@ void AgentHost::start() {
 }
 
 void AgentHost::shutdown() {
-    // Release our reference to the RPC client pool.  In-flight coroutines
-    // on the global I/O executor hold their own shared_ptr copies of the
-    // underlying coro_rpc_client objects, so they complete safely.
+    // Stop RPC server first — no new pushes accepted, in-flight handlers
+    // are guaranteed to have finished posting to the executor.
+    if (rpc_server_) rpc_server_->shutdown();
+    // Drop the shared-state reference so in-flight async coroutines release
+    // their cached clients once they complete.
     if (rpc_client_) rpc_client_.reset();
     // Drain the executor — any callbacks already posted will complete.
     executor_.shutdown();
     te_link_manager_.setEventCallback(nullptr);
-    if (rpc_server_) rpc_server_->shutdown();
 }
 
 // =========================================================================
@@ -252,7 +252,7 @@ ProposeViewUpdateResponse AgentHost::proposeActivate(
     req.group_id = group_id;
     req.source_rank = rank_;
     req.agent_session_epoch = agent_.getAgentSessionEpoch();
-    req.target_ranks = ranks;
+    req.requested_ranks = ranks;
     req.is_activate = true;
     return rpc_client_->call<&CoordinatorRpcService::proposeViewUpdate>(
         coordinator_addr_, req);
@@ -264,7 +264,7 @@ ProposeViewUpdateResponse AgentHost::proposeDeactivate(
     req.group_id = group_id;
     req.source_rank = rank_;
     req.agent_session_epoch = agent_.getAgentSessionEpoch();
-    req.target_ranks = ranks;
+    req.requested_ranks = ranks;
     req.is_activate = false;
     return rpc_client_->call<&CoordinatorRpcService::proposeViewUpdate>(
         coordinator_addr_, req);
@@ -331,11 +331,8 @@ void AgentHost::postTELinkEvent(TELinkEvent event) {
             }
         } else {
             // LinkDown: TELinkManager already called publishLinkDown in
-            // tearDownPeerLink.  We just need the state machine update and
-            // P2P reset fanout to all backends.
-            forEachBackend([&](MooncakeBackend* backend) {
-                backend->onPeerLinkReset(event.peer);
-            });
+            // tearDownPeerLink.  P2P reset is modeled as a
+            // ResetPeerP2PState effect from handleLinkStateChanged.
             runEffects(agent_.handleLinkStateChanged(event.peer, false));
         }
     });
@@ -362,7 +359,11 @@ void AgentHost::startRegisterRpc() {
 
                 if (resp.success) {
                     if (!registration_done_) {
-                        registration_done_ = true;
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                registration_mutex_);
+                            registration_done_ = true;
+                        }
                         registration_cv_.notify_all();
                     }
 
@@ -484,14 +485,13 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                         it->second->markViewStale();
                     }
                 },
+                [this](const NotifyTEUnreachable& e) {
+                    forEachBackend([&](MooncakeBackend* backend) {
+                        backend->onPeerLinkReset(e.peer);
+                    });
+                },
             },
             effect);
-    }
-}
-
-void AgentHost::forEachBackend(std::function<void(MooncakeBackend*)> func) {
-    for (auto& [group_id, backend] : backends_) {
-        func(backend);
     }
 }
 

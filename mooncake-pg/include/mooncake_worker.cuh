@@ -7,7 +7,6 @@
 #include <c10/util/intrusive_ptr.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
-#include <torch/csrc/distributed/c10d/Store.hpp>
 #else
 // MUSA device compilation: minimal includes to avoid mcc compiler crash
 #include <cstddef>
@@ -27,41 +26,34 @@
 #include <unordered_map>
 #include <vector>
 
-#if !defined(__MUSA__)
-#include "control_plane/rpc.h"
-#endif
-
 namespace mooncake {
 
 static constexpr size_t kBufferSize = 1u << 24;
 
 class MooncakeBackend;
 
+struct SegmentInfo {
+    uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2];
+    uint64_t p2p_credit_region;
+    uint64_t p2p_ack_region;
+};
+
 struct TransferGroupMeta {
-    // ---- Always present (MUSA-safe) ----
     int rank;
-    int size;                // slot capacity (max_group_size_)
-    int activeSize;          // count of active members
-    int taskCount;           // round-robin buffer offset counter
-    TransferEngine* engine;  // shared TE handle
-    bool autoDeactivateOnFailure = true;
-    const size_t* collectiveTimeoutUs = nullptr;
+    int size;        // capacity: number of slots allocated (incl. inactive)
+    int activeSize;  // visible group size: number of ranks that participate
+    int taskCount;
     GroupId group_id = 0;
-    MooncakeBackend* backend = nullptr;  // for GroupView / endpoint access
-
-    // GPU kernel needs these (cudaHostAlloc mapped → safe from MUSA path).
-    bool* activeRanks = nullptr;
-    bool* activeRanksDevice = nullptr;
-
-    // ---- MUSA-guarded (torch-dependent types) ----
+    bool* activeRanks;
+    bool* activeRanksDevice;
 #if !defined(__MUSA__)
-    // Per-backend local endpoint (buffer / sync / P2P addresses).
-    GroupEndpointInfo local_endpoint_info;
-    // View epoch for worker validity check.
-    std::atomic<uint64_t> groupEpoch{0};
-    // GPU tensor mirror of activeRanks; synced inside GPU kernel.
     at::Tensor activeRanksTensor;
 #endif
+    TransferEngine* engine;
+    TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
+    SegmentInfo segmentInfos[kMaxNumRanks];
+    const size_t* collectiveTimeoutUs = nullptr;
+    MooncakeBackend* backend = nullptr;  // for failure reporting / link check
 };
 
 #if defined(__CUDACC__) || defined(__MUSA__)
@@ -78,7 +70,7 @@ __global__
     BatchID batchID;
     void* transferGroupMeta;
     int* failedRanksHost = nullptr;
-    int* attemptedRanksHost = nullptr;  // per-op attempted bitmap (new)
+    int* attemptedRanksHost = nullptr;  // per-op attempted bitmap
 };
 
 #if !defined(__MUSA__)

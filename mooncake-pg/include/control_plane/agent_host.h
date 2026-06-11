@@ -201,7 +201,12 @@ class AgentHost : public AgentInterface {
     void tick();
 
     void runEffects(const AgentApplyResult& effects);
-    void forEachBackend(std::function<void(MooncakeBackend*)> func);
+    template <typename F>
+    void forEachBackend(F&& func) {
+        for (auto& [group_id, backend] : backends_) {
+            func(backend);
+        }
+    }
 };
 
 }  // namespace mooncake

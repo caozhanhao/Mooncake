@@ -114,7 +114,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         uint64_t agent_session_epoch = 0;
         std::chrono::steady_clock::time_point last_heartbeat;
         std::vector<uint8_t> link_status;
-        uint64_t warmup_send_addr = 0;
         uint64_t warmup_recv_addr = 0;
     };
 

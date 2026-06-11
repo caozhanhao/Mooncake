@@ -55,6 +55,10 @@ void TELinkManager::init(GlobalRank rank, int max_world_size,
 
     rank_ = rank;
     max_world_size_ = max_world_size;
+    CHECK_GT(max_world_size_, 0);
+    CHECK_LE(max_world_size_, kMaxNumRanks)
+        << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
+        << kMaxNumRanks << ")";
     engine_ = engine;
     local_server_name_ = engine_->getLocalIpAndPort();
     skip_warmup_ = supportFabricMem();

@@ -555,13 +555,6 @@ class P2PProxy {
                std::chrono::microseconds(*p2p_timeout_us_);
     }
 
-    // Map InGroupRank → GlobalRank via the backend.
-    GlobalRank toGlobalRank(int local_rank) const;
-    // Resolve the TE L4 handle for a peer (InGroupRank → GlobalRank → TE).
-    std::optional<PeerReadHandle> resolvePeer(int local_rank) const;
-    // Get the remote endpoint info for a peer via GroupView.
-    const GroupEndpointInfo* getRemoteEndpoint(int local_rank) const;
-
    private:
     struct P2PResources {
         CreditSlot* credit_region_ = nullptr;

@@ -82,12 +82,16 @@ void CoordinatorHost::start() {
 }
 
 void CoordinatorHost::shutdown() {
+    // 1. Stop RPC server — no new requests accepted.
+    if (rpc_server_) rpc_server_->shutdown();
+    // 2. Drain the executor — all posted tasks complete.
     executor_.shutdown();
-    // Safe to clear now — executor thread has exited, no concurrent access.
-    pending_rpcs_.clear();
-    if (rpc_server_) {
-        rpc_server_->shutdown();
+    // 3. Fail any pending 2PC proposals so clients don't hang.
+    for (auto& [propose_id, ctx] : pending_rpcs_) {
+        ctx.response_msg(ProposeViewUpdateResponse{
+            ViewUpdateStatus::Rejected, 0, {}, "coordinator shutting down"});
     }
+    pending_rpcs_.clear();
 }
 
 // ---- RPC post methods ----

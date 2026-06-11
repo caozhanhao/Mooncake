@@ -184,9 +184,9 @@ class BackoffWaiter {
     std::chrono::microseconds current_sleep_;
 };
 // =========================================================================
-// ThreadSafeQueue — lock-free single-producer, single-consumer queue with
-// mutex.  Used for TransferObservationEvent from worker thread → Agent
-// executor.  try_dequeue is non-blocking; enqueue never waits.
+// ThreadSafeQueue — mutex-protected MPMC (multiple-producer,
+// multiple-consumer) queue.  Used for TransferObservationEvent from worker
+// thread → Agent executor.  try_dequeue is non-blocking; enqueue never waits.
 // =========================================================================
 
 template <typename T>
