@@ -2,6 +2,11 @@
 
 #include <cstring>
 
+#ifndef MOONCAKE_EP_USE_MUSA
+#include <cuda.h>
+#include <cuda_runtime.h>
+#endif
+
 #include <cuda_alike.h>
 #include <transfer_engine.h>
 

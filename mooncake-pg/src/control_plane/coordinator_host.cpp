@@ -62,8 +62,14 @@ CoordinatorHost::~CoordinatorHost() { shutdown(); }
 void CoordinatorHost::start() {
     // Start RPC server.
     rpc_server_ = std::make_unique<RpcServer>(/*port=*/0, /*thread_num=*/2);
-    auto rpc_impl = std::make_unique<CoordinatorRpcServiceImpl>(*this);
-    rpc_server_->registerHandler<CoordinatorRpcService>(std::move(rpc_impl));
+    rpc_impl_ = std::make_unique<CoordinatorRpcServiceImpl>(*this);
+    rpc_server_->registerHandler<
+        &CoordinatorRpcServiceImpl::registerAgent,
+        &CoordinatorRpcServiceImpl::heartbeat,
+        &CoordinatorRpcServiceImpl::declareGroup,
+        &CoordinatorRpcServiceImpl::proposeViewUpdate,
+        &CoordinatorRpcServiceImpl::publishEndpoint,
+        &CoordinatorRpcServiceImpl::reportTransferObservation>(rpc_impl_.get());
 
     rpc_server_->start();
 

@@ -175,6 +175,7 @@ class AgentHost : public AgentInterface {
     // RPC infrastructure.
     std::unique_ptr<RpcServer> rpc_server_;
     std::unique_ptr<RpcClient> rpc_client_;
+    std::unique_ptr<AgentRpcServiceImpl> rpc_impl_;
 
     // Bootstrap synchronization: condition_variable so callers can retry
     // waitUntilRegistered() after a timeout without double-get_future() UB.

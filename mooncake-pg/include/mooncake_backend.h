@@ -298,6 +298,12 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // Mark this backend's view as stale (called when Agent goes OFFLINE).
     void markViewStale();
 
+    // Sync the activeRanksTensor on CPU/GPU from the current GroupView.
+    void syncActiveRanksTensor();
+
+    // Free meta_->activeRanks and reset device pointers.
+    void destroyMeta();
+
     // Build a GroupEndpointMetadata for this backend's current local endpoint.
     // Called by AgentHost after (re-)registration to re-publish endpoints.
     GroupEndpointPublication buildEndpointMetadata() const;

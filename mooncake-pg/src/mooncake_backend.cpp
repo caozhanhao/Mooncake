@@ -39,8 +39,8 @@ MooncakeBackend::MooncakeBackend(
                    distBackendOpts.group_size),
       ctx_(ctx),
       options_(std::move(options)),
-      agent_(agent),
-      isCpu_(isCpu) {
+      isCpu_(isCpu),
+      agent_(agent) {
     const int rank = distBackendOpts.group_rank;
     const int size = distBackendOpts.group_size;
     const int max_group_size = (options_ && options_->maxWorldSize_ > 0)

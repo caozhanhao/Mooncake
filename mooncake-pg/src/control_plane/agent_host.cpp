@@ -52,8 +52,11 @@ void AgentHost::start() {
 
     // Start Agent RPC server.
     rpc_server_ = std::make_unique<RpcServer>(/*port=*/0, /*thread_num=*/2);
-    auto rpc_impl = std::make_unique<AgentRpcServiceImpl>(*this);
-    rpc_server_->registerHandler<AgentRpcService>(std::move(rpc_impl));
+    rpc_impl_ = std::make_unique<AgentRpcServiceImpl>(*this);
+    rpc_server_->registerHandler<&AgentRpcServiceImpl::onPeerJoined,
+                                 &AgentRpcServiceImpl::onRankStateUpdate,
+                                 &AgentRpcServiceImpl::onViewUpdate>(
+        rpc_impl_.get());
     if (!rpc_server_->start()) {
         LOG(ERROR) << "AgentHost: failed to start RPC server";
     }

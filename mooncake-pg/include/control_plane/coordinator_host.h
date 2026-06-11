@@ -105,6 +105,7 @@ class CoordinatorHost {
     // RPC infrastructure.
     std::unique_ptr<RpcServer> rpc_server_;
     std::unique_ptr<RpcClient> rpc_client_;
+    std::unique_ptr<CoordinatorRpcServiceImpl> rpc_impl_;
 
     // Host maintains the propose_id → RPC context mapping.
     // 2PC state is inside CentralizedCoordinatorStateMachine; Host just stores

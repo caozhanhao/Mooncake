@@ -36,9 +36,13 @@ class RpcServer {
    public:
     explicit RpcServer(uint16_t port = 0, unsigned thread_num = 2);
 
-    template <typename Service>
-    void registerHandler(std::unique_ptr<Service> impl) {
-        server_->register_handler<Service>(std::move(impl));
+    // Register coro_rpc service handler(s).  coro_rpc expects non-type
+    // template parameters (function pointers) and a raw pointer to the
+    // service instance.  Caller must keep *impl alive for the server
+    // lifetime.
+    template <auto First, auto... Rest>
+    void registerHandler(util::class_type_t<decltype(First)>* impl) {
+        server_->register_handler<First, Rest...>(impl);
     }
 
     bool start();
@@ -139,16 +143,13 @@ class RpcClient {
             }
 
             try {
-                // send_request returns Lazy<Lazy<async_rpc_result<T>>>.
-                // async_rpc_result<T> wraps the value in
-                // async_rpc_result_value_t<T>; .result() extracts T.
-                auto send_lazy = co_await client->send_request<Func>(req);
-                auto res = co_await std::move(send_lazy);
-                if (res) {
-                    cb(std::move(res.value().result()));
+                // call<Func> returns Lazy<rpc_result<T>> — single co_await.
+                auto result = co_await client->call<Func>(req);
+                if (result) {
+                    cb(std::move(result.value()));
                 } else {
                     LOG(ERROR) << "RpcClient: async rpc to " << addr
-                               << " failed: " << res.error().msg;
+                               << " failed: " << result.error().msg;
                     cb(ResponseType{});
                 }
             } catch (const std::exception& e) {
@@ -172,8 +173,9 @@ class RpcClient {
             auto client = co_await getOrCreateClientAsync(state, addr);
             if (!client) co_return;
             try {
-                auto send_lazy = co_await client->send_request<Func>(req);
-                co_await std::move(send_lazy);
+                // call<Func> returns Lazy<rpc_result<T>> — single co_await.
+                // We discard the result for fire-and-forget.
+                co_await client->call<Func>(req);
             } catch (...) {
             }
         }();

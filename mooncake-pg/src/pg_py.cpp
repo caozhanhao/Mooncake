@@ -64,7 +64,7 @@ c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeCpuBackend(
     auto& host = initControlPlane(distBackendOpts.store, rank, max_size);
     return c10::make_intrusive<MooncakeBackend>(std::move(distBackendOpts),
                                                 std::move(backendOptions), host,
-                                                true, g_ctx);
+                                                g_ctx, true);
 }
 
 __attribute__((constructor)) static void MooncakeBackendConstructor() {
