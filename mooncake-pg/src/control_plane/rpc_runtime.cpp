@@ -82,6 +82,18 @@ getOrCreateClientAsync(std::shared_ptr<RpcSharedState> state,
     }
 }
 
+void spawnOnExecutor(async_simple::coro::Lazy<void> task) {
+    auto executor = coro_io::get_global_executor();
+    std::move(task).via(executor).start([](auto&&) {});
+}
+
+std::unique_ptr<coro_rpc::coro_rpc_client> createSyncClient() {
+    coro_rpc::coro_rpc_client::config config;
+    config.connect_timeout_duration = std::chrono::seconds(3);
+    return std::make_unique<coro_rpc::coro_rpc_client>(
+        coro_io::get_global_executor(), config);
+}
+
 }  // namespace rpc_detail
 
 // =========================================================================

@@ -18,7 +18,6 @@
 
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
-#include <ylt/coro_io/coro_io.hpp>
 
 #include <async_simple/coro/SyncAwait.h>
 #include <async_simple/coro/Lazy.h>
@@ -75,6 +74,15 @@ async_simple::coro::Lazy<std::shared_ptr<coro_rpc::coro_rpc_client>>
 getOrCreateClientAsync(std::shared_ptr<RpcSharedState> state,
                        const std::string& addr);
 
+// Spawn a Lazy<void> coroutine on the global I/O executor.
+// Defined in rpc_runtime.cpp to avoid instantiating coro_io::get_global_
+// executor() in every TU that includes this header (GCC 11 compatibility).
+void spawnOnExecutor(async_simple::coro::Lazy<void> task);
+
+// Create a coro_rpc_client with a local io_context (for sync RPC).
+// Defined in rpc_runtime.cpp to avoid instantiating coro_io in the header.
+std::unique_ptr<coro_rpc::coro_rpc_client> createSyncClient();
+
 // Fire-and-forget coroutine: connect, send_request, discard result.
 // Uses send_request<Func, Req> with explicit Args... to avoid GCC 11
 // overload resolution issues with non-type template parameters.
@@ -85,7 +93,7 @@ async_simple::coro::Lazy<void> sendCoroutine(
     if (!client) co_return;
     try {
         auto send_lazy =
-            co_await client->send_request<Func, Req>(std::move(req));
+            co_await client->template send_request<Func, Req>(std::move(req));
         co_await std::move(send_lazy);
     } catch (...) {
     }
@@ -109,7 +117,7 @@ async_simple::coro::Lazy<void> callAsyncCoroutine(
         // send_request returns Lazy<Lazy<async_rpc_result<T>>>.
         // Outer co_await: request sent.  Inner co_await: response received.
         auto send_lazy =
-            co_await client->send_request<Func, Req>(std::move(req));
+            co_await client->template send_request<Func, Req>(std::move(req));
         auto res = co_await std::move(send_lazy);
         if (res) {
             cb(std::move(res.value().result()));
@@ -149,19 +157,16 @@ class RpcClient {
         // with GCC 11 and non-type template parameters).
         using ResponseType = decltype(coro_rpc::get_return_type<Func>());
 
-        coro_rpc::coro_rpc_client::config config;
-        config.connect_timeout_duration = std::chrono::seconds(3);
-        coro_rpc::coro_rpc_client client(coro_io::get_global_executor(),
-                                         config);
+        auto client = rpc_detail::createSyncClient();
 
-        auto ec = async_simple::coro::syncAwait(client.connect(addr));
+        auto ec = async_simple::coro::syncAwait(client->connect(addr));
         if (ec) {
             LOG(ERROR) << "RpcClient: call connect failed to " << addr << ": "
                        << ec.message();
             return ResponseType{};
         }
         auto result =
-            async_simple::coro::syncAwait(client.call_for<Func>(timeout, req));
+            async_simple::coro::syncAwait(client->call_for<Func>(timeout, req));
         if (!result) {
             LOG(ERROR) << "RpcClient: call RPC failed: " << result.error().msg;
             return ResponseType{};
@@ -181,8 +186,7 @@ class RpcClient {
             rpc_detail::callAsyncCoroutine<Func, Req, ResponseType, Callback>(
                 state_, addr, std::move(req), std::move(cb));
 
-        auto executor = coro_io::get_global_executor();
-        std::move(task).via(executor).start([](auto&&) {});
+        rpc_detail::spawnOnExecutor(std::move(task));
     }
 
     // ---- Fire-and-forget ----
@@ -191,8 +195,7 @@ class RpcClient {
         auto task =
             rpc_detail::sendCoroutine<Func, Req>(state_, addr, std::move(req));
 
-        auto executor = coro_io::get_global_executor();
-        std::move(task).via(executor).start([](auto&&) {});
+        rpc_detail::spawnOnExecutor(std::move(task));
     }
 
     // ---- Connection health ----
