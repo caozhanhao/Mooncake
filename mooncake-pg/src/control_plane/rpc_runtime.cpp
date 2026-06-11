@@ -39,12 +39,14 @@ void RpcServer::shutdown() {
 }
 
 // =========================================================================
-// RpcClient
+// rpc_detail::getOrCreateClientAsync
 // =========================================================================
 
+namespace rpc_detail {
+
 async_simple::coro::Lazy<std::shared_ptr<coro_rpc::coro_rpc_client>>
-RpcClient::getOrCreateClientAsync(std::shared_ptr<SharedState> state,
-                                  const std::string& addr) {
+getOrCreateClientAsync(std::shared_ptr<RpcSharedState> state,
+                       const std::string& addr) {
     // Fast path: lookup under lock.
     {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -79,6 +81,12 @@ RpcClient::getOrCreateClientAsync(std::shared_ptr<SharedState> state,
         co_return client;
     }
 }
+
+}  // namespace rpc_detail
+
+// =========================================================================
+// RpcClient
+// =========================================================================
 
 bool RpcClient::isConnected(const std::string& addr) const {
     std::lock_guard<std::mutex> lock(state_->mutex);
