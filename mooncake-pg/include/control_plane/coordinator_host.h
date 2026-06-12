@@ -18,9 +18,48 @@ class RpcServer;
 class RpcClient;
 
 // =========================================================================
-// CoordinatorRpcServiceImpl — thin RPC handler that forwards all calls
-// to CoordinatorHost::post*().
+// Control Plane Architecture (Coordinator side)
 // =========================================================================
+//
+// The Coordinator runs inside Rank 0's process.  It is the authoritative
+// source of truth for rank health (RankState) and group membership (GroupView).
+//
+//   Agent (any rank)                 CoordinatorHost (Rank 0)
+//   +-----------------+              +---------------------------+
+//   | registerAgent   |--- RPC ----->| postRegister()            |
+//   | heartbeat       |--- RPC ----->| postHeartbeat()           |
+//   | proposeViewUpd  |--- RPC ----->| postProposeViewUpdate()   |
+//   | publishEndpoint |--- RPC ----->| postPublishEndpoint()     |
+//   | reportTransfer  |--- RPC ----->| postTransferObservation() |
+//   +-----------------+              +---------------------------+
+//                                            |
+//                                    SerializedExecutor
+//                                            |
+//                              +-------------------------------+
+//                              | CentralizedCoordinatorStateMachine |
+//                              |  (pure state machine, no I/O)     |
+//                              +-------------------------------+
+//                                            |
+//                                    returns Effect list
+//                                            |
+//                              +-------------------------------+
+//                              | runEffects()                   |
+//                              |  RankStateUpdatePush -> broadcast |
+//                              |  ViewUpdatePush -> callAsync    |
+//                              |  ReplyViewUpdateEffect -> reply |
+//                              +-------------------------------+
+//
+// Key design: the state machine is 100% synchronous and lock-free.
+// All I/O (RPC, network) happens in the Host layer via effects.
+//
+// Two independent 2PC flows:
+//   1. Proposal 2PC (activate/deactivate): propose_id-keyed, Strict Barrier
+//   2. Bootstrap 2PC (group readiness): group_id-keyed, waits for all ACKs
+// Both share the same ViewUpdate ACK path; CoordinatorHost routes each ACK
+// to the correct handler based on whether the push had a propose_id.
+
+// CoordinatorRpcServiceImpl  - thin RPC handler that forwards all calls
+// to CoordinatorHost::post*().
 
 class CoordinatorHost;
 
@@ -49,18 +88,16 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
     CoordinatorHost& host_;
 };
 
-// =========================================================================
-// CoordinatorHost — execution host for the Coordinator state machine.
+// CoordinatorHost  - execution host for the Coordinator state machine.
 //
 // Owns:
 //   - CentralizedCoordinatorStateMachine (pure state machine)
 //   - SerializedExecutor (single-threaded event loop)
-//   - RPC server (for Agent→Coordinator calls)
-//   - RpcClient (for Coordinator→Agent pushes)
+//   - RPC server (for Agent->Coordinator calls)
+//   - RpcClient (for Coordinator->Agent pushes)
 //
 // All state machine methods execute on the SerializedExecutor thread.
 // RPC handlers are thin: they just post to the executor.
-// =========================================================================
 
 class CoordinatorHost {
    public:
@@ -71,8 +108,6 @@ class CoordinatorHost {
 
     void start();
     void shutdown();
-
-    // ---- RPC post methods (called from RPC handler thread) ----
 
     void postRegister(coro_rpc::context<RegisterResponse> ctx,
                       RegisterRequest req);
@@ -111,7 +146,7 @@ class CoordinatorHost {
     std::unique_ptr<RpcClient> rpc_client_;
     std::unique_ptr<CoordinatorRpcServiceImpl> rpc_impl_;
 
-    // Host maintains the propose_id → RPC context mapping.
+    // Host maintains the propose_id -> RPC context mapping.
     // 2PC state is inside CentralizedCoordinatorStateMachine; Host just stores
     // the RPC context for replying when the state machine emits
     // ReplyViewUpdateEffect.

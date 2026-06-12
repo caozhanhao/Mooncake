@@ -71,22 +71,14 @@ MooncakeBackend::MooncakeBackend(
         }
     }
 
-    // Initialize transfer engine
+    // Engine and LinkManager are initialized by initControlPlane() (called
+    // before the first MooncakeBackend constructor).  The external_engine
+    // override still applies here.
     if (ctx_.external_engine) {
-        // Use externally-provided engine (already initialized), skip init.
         ctx_.engine = ctx_.external_engine;
-        ctx_.engine_initialized = true;
-    } else if (!ctx_.engine_initialized) {
-        ctx_.engine->init(P2PHANDSHAKE, ctx_.host_ip);
         ctx_.engine_initialized = true;
     }
     localServerName_ = ctx_.engine->getLocalIpAndPort();
-
-    // Initialize process-level LinkManager (first backend triggers init).
-    auto& link_mgr = ctx_.link_manager;
-    if (!link_mgr.isInitialized()) {
-        link_mgr.init(rank, max_group_size_, ctx_.engine);
-    }
 
     // Build rank_order from global_ranks_in_group (or identity fallback).
     // This is used for the GroupDeclaration and for meta_->rank_order.
@@ -105,6 +97,23 @@ MooncakeBackend::MooncakeBackend(
     // Fill remaining slots for future joiners.
     for (int i = size; i < max_group_size_; ++i) {
         initial_rank_order.push_back(static_cast<GlobalRank>(i));
+    }
+
+    {
+        std::string gr;
+        for (size_t i = 0; i < globalRanks.size(); ++i) {
+            if (i) gr += ",";
+            gr += std::to_string(globalRanks[i]);
+        }
+        std::string ro;
+        for (size_t i = 0; i < initial_rank_order.size(); ++i) {
+            if (i) ro += ",";
+            ro += std::to_string(initial_rank_order[i]);
+        }
+        LOG(INFO) << "MooncakeBackend: rank=" << rank << " size=" << size
+                  << " globalRanks=[" << gr << "]"
+                  << " initial_rank_order=[" << ro << "]"
+                  << " globalRank=" << meta_->globalRank;
     }
 
     // Register buffers

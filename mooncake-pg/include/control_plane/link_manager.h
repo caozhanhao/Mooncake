@@ -19,20 +19,16 @@
 
 namespace mooncake {
 
-// =========================================================================
-// PeerReadHandle — lock-free handle returned by resolvePeer().
+// PeerReadHandle  - lock-free handle returned by resolvePeer().
 //
 // Only contains L4-level info needed to construct a TransferRequest.
 // Worker combines this with GroupEndpointInfo from GroupView.
-// =========================================================================
 
 struct PeerReadHandle {
     TransferMetadata::SegmentID target_id;
 };
 
-// =========================================================================
-// TELinkEvent — emitted when a physical TE link transitions up/down.
-// =========================================================================
+// TELinkEvent  - emitted when a physical TE link transitions up/down.
 
 struct TELinkEvent {
     enum class Kind { LinkUp, LinkDown } kind = Kind::LinkDown;
@@ -40,8 +36,7 @@ struct TELinkEvent {
     std::optional<TransferMetadata::SegmentID> target_id;
 };
 
-// =========================================================================
-// LinkManager — process-level manager for shared TE physical links.
+// LinkManager  - process-level manager for shared TE physical links.
 // Owned by MooncakeProcessContext; one instance per process.
 //
 // Responsibilities:
@@ -55,16 +50,13 @@ struct TELinkEvent {
 //   - A dedicated poller thread drives candidate probes and warmup state
 //     machine. It does NOT use SerializedExecutor because L4 operations
 //     (openSegment, RDMA warmup) may block.
-// =========================================================================
 
 class LinkManager {
    public:
     LinkManager() = default;
 
-    // ---- Lifecycle ----
-
     // Initialize.  Must be called once, before any backend uses it.
-    // Idempotent — second call is a no-op.
+    // Idempotent  - second call is a no-op.
     void init(GlobalRank rank, int max_world_size, TransferEngine* engine);
 
     bool isInitialized() const {
@@ -80,9 +72,6 @@ class LinkManager {
     // skipped, e.g. MNNVL fabric).  Published to peers via RegisterRequest
     // so they can RDMA-write the warmup handshake signal.
     uint64_t getWarmupRecvAddr() const;
-
-    // ---- Resource management (called by Agent / AgentHost, low
-    // frequency) ----
 
     // Mark a peer as a connection candidate and start low-frequency probe.
     // Safe to call when the peer is already a candidate or connected.
@@ -100,12 +89,8 @@ class LinkManager {
 
     bool isConnected(GlobalRank peer) const;
 
-    // ---- Event callback ----
-
     using EventCallback = std::function<void(TELinkEvent)>;
     void setEventCallback(EventCallback callback);
-
-    // ---- Worker read model (lock-free, high frequency) ----
 
     // Publish the Coordinator-authoritative RankState snapshot for all peers.
     // Called by AgentHost from the executor thread.
@@ -121,8 +106,6 @@ class LinkManager {
     // Used by pg.get_peer_state().
     bool isRankReady(GlobalRank peer) const;
 
-    // ---- Internal: called by AgentHost from the executor thread ----
-
     void publishLinkUp(GlobalRank peer, TransferMetadata::SegmentID target_id);
     void publishLinkDown(GlobalRank peer);
 
@@ -132,9 +115,7 @@ class LinkManager {
     LinkManager& operator=(const LinkManager&) = delete;
 
    private:
-    // ================================================================
     // Resource state (mutex-protected)
-    // ================================================================
 
     enum class PeerLinkState : uint8_t {
         IDLE = 0,
@@ -148,7 +129,7 @@ class LinkManager {
         PeerLinkState state = PeerLinkState::IDLE;
         std::string server_name;
         bool candidate = false;
-        bool skip_warmup = false;  // MNNVL fabric — warmup skipped
+        bool skip_warmup = false;  // MNNVL fabric  - warmup skipped
 
         std::optional<TransferMetadata::SegmentID> target_id;
         std::optional<BatchID> warmup_batch_id;
@@ -167,9 +148,7 @@ class LinkManager {
     std::array<PeerLink, kMaxNumRanks> peers_;
     mutable std::mutex peers_mutex_;
 
-    // ================================================================
     // Worker read model (atomic, lock-free)
-    // ================================================================
 
     struct PeerReadState {
         std::atomic<uint8_t> rank_state{0};      // RankState cast to uint8_t
@@ -183,16 +162,14 @@ class LinkManager {
 
     std::array<PeerReadState, kMaxNumRanks> read_state_;
 
-    // ================================================================
     // Poller infrastructure
-    // ================================================================
 
     GlobalRank rank_ = kInvalidGlobalRank;
     int max_world_size_ = 0;
     TransferEngine* engine_ = nullptr;
     std::string local_server_name_;
 
-    // Warmup region — process-level, allocated once in init().
+    // Warmup region  - process-level, allocated once in init().
     // nullptr when skip_warmup_ is true (MNNVL fabric).
     std::unique_ptr<int32_t[]> warmup_send_region_;
     std::unique_ptr<int32_t[]> warmup_recv_region_;

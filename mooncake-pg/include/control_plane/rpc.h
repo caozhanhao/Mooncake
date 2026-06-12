@@ -6,7 +6,6 @@
 #include <variant>
 #include <vector>
 
-// Workaround for yalantinglibs #1152
 #include <csignal>
 
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -90,7 +89,7 @@ struct ProposeViewUpdateResponse {
 };
 
 // Per-(group_id, rank) endpoint publication unit.
-// agent_session_epoch is NOT included here — the Host fills it in the
+// agent_session_epoch is NOT included here  - the Host fills it in the
 // enclosing PublishEndpointRequest before sending the RPC.
 struct GroupEndpointPublication {
     GroupId group_id = 0;
@@ -164,7 +163,10 @@ struct ViewUpdateEffect {
     GroupDescriptor descriptor;
     GroupView view;
     std::vector<GlobalRank> required_acks;
-    std::optional<uint64_t> propose_id = std::nullopt;  // set for proposals
+    // Set for proposal-originated pushes (activate/deactivate), nullopt for
+    // bootstrap and best-effort endpoint updates.  Used by CoordinatorHost to
+    // route ACKs back to the correct 2PC handler.
+    std::optional<uint64_t> propose_id = std::nullopt;
 };
 
 struct ReplyViewUpdateEffect {

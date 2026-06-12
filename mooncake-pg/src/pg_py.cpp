@@ -21,6 +21,19 @@ static std::once_flag g_init_control_plane_once;
 static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
                                    int rank, int max_world_size) {
     std::call_once(g_init_control_plane_once, [&] {
+        // Ordering constraint: AgentHost::start() sends registerAgent
+        // immediately, which includes LinkManager's localServerName() and
+        // getWarmupRecvAddr().  These must be non-empty, so the engine and
+        // LinkManager must be initialized BEFORE AgentHost starts.
+        if (!g_ctx.engine_initialized) {
+            g_ctx.engine->init(P2PHANDSHAKE, g_ctx.host_ip);
+            g_ctx.engine_initialized = true;
+        }
+        if (!g_ctx.link_manager.isInitialized()) {
+            g_ctx.link_manager.init(static_cast<GlobalRank>(rank),
+                                    max_world_size, g_ctx.engine);
+        }
+
         // Rank 0 hosts the Coordinator in-process.  It must start BEFORE
         // AgentHost so the coordinator_addr key is in the Store when
         // AgentHost::start() reads it.

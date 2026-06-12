@@ -15,23 +15,15 @@ class AgentStateMachine {
    public:
     AgentStateMachine(GlobalRank rank, int max_world_size);
 
-    // ---- Group lifecycle (called from executor thread) ----
-
     void registerGroup(const GroupDeclaration& declaration);
     void unregisterGroup(GroupId group_id);
-
-    // ---- Event handlers (return effects for Host execution) ----
 
     AgentApplyResult handlePeerJoined(const PeerJoinedPush& push);
     AgentApplyResult handleRankStateUpdate(const RankStateUpdatePush& push);
     AgentApplyResult handleViewUpdate(const ViewUpdatePush& push);
     AgentApplyResult handleLinkStateChanged(GlobalRank peer, bool connected);
 
-    // ---- Heartbeat construction ----
-
     HeartbeatRequest buildHeartbeat() const;
-
-    // ---- Registration lifecycle ----
 
     AgentApplyResult applyRegisterResponse(const RegisterResponse& resp);
     AgentApplyResult prepareCleanSlateRegister();
@@ -42,12 +34,8 @@ class AgentStateMachine {
         agent_session_epoch_.store(epoch, std::memory_order_release);
     }
 
-    // ---- Transfer observation processing ----
-
     AgentApplyResult processTransferObservation(
         const TransferObservationEvent& event);
-
-    // ---- Queries ----
 
     GroupView getGroupView(GroupId group_id) const;
     const GroupDescriptor* getGroupDescriptor(GroupId group_id) const;
@@ -59,8 +47,6 @@ class AgentStateMachine {
     void setCoordinatorConnected() {
         coordinator_connection_ = CoordinatorConnection::Connected;
     }
-
-    // ---- State access for Host ----
 
     RankState getSelfRankState() const { return rank_state_; }
     uint64_t getAgentSessionEpoch() const {
@@ -85,8 +71,20 @@ class AgentStateMachine {
     std::unordered_map<GroupId, GroupEntry> groups_;
 
     std::array<RankState, kMaxNumRanks> global_rank_states_{};
+
+    // Physical link state from LinkManager events (LinkUp/LinkDown).
     std::array<bool, kMaxNumRanks> link_connected_{};
-    std::array<uint8_t, kMaxNumRanks> link_status_cache_{};
+
+    // Last peer reachability status reported to the Coordinator.
+    // Updated by processTransferObservation when a transfer observation
+    // differs from the last reported value (both success and failure
+    // transitions trigger an immediate reportTransferObservation RPC).
+    // Seeded to true on peer registration so the first observation of
+    // any kind (success or failure) triggers a report.
+    std::array<bool, kMaxNumRanks> last_reported_peer_status_{};
+
+    // Snapshot of Coordinator-authoritative rank states, published to
+    // LinkManager for worker-facing isRankReady() queries.
     std::array<uint8_t, kMaxNumRanks> rank_state_snapshot_{};
 
     std::array<std::optional<RankConnectionMetadata>, kMaxNumRanks>
@@ -94,8 +92,6 @@ class AgentStateMachine {
 
     CoordinatorConnection coordinator_connection_ =
         CoordinatorConnection::Disconnected;
-
-    // ---- Internal helpers ----
 
     bool rankInRange(GlobalRank rank) const {
         return rank >= 0 && rank < max_world_size_;

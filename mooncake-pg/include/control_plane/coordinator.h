@@ -13,14 +13,12 @@
 
 namespace mooncake {
 
-// =========================================================================
-// CoordinatorStateMachine — abstract interface for the control-plane server
+// CoordinatorStateMachine  - abstract interface for the control-plane server
 // state machine.
 //
 // All methods are pure, synchronous, single-threaded functions.  They mutate
 // internal state, return a response (if applicable) and a list of side-effects
 // for the Host to execute.  No RPC, no I/O, no threads.
-// =========================================================================
 
 class CoordinatorStateMachine {
    public:
@@ -58,16 +56,14 @@ class CoordinatorStateMachine {
                                                             uint64_t epoch) = 0;
 };
 
-// =========================================================================
-// CentralizedCoordinatorStateMachine — single-node implementation of the
+// CentralizedCoordinatorStateMachine  - single-node implementation of the
 // Coordinator state machine.
 //
 // Runs inside the Rank 0 process.  All state lives in std::array /
-// std::unordered_map — the fixed kMaxNumRanks cap keeps allocation simple.
+// std::unordered_map  - the fixed kMaxNumRanks cap keeps allocation simple.
 //
 // Thread safety: NOT thread-safe.  Must be called from a single thread
 // (the Host's SerializedExecutor).
-// =========================================================================
 
 class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
    public:
@@ -102,8 +98,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                                                     GlobalRank rank,
                                                     uint64_t epoch) override;
 
-    // ---- Public accessors for Host use ----
-
     RankState getRankState(GlobalRank rank) const {
         if (!rankInValidRange(rank)) return RankState::OFFLINE;
         return ranks_[rank].state;
@@ -117,8 +111,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
    private:
     int max_world_size_;
 
-    // ---- Per-rank state ----
-
     struct RankInfo {
         RankState state = RankState::OFFLINE;
         std::string agent_addr;
@@ -131,15 +123,20 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     std::array<RankInfo, kMaxNumRanks> ranks_;
 
-    // ---- Per-group state ----
-
     std::unordered_map<GroupId, GroupView> group_views_;
     std::unordered_map<GroupId, GroupDescriptor> group_descriptors_;
     std::unordered_map<GroupId, bool> group_auto_deactivate_;
 
-    // ---- 2PC ACK tracking ----
+    //
+    // Two independent 2PC flows share the same ViewUpdate ACK path:
+    //   1. Proposal 2PC (activate/deactivate) - keyed by propose_id
+    //   2. Bootstrap 2PC (initial group readiness) - keyed by group_id
+    //
+    // Both flows broadcast a ViewUpdate to agents and wait for ACKs.
+    // The CoordinatorHost routes each ACK to the correct handler based on
+    // whether the push had a propose_id (proposal) or not (bootstrap).
 
-    // Proposal 2PC (activate/deactivate).  Maps propose_id → pending state.
+    // Proposal 2PC (activate/deactivate).  Maps propose_id -> pending state.
     struct PendingProposal {
         uint64_t propose_id = 0;
         GroupId group_id = 0;
@@ -149,7 +146,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     };
     std::unordered_map<uint64_t, PendingProposal> pending_proposal_acks_;
 
-    // Bootstrap 2PC.  Maps group_id → set of ranks whose ACK is still
+    // Bootstrap 2PC.  Maps group_id -> set of ranks whose ACK is still
     // pending during the BootstrapSyncing phase.
     std::unordered_map<GroupId, std::unordered_set<GlobalRank>>
         pending_bootstrap_acks_;
@@ -157,16 +154,19 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     static constexpr auto kProposeTimeout = std::chrono::seconds(2);
     static constexpr auto kHeartbeatTimeout = std::chrono::seconds(5);
 
-    // ---- Private helper methods ----
-
     void transitionToOffline(GlobalRank rank,
                              std::vector<CoordinatorEffect>& effects);
     void transitionToSynced(GlobalRank rank,
                             std::vector<CoordinatorEffect>& effects);
     void updateRankHealth(std::vector<CoordinatorEffect>& effects);
 
-    // Bootstrap state machine driver.  Called after every state-changing
-    // operation to check if any group can progress through its lifecycle.
+    // Bootstrap state machine driver.  Advances groups through:
+    //   Bootstrapping -> BootstrapSyncing (when all active ranks are HEALTHY
+    //                    and have published endpoints)
+    //   BootstrapSyncing -> Ready (when all active ranks have ACKed)
+    //
+    // Called after every state-changing operation (handlePublishEndpoint,
+    // handleBootstrapAck, updateRankHealth).
     void checkGroupTransitions(std::vector<CoordinatorEffect>& effects);
 
     bool isMutuallyConnected(GlobalRank a, GlobalRank b) const;

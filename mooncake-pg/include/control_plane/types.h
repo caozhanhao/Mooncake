@@ -16,11 +16,21 @@ constexpr int kMaxNumRanks = 64;
 
 // Epoch sentinels.  All epochs start at kInvalidEpoch (0) and only increase
 // from there.  A value of kInvalidEpoch means "not yet initialised" / "stale".
-// The first real epoch value is ≥ 1.
+// The first real epoch value is >= 1.
 constexpr uint64_t kInvalidEpoch = 0;
 constexpr uint64_t kInitialEndpointEpoch = 1;
 
-// Process-level state for a rank
+// Process-level state for a rank.  All transitions are driven by the
+// Coordinator (authoritative); the Agent never self-demotes.
+//
+//   registerAgent()         Coordinator computes TE HealthySet
+//        |                  (heartbeat + transfer observations)
+//        v                         |
+//   OFFLINE -> SYNCED ---------> HEALTHY
+//        ^                         |
+//        |   heartbeat timeout     |   excluded from HealthySet
+//        +--- or disconnect -------+-----> SYNCED
+//
 enum class RankState : uint8_t {
     OFFLINE = 0,
     SYNCED = 1,
@@ -52,9 +62,27 @@ struct GroupMember {
 };
 
 // Group lifecycle status.
-// Bootstrapping  – collecting endpoints and waiting for all ranks to become
-// HEALTHY. BootstrapSyncing – Coordinator initiated 2PC barrier, waiting for
-// ACKs. Ready          – barrier达成, all ranks ready for data-plane transfers.
+//
+//   declareGroup()
+//       |
+//       v
+//   Bootstrapping  -- all active ranks HEALTHY + have endpoints -->
+//   BootstrapSyncing
+//       (waiting for       (Coordinator broadcasts ViewUpdate,
+//        publishEndpoint     waits for ACKs from all active ranks)
+//        calls)                        |
+//                                      v  (all ACKs received)
+//                                  Ready
+//                               (group usable for data-plane transfers)
+//
+//   Bootstrapping      - collecting endpoints and waiting for all active ranks
+//                        to become HEALTHY with valid endpoints.
+//   BootstrapSyncing   - Coordinator initiated 2PC barrier; waiting for all
+//                        active ranks to ACK the initial ViewUpdate.
+//                        If a peer dies here, waitUntilGroupReady() hangs
+//                        until its timeout.
+//   Ready              - barrier complete; all ranks ready for data-plane
+//                        transfers.
 enum class GroupStatus : uint8_t {
     Bootstrapping = 0,
     BootstrapSyncing = 1,

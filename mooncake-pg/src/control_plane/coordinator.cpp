@@ -1,7 +1,6 @@
 #include "control_plane/coordinator.h"
 
 #include <algorithm>
-#include <bit>
 #include <numeric>
 #include <set>
 
@@ -9,9 +8,7 @@
 
 namespace mooncake {
 
-// =========================================================================
 // Constructor
-// =========================================================================
 
 CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
     int max_world_size)
@@ -26,9 +23,7 @@ CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
     }
 }
 
-// =========================================================================
-// §7.5  registerAgent
-// =========================================================================
+// registerAgent
 
 CoordinatorApplyResult<RegisterResponse>
 CentralizedCoordinatorStateMachine::handleRegister(const RegisterRequest& req) {
@@ -40,9 +35,9 @@ CentralizedCoordinatorStateMachine::handleRegister(const RegisterRequest& req) {
     }
     auto& info = ranks_[req.rank];
 
-    // --- Identity check ---
+    // Identity check
     // If the rank already has an active registration AND the request comes
-    // from a different process → reject.  Replacement must wait for the old
+    // from a different process -> reject.  Replacement must wait for the old
     // process to be heartbeat-timed-out to OFFLINE.
     bool same_peer = (info.agent_addr == req.agent_addr &&
                       info.te_server_name == req.te_server_name);
@@ -74,9 +69,7 @@ CentralizedCoordinatorStateMachine::handleRegister(const RegisterRequest& req) {
     return result;
 }
 
-// =========================================================================
-// §7.5  heartbeat
-// =========================================================================
+// heartbeat
 
 CoordinatorApplyResult<HeartbeatResponse>
 CentralizedCoordinatorStateMachine::handleHeartbeat(
@@ -109,9 +102,7 @@ CentralizedCoordinatorStateMachine::handleHeartbeat(
     return result;
 }
 
-// =========================================================================
-// §7.5  declareGroup
-// =========================================================================
+// declareGroup
 
 CoordinatorApplyResult<DeclareGroupResponse>
 CentralizedCoordinatorStateMachine::handleDeclareGroup(
@@ -138,9 +129,7 @@ CentralizedCoordinatorStateMachine::handleDeclareGroup(
     return result;
 }
 
-// =========================================================================
-// §7.7  handleProposeViewUpdate (activate / deactivate)
-// =========================================================================
+// handleProposeViewUpdate (activate / deactivate)
 
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
@@ -235,7 +224,7 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
                 changed = true;
             }
         }
-        // rank_order is NOT changed on deactivate ($2.3).
+        // rank_order is NOT changed on deactivate.
     }
 
     if (!changed) {
@@ -272,9 +261,7 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     return result;
 }
 
-// =========================================================================
-// §7.7b  handleProposalAck
-// =========================================================================
+// handleProposalAck  - 2PC second phase: collect ACKs from agents
 
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleProposalAck(uint64_t propose_id,
@@ -297,9 +284,7 @@ CentralizedCoordinatorStateMachine::handleProposalAck(uint64_t propose_id,
     return result;
 }
 
-// =========================================================================
-// §7.7c  handleBootstrapAck  (Bootstrap 2PC ACK handler)
-// =========================================================================
+// handleBootstrapAck  - collect ACKs during BootstrapSyncing phase
 
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleBootstrapAck(GroupId group_id,
@@ -318,16 +303,14 @@ CentralizedCoordinatorStateMachine::handleBootstrapAck(GroupId group_id,
     return result;
 }
 
-// =========================================================================
-// §7.7c  checkTimeouts
-// =========================================================================
+// checkTimeouts  - heartbeat timeout + proposal ACK timeout
 
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::checkTimeouts() {
     CoordinatorApplyResult<void> result;
     auto now = std::chrono::steady_clock::now();
 
-    // --- Heartbeat timeout ---
+    // Heartbeat timeout
     for (int rank = 0; rank < max_world_size_; ++rank) {
         auto& info = ranks_[rank];
         if (info.state == RankState::OFFLINE) continue;
@@ -336,7 +319,7 @@ CentralizedCoordinatorStateMachine::checkTimeouts() {
         }
     }
 
-    // --- Propose ACK timeout (Strict Barrier & Prune) ---
+    // Propose ACK timeout (Strict Barrier & Prune)
     // NOTE: transitionToOffline does NOT modify pending_proposal_acks_,
     // so the iterator remains valid across the call.
     for (auto it = pending_proposal_acks_.begin();
@@ -360,9 +343,7 @@ CentralizedCoordinatorStateMachine::checkTimeouts() {
     return result;
 }
 
-// =========================================================================
-// §7.8  publishEndpoint
-// =========================================================================
+// publishEndpoint  - passive endpoint registration
 
 CoordinatorApplyResult<PublishEndpointResponse>
 CentralizedCoordinatorStateMachine::handlePublishEndpoint(
@@ -398,7 +379,7 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
 
         if (member.active) {
             if (view.status == GroupStatus::Ready) {
-                // Group already activated → push best-effort view update.
+                // Group already activated -> push best-effort view update.
                 view.epoch++;
                 result.effects.push_back(ViewUpdateEffect{
                     group_descriptors_[ep.group_id], view, {}, std::nullopt});
@@ -411,9 +392,7 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
     return result;
 }
 
-// =========================================================================
-// §7.9  transferObservation
-// =========================================================================
+// transferObservation  - update link_status from data-plane evidence
 
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleTransferObservation(
@@ -448,9 +427,7 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
     return result;
 }
 
-// =========================================================================
 // Private: state transitions
-// =========================================================================
 
 void CentralizedCoordinatorStateMachine::transitionToOffline(
     GlobalRank rank, std::vector<CoordinatorEffect>& effects) {
@@ -466,13 +443,13 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
     effects.push_back(makeRankStateEffect(rank));
 
     // DO NOT modify active_ranks here.  Membership changes come from:
-    //   - auto_deactivate=true → handleTransferObservation
+    //   - auto_deactivate=true -> handleTransferObservation
     //   - Explicit deactivate_rank / disconnect
-    //   - Strict Barrier & Prune → AppliedWithDroppedRanks
+    //   - Strict Barrier & Prune -> AppliedWithDroppedRanks
 
     // DO NOT modify pending ACKs here.  Proposal timeout handles its own
     // cleanup (AppliedWithDroppedRanks).  Bootstrap timeout is acceptable
-    // for now — a hanging waitUntilGroupReady is the expected failure mode
+    // for now  - a hanging waitUntilGroupReady is the expected failure mode
     // when a peer dies during bootstrap.
 
     updateRankHealth(effects);
@@ -482,13 +459,11 @@ void CentralizedCoordinatorStateMachine::transitionToSynced(
     GlobalRank rank, std::vector<CoordinatorEffect>& effects) {
     ranks_[rank].state = RankState::SYNCED;
     effects.push_back(makeRankStateEffect(rank));
-    // Do NOT recompute healthy set here — a newly-SYNCED rank has
+    // Do NOT recompute healthy set here  - a newly-SYNCED rank has
     // link_status_ all zeros, so it cannot affect the healthy set.
 }
 
-// =========================================================================
 // Private: authoritative HEALTHY computation
-// =========================================================================
 
 bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
     GlobalRank a, GlobalRank b) const {
@@ -501,6 +476,13 @@ bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
            ranks_[a].link_status[b] != 0 && ranks_[b].link_status[a] != 0;
 }
 
+// Find the largest all-to-all mutually connected set of ranks.
+// This is a maximum clique problem on the mutual-connectivity graph.
+// Uses exhaustive branch-and-bound search with a step limit to prevent
+// hanging on pathological topologies.
+//
+// Tie-breaking: prefer cliques containing Rank 0 (it hosts the
+// Coordinator and Store), then lexicographically smallest.
 std::vector<GlobalRank> CentralizedCoordinatorStateMachine::findHealthySet()
     const {
     std::vector<GlobalRank> candidates;
@@ -602,8 +584,8 @@ void CentralizedCoordinatorStateMachine::updateRankHealth(
 
     // 2. For auto_deactivate groups, remove unhealthy ranks from the active
     //    set.  This subsumes the per-group deactivation that was previously in
-    //    handleTransferObservation, and also fires on heartbeat-timeout →
-    //    transitionToOffline → updateRankHealth, fixing the bug where LinkDown
+    //    handleTransferObservation, and also fires on heartbeat-timeout ->
+    //    transitionToOffline -> updateRankHealth, fixing the bug where LinkDown
     //    could suppress transfer-observation reports and leave a dead rank
     //    stuck as active=true forever.
     for (auto& [group_id, view] : group_views_) {
@@ -628,9 +610,7 @@ void CentralizedCoordinatorStateMachine::updateRankHealth(
     checkGroupTransitions(effects);
 }
 
-// =========================================================================
 // Private: activatable predicates
-// =========================================================================
 
 bool CentralizedCoordinatorStateMachine::rankInValidRange(
     GlobalRank rank) const {
@@ -668,9 +648,15 @@ bool CentralizedCoordinatorStateMachine::isActivatableSet(
     return true;
 }
 
-// =========================================================================
-// Private: checkGroupTransitions  (bootstrap state machine driver)
-// =========================================================================
+// checkGroupTransitions - bootstrap state machine driver.
+//
+// Group lifecycle:
+//   declareGroup() creates a group in Bootstrapping status.
+//   Once all active ranks have valid endpoints and are HEALTHY, this
+//   function transitions to BootstrapSyncing and broadcasts a ViewUpdate
+//   to collect ACKs from all active ranks (a 2PC barrier).
+//   Once all ACKs arrive, the group transitions to Ready.
+//   waitUntilGroupReady() unblocks only when status == Ready.
 
 void CentralizedCoordinatorStateMachine::checkGroupTransitions(
     std::vector<CoordinatorEffect>& effects) {
@@ -705,6 +691,9 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                                                    std::nullopt});
             }
         } else if (view.status == GroupStatus::BootstrapSyncing) {
+            // If a peer dies during this phase, its ACK never arrives.
+            // The group stays in BootstrapSyncing; waitUntilGroupReady()
+            // will time out on the dead peer's Agent.
             auto it = pending_bootstrap_acks_.find(group_id);
             if (it == pending_bootstrap_acks_.end()) continue;
             auto& pending = it->second;
@@ -721,9 +710,7 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
     }
 }
 
-// =========================================================================
 // Private: declareGroup
-// =========================================================================
 
 bool CentralizedCoordinatorStateMachine::declareGroup(
     const GroupDeclaration& declaration, DeclareGroupResponse& response) {
@@ -773,7 +760,7 @@ bool CentralizedCoordinatorStateMachine::declareGroup(
 
     auto it = group_views_.find(group_id);
     if (it == group_views_.end()) {
-        // First declaration → create group.
+        // First declaration -> create group.
         group_descriptors_[group_id] = declaration.descriptor;
         group_views_[group_id] = declaration.initial_view;
         group_views_[group_id].status = GroupStatus::Bootstrapping;
@@ -783,7 +770,7 @@ bool CentralizedCoordinatorStateMachine::declareGroup(
         return true;
     }
 
-    // Group already exists → validate rank_order prefix.
+    // Group already exists -> validate rank_order prefix.
     const auto& existing_order = group_descriptors_[group_id].rank_order;
     const auto& new_order = declaration.descriptor.rank_order;
 
@@ -809,9 +796,7 @@ bool CentralizedCoordinatorStateMachine::declareGroup(
     return true;
 }
 
-// =========================================================================
 // Private: helpers
-// =========================================================================
 
 std::vector<GlobalRank>
 CentralizedCoordinatorStateMachine::computeRequiredViewAcks(
@@ -870,9 +855,7 @@ RegisterResponse CentralizedCoordinatorStateMachine::buildRegisterResponse(
     return resp;
 }
 
-// =========================================================================
 // Effect factories
-// =========================================================================
 
 CoordinatorEffect CentralizedCoordinatorStateMachine::makeRankStateEffect(
     GlobalRank rank) {

@@ -15,8 +15,6 @@
 
 namespace mooncake {
 
-// ---- MNNVL fabric detection ------------------------------------------------
-
 #ifndef MOONCAKE_EP_USE_MUSA
 static bool checkSupportFabricMem() {
     const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
@@ -44,13 +42,17 @@ bool LinkManager::supportFabricMem() {
     return cached;
 }
 
-// ---- Lifecycle -------------------------------------------------------------
-
 void LinkManager::init(GlobalRank rank, int max_world_size,
                        TransferEngine* engine) {
+    LOG(INFO) << "LinkManager::init() called, rank=" << rank
+              << " max_world_size=" << max_world_size
+              << " engine=" << (void*)engine;
     // If already initialized, return.  Also reject init after shutdown
-    // (re-init-after-shutdown is not supported — create a new process).
-    if (initialized_.exchange(true, std::memory_order_acq_rel)) return;
+    // (re-init-after-shutdown is not supported  - create a new process).
+    if (initialized_.exchange(true, std::memory_order_acq_rel)) {
+        LOG(WARNING) << "LinkManager::init() already initialized, returning";
+        return;
+    }
     if (shutdown_.load(std::memory_order_acquire)) {
         initialized_.store(false, std::memory_order_release);
         LOG(ERROR) << "LinkManager: init() called after shutdown(); ignoring.";
@@ -83,12 +85,20 @@ void LinkManager::init(GlobalRank rank, int max_world_size,
         warmup_recv_region_ = std::make_unique<int32_t[]>(kMaxNumRanks);
         std::memset(warmup_recv_region_.get(), 0,
                     kMaxNumRanks * sizeof(int32_t));
+        LOG(INFO) << "LinkManager: registering warmup_recv_region addr="
+                  << (void*)warmup_recv_region_.get()
+                  << " length=" << kMaxNumRanks * sizeof(int32_t);
         rc = engine_->registerLocalMemory(warmup_recv_region_.get(),
                                           kMaxNumRanks * sizeof(int32_t),
                                           kWildcardLocation);
         if (rc != 0) {
+            LOG(ERROR)
+                << "LinkManager: failed to register warmup recv region, rc="
+                << rc;
             warmup_recv_region_.reset();
-            LOG(ERROR) << "LinkManager: failed to register warmup recv region";
+        } else {
+            LOG(INFO) << "LinkManager: warmup_recv_region registered OK, "
+                      << "getWarmupRecvAddr=" << (void*)getWarmupRecvAddr();
         }
     }
 
@@ -157,13 +167,16 @@ uint64_t LinkManager::getWarmupRecvAddr() const {
     return reinterpret_cast<uint64_t>(warmup_recv_region_.get());
 }
 
-// ---- Resource management ---------------------------------------------------
-
 void LinkManager::enablePeerProbe(GlobalRank peer,
                                   const std::string& server_name,
                                   uint64_t warmup_recv_addr) {
     if (peer == rank_) return;
     if (peer < 0 || peer >= max_world_size_) return;
+
+    LOG(INFO) << "LinkManager: enablePeerProbe rank " << peer
+              << " server_name=" << server_name
+              << " warmup_recv_addr=" << (void*)warmup_recv_addr
+              << " skip_warmup=" << skip_warmup_;
 
     std::lock_guard<std::mutex> lock(peers_mutex_);
     auto& link = peers_[peer];
@@ -206,8 +219,6 @@ void LinkManager::setEventCallback(EventCallback callback) {
     event_callback_ = std::move(callback);
 }
 
-// ---- Worker read model -----------------------------------------------------
-
 void LinkManager::setRankStates(const std::vector<uint8_t>& states) {
     for (int i = 0; i < max_world_size_ && i < static_cast<int>(states.size());
          ++i) {
@@ -230,7 +241,7 @@ std::optional<PeerReadHandle> LinkManager::resolvePeer(GlobalRank peer) const {
     handle.target_id = rs.target_id.load(std::memory_order_acquire);
     uint64_t v2 = rs.version.load(std::memory_order_acquire);
 
-    // If version changed, the link state was modified during our read —
+    // If version changed, the link state was modified during our read  -
     // target_id may be from a different LinkUp cycle.  Treat as
     // disconnected.
     if (v1 != v2) return std::nullopt;
@@ -245,8 +256,6 @@ bool LinkManager::isRankReady(GlobalRank peer) const {
            read_state_[peer].link_connected.load(std::memory_order_acquire) !=
                0;
 }
-
-// ---- Internal: read model publication --------------------------------------
 
 void LinkManager::publishLinkUp(GlobalRank peer,
                                 TransferMetadata::SegmentID target_id) {
@@ -263,8 +272,6 @@ void LinkManager::publishLinkDown(GlobalRank peer) {
     read_state_[peer].link_connected.store(0, std::memory_order_release);
     read_state_[peer].version.fetch_add(1, std::memory_order_release);
 }
-
-// ---- Internal: tear-down ---------------------------------------------------
 
 void LinkManager::tearDownPeerLink(GlobalRank peer, bool stop_reconnect) {
     auto& link = peers_[peer];
@@ -306,8 +313,6 @@ void LinkManager::emit(TELinkEvent event) {
 
 void LinkManager::wakeup() { wakeup_cv_.notify_one(); }
 
-// ---- Poller loop -----------------------------------------------------------
-
 void LinkManager::pollerLoop() {
     while (poller_running_.load(std::memory_order_acquire)) {
         bool did_work = false;
@@ -347,8 +352,6 @@ void LinkManager::pollerLoop() {
     }
 }
 
-// ---- Probe a single peer ---------------------------------------------------
-
 bool LinkManager::probePeer(GlobalRank peer) {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     auto& link = peers_[peer];
@@ -361,13 +364,20 @@ bool LinkManager::probePeer(GlobalRank peer) {
             // openSegment returns (SegmentHandle)(-1) on failure (UINT64_MAX),
             // which is truthy so a plain !segment_id check would miss it.
             if (segment_id == static_cast<SegmentHandle>(-1)) {
-                // openSegment failed — backoff and retry.
+                // openSegment failed  - backoff and retry.
                 link.probe_backoff = std::min(link.probe_backoff * 2,
                                               PeerLink::kProbeBackoffMax);
                 return false;
             }
 
             link.target_id = segment_id;
+
+            LOG(INFO) << "LinkManager: probePeer rank " << peer
+                      << " openSegment OK, segment_id=" << segment_id
+                      << " server_name=" << link.server_name
+                      << " warmup_recv_addr=" << (void*)link.warmup_recv_addr
+                      << " skip_warmup=" << link.skip_warmup
+                      << " will_initiate_warmup=" << (peer <= rank_);
 
             if (link.skip_warmup) {
                 // MNNVL fabric: connectivity is guaranteed, skip warmup
@@ -385,15 +395,22 @@ bool LinkManager::probePeer(GlobalRank peer) {
             if (peer <= rank_) {
                 // We initiate: write to peer's warmup recv region.
                 auto batch_id = engine_->allocateBatchID(1);
-                engine_->submitTransfer(
-                    batch_id, {TransferRequest{
-                                  .opcode = TransferRequest::WRITE,
-                                  .source = warmup_send_region_.get(),
-                                  .target_id = segment_id,
-                                  .target_offset = link.warmup_recv_addr +
-                                                   rank_ * sizeof(int32_t),
-                                  .length = sizeof(int32_t),
-                              }});
+                uint64_t target_offset =
+                    link.warmup_recv_addr + rank_ * sizeof(int32_t);
+                LOG(INFO) << "LinkManager: warmup write rank " << rank_
+                          << " -> " << peer << " segment_id=" << segment_id
+                          << " warmup_recv_addr="
+                          << (void*)link.warmup_recv_addr
+                          << " target_offset=" << (void*)target_offset
+                          << " source=" << (void*)warmup_send_region_.get();
+                engine_->submitTransfer(batch_id,
+                                        {TransferRequest{
+                                            .opcode = TransferRequest::WRITE,
+                                            .source = warmup_send_region_.get(),
+                                            .target_id = segment_id,
+                                            .target_offset = target_offset,
+                                            .length = sizeof(int32_t),
+                                        }});
                 link.warmup_batch_id = batch_id;
                 link.state = PeerLinkState::WAITING_WARMUP_TRANSFER;
             } else {
@@ -413,6 +430,8 @@ bool LinkManager::probePeer(GlobalRank peer) {
             engine_->getTransferStatus(link.warmup_batch_id.value(), 0, status);
 
             if (status.s == TransferStatusEnum::COMPLETED) {
+                LOG(INFO) << "LinkManager: warmup rank " << rank_ << " -> "
+                          << peer << " COMPLETED";
                 engine_->freeBatchID(link.warmup_batch_id.value());
                 link.warmup_batch_id = std::nullopt;
                 link.state = PeerLinkState::CONNECTED;
@@ -424,6 +443,12 @@ bool LinkManager::probePeer(GlobalRank peer) {
             }
 
             if (status.s == TransferStatusEnum::FAILED) {
+                LOG(WARNING)
+                    << "LinkManager: warmup rank " << rank_ << " -> " << peer
+                    << " FAILED"
+                    << " warmup_recv_addr=" << (void*)link.warmup_recv_addr
+                    << " target_offset="
+                    << (void*)(link.warmup_recv_addr + rank_ * sizeof(int32_t));
                 engine_->freeBatchID(link.warmup_batch_id.value());
                 link.warmup_batch_id = std::nullopt;
                 engine_->closeSegment(link.target_id.value());
@@ -433,7 +458,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
                                               PeerLink::kProbeBackoffMax);
                 return false;
             }
-            // Still in flight — don't advance backoff.
+            // Still in flight  - don't advance backoff.
             return false;
         }
 
@@ -452,7 +477,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
                                  .target_id = link.target_id});
                 return true;
             }
-            // Still waiting — don't advance backoff.
+            // Still waiting  - don't advance backoff.
             return false;
         }
 

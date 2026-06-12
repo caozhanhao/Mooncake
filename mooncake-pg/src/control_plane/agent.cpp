@@ -4,9 +4,7 @@
 
 namespace mooncake {
 
-// =========================================================================
 // Constructor
-// =========================================================================
 
 AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     : rank_(rank), max_world_size_(max_world_size) {
@@ -16,13 +14,11 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
         << kMaxNumRanks << ")";
     global_rank_states_.fill(RankState::OFFLINE);
     link_connected_.fill(false);
-    link_status_cache_.fill(0);
+    last_reported_peer_status_.fill(false);
     rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::OFFLINE));
 }
 
-// =========================================================================
 // Group lifecycle
-// =========================================================================
 
 void AgentStateMachine::registerGroup(const GroupDeclaration& declaration) {
     GroupId group_id = declaration.descriptor.group_id;
@@ -54,9 +50,7 @@ const GroupDescriptor* AgentStateMachine::getGroupDescriptor(
     return nullptr;
 }
 
-// =========================================================================
-// handlePeerJoined — new rank registered
-// =========================================================================
+// handlePeerJoined  - new rank registered
 
 AgentApplyResult AgentStateMachine::handlePeerJoined(
     const PeerJoinedPush& push) {
@@ -73,17 +67,15 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
         .te_server_name = push.te_server_name,
         .warmup_recv_addr = push.warmup_recv_addr,
     };
-    // Seed the debounce cache so the first transfer failure triggers a report.
-    link_status_cache_[push.rank] = 1;
+    // Seed so the first observation of any kind triggers a report.
+    last_reported_peer_status_[push.rank] = true;
 
     effects.push_back(
         EnablePeerProbe{push.rank, push.te_server_name, push.warmup_recv_addr});
     return effects;
 }
 
-// =========================================================================
-// handleRankStateUpdate — Coordinator-authoritative state change
-// =========================================================================
+// handleRankStateUpdate  - Coordinator-authoritative state change
 
 AgentApplyResult AgentStateMachine::handleRankStateUpdate(
     const RankStateUpdatePush& push) {
@@ -108,9 +100,7 @@ AgentApplyResult AgentStateMachine::handleRankStateUpdate(
     return effects;
 }
 
-// =========================================================================
-// handleViewUpdate — new GroupView received
-// =========================================================================
+// handleViewUpdate  - new GroupView received
 
 AgentApplyResult AgentStateMachine::handleViewUpdate(
     const ViewUpdatePush& push) {
@@ -127,9 +117,7 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
     return effects;
 }
 
-// =========================================================================
-// handleLinkStateChanged — LinkManager link up/down event
-// =========================================================================
+// handleLinkStateChanged  - LinkManager link up/down event
 
 AgentApplyResult AgentStateMachine::handleLinkStateChanged(GlobalRank peer,
                                                            bool connected) {
@@ -143,14 +131,15 @@ AgentApplyResult AgentStateMachine::handleLinkStateChanged(GlobalRank peer,
     link_connected_[peer] = connected;
 
     if (!connected) {
+        // On link down, notify all backends to reset their P2P peer state.
+        // The state machine doesn't hold backend pointers, so this is modeled
+        // as an effect for the Host to execute (forEachBackend fanout).
         effects.push_back(NotifyTEUnreachable{peer});
     }
     return effects;
 }
 
-// =========================================================================
 // buildHeartbeat
-// =========================================================================
 
 HeartbeatRequest AgentStateMachine::buildHeartbeat() const {
     HeartbeatRequest req;
@@ -163,9 +152,7 @@ HeartbeatRequest AgentStateMachine::buildHeartbeat() const {
     return req;
 }
 
-// =========================================================================
-// applyRegisterResponse — process full state from Coordinator
-// =========================================================================
+// applyRegisterResponse  - process full state from Coordinator
 
 AgentApplyResult AgentStateMachine::applyRegisterResponse(
     const RegisterResponse& resp) {
@@ -203,12 +190,11 @@ AgentApplyResult AgentStateMachine::applyRegisterResponse(
     }
 
     // Populate connection metadata and trigger peer probes.
-    // Seed the debounce cache to 1 so the FIRST transfer failure to any
-    // peer triggers a TransferObservationReport (1→0 transition).
+    // Seed so the first observation of any kind triggers a report.
     for (const auto& conn : resp.rank_connections) {
         if (conn.rank == rank_) continue;
         rank_connections_[conn.rank] = conn;
-        link_status_cache_[conn.rank] = 1;
+        last_reported_peer_status_[conn.rank] = true;
         effects.push_back(EnablePeerProbe{conn.rank, conn.te_server_name,
                                           conn.warmup_recv_addr});
     }
@@ -218,9 +204,7 @@ AgentApplyResult AgentStateMachine::applyRegisterResponse(
     return effects;
 }
 
-// =========================================================================
-// prepareCleanSlateRegister — full reset before re-registration
-// =========================================================================
+// prepareCleanSlateRegister  - full reset before re-registration
 
 AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
     AgentApplyResult effects;
@@ -228,7 +212,7 @@ AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
     rank_state_ = RankState::OFFLINE;
     global_rank_states_.fill(RankState::OFFLINE);
     link_connected_.fill(false);
-    link_status_cache_.fill(0);
+    last_reported_peer_status_.fill(false);
     rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::OFFLINE));
     for (auto& conn : rank_connections_) conn.reset();
 
@@ -241,9 +225,7 @@ AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
     return effects;
 }
 
-// =========================================================================
-// markOffline — Coordinator connection lost
-// =========================================================================
+// markOffline  - Coordinator connection lost
 
 AgentApplyResult AgentStateMachine::markOffline() {
     AgentApplyResult effects;
@@ -252,7 +234,7 @@ AgentApplyResult AgentStateMachine::markOffline() {
     coordinator_connection_ = CoordinatorConnection::Disconnected;
     global_rank_states_.fill(RankState::OFFLINE);
     link_connected_.fill(false);
-    link_status_cache_.fill(0);
+    last_reported_peer_status_.fill(false);
     rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::OFFLINE));
     for (auto& conn : rank_connections_) conn.reset();
 
@@ -269,9 +251,13 @@ AgentApplyResult AgentStateMachine::markOffline() {
     return effects;
 }
 
-// =========================================================================
-// processTransferObservation — Debouncing logic
-// =========================================================================
+// processTransferObservation  - report when observation differs from last
+//
+// When a transfer observation for peer j differs from
+// last_reported_peer_status_, include it in an immediate
+// reportTransferObservation RPC and update the cache. This covers both failure
+// (true->false) and recovery (false->true) transitions. Unchanged observations
+// piggyback on the next heartbeat.
 
 AgentApplyResult AgentStateMachine::processTransferObservation(
     const TransferObservationEvent& event) {
@@ -279,53 +265,48 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
 
     if (rank_state_ == RankState::OFFLINE) return effects;
 
-    // Track which peers just transitioned from 1→0 (first failure).
-    // These trigger an immediate RPC to the Coordinator.
-    std::vector<GlobalRank> new_failures;
+    TransferObservationReport req;
+    req.group_id = event.group_id;
+    req.reporter_rank = rank_;
+
+    bool has_changed = false;
 
     for (int j = 0; j < max_world_size_; ++j) {
         if (static_cast<size_t>(j) >= event.attempted_ranks.size()) continue;
         if (!event.attempted_ranks[j]) continue;
 
-        if (static_cast<size_t>(j) < event.succeeded_ranks.size() &&
-            event.succeeded_ranks[j]) {
-            // Success: update local cache, piggyback on next heartbeat.
-            link_status_cache_[j] = 1;
-        }
+        bool succeeded =
+            static_cast<size_t>(j) < event.succeeded_ranks.size() &&
+            event.succeeded_ranks[j];
+        bool failed = static_cast<size_t>(j) < event.failed_ranks.size() &&
+                      event.failed_ranks[j];
 
-        if (static_cast<size_t>(j) < event.failed_ranks.size() &&
-            event.failed_ranks[j]) {
-            // First failure (1→0 transition) triggers immediate RPC.
-            if (link_status_cache_[j] == 1) {
-                new_failures.push_back(j);
+        // Determine current observation: failed takes precedence.
+        bool current = succeeded && !failed;
+
+        if (current != last_reported_peer_status_[j]) {
+            last_reported_peer_status_[j] = current;
+            // Lazy-init the vectors on first change.
+            if (!has_changed) {
+                req.attempted_ranks.assign(max_world_size_, 0);
+                req.failed_ranks.assign(max_world_size_, 0);
+                req.succeeded_ranks.assign(max_world_size_, 0);
             }
-            link_status_cache_[j] = 0;
+            req.attempted_ranks[j] = 1;
+            req.succeeded_ranks[j] = current ? 1 : 0;
+            req.failed_ranks[j] = current ? 0 : 1;
+            has_changed = true;
         }
     }
 
-    if (!new_failures.empty()) {
-        TransferObservationReport req;
-        req.group_id = event.group_id;
-        req.reporter_rank = rank_;
-        req.attempted_ranks.assign(max_world_size_, 0);
-        req.failed_ranks.assign(max_world_size_, 0);
-        req.succeeded_ranks.assign(max_world_size_, 0);
-
-        // Only include newly-failed peers (1→0 transition).
-        for (GlobalRank j : new_failures) {
-            req.attempted_ranks[j] = 1;
-            req.failed_ranks[j] = 1;
-        }
-
+    if (has_changed) {
         effects.push_back(SendTransferObservation{std::move(req)});
     }
 
     return effects;
 }
 
-// =========================================================================
-// syncRankStateSnapshot — sync state snapshot for LinkManager
-// =========================================================================
+// syncRankStateSnapshot  - sync state snapshot for LinkManager
 
 void AgentStateMachine::syncRankStateSnapshot(AgentApplyResult& effects) {
     // rank_state_ strictly tracks the Coordinator-authoritative broadcast.

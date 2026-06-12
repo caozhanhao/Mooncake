@@ -13,7 +13,6 @@
 
 #include <glog/logging.h>
 
-// Workaround for yalantinglibs #1152
 #include <csignal>
 
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
@@ -24,9 +23,7 @@
 
 namespace mooncake {
 
-// =========================================================================
-// RpcServer — thin wrapper around coro_rpc::coro_rpc_server.
-// =========================================================================
+// RpcServer  - thin wrapper around coro_rpc::coro_rpc_server.
 
 class RpcServer {
    public:
@@ -52,13 +49,7 @@ class RpcServer {
     unsigned thread_num_;
 };
 
-// =========================================================================
-// RpcClient helpers — free function coroutines.
-//
-// GCC 11 fails to resolve non-type template parameters (pointer-to-virtual-
-// member-function) forwarded through lambdas inside coroutine contexts.
-// Extracting the coroutine into a free function template avoids this.
-// =========================================================================
+// RpcClient helpers  - free function coroutines.
 
 namespace rpc_detail {
 
@@ -75,17 +66,12 @@ getOrCreateClientAsync(std::shared_ptr<RpcSharedState> state,
                        const std::string& addr);
 
 // Spawn a Lazy<void> coroutine on the global I/O executor.
-// Defined in rpc_runtime.cpp to avoid instantiating coro_io::get_global_
-// executor() in every TU that includes this header (GCC 11 compatibility).
 void spawnOnExecutor(async_simple::coro::Lazy<void> task);
 
 // Create a coro_rpc_client with a local io_context (for sync RPC).
-// Defined in rpc_runtime.cpp to avoid instantiating coro_io in the header.
 std::unique_ptr<coro_rpc::coro_rpc_client> createSyncClient();
 
 // Fire-and-forget coroutine: connect, send_request, discard result.
-// Uses send_request<Func, Req> with explicit Args... to avoid GCC 11
-// overload resolution issues with non-type template parameters.
 template <auto Func, typename Req>
 async_simple::coro::Lazy<void> sendCoroutine(
     std::shared_ptr<RpcSharedState> state, const std::string& addr, Req req) {
@@ -100,26 +86,29 @@ async_simple::coro::Lazy<void> sendCoroutine(
 }
 
 // Async call with callback coroutine: connect, send_request, invoke callback.
-// Uses send_request<Func, Req> with explicit Args... to avoid GCC 11
-// overload resolution issues with non-type template parameters.
-// Callback type is templated to avoid requiring std::function (which needs
-// CopyConstructible) — the caller's lambda is moved into cb.
+// Callback is templated (not std::function) so the caller's lambda is moved
+// rather than copied.
 template <auto Func, typename Req, typename ResponseType, typename Callback>
 async_simple::coro::Lazy<void> callAsyncCoroutine(
     std::shared_ptr<RpcSharedState> state, const std::string& addr, Req req,
     Callback cb) {
+    LOG(INFO) << "callAsyncCoroutine: connecting to " << addr;
     auto client = co_await getOrCreateClientAsync(state, addr);
     if (!client) {
+        LOG(ERROR) << "callAsyncCoroutine: failed to connect to " << addr;
         cb(ResponseType{});
         co_return;
     }
+    LOG(INFO) << "callAsyncCoroutine: connected to " << addr
+              << ", sending request";
     try {
-        // send_request returns Lazy<Lazy<async_rpc_result<T>>>.
-        // Outer co_await: request sent.  Inner co_await: response received.
         auto send_lazy =
             co_await client->template send_request<Func, Req>(std::move(req));
+        LOG(INFO) << "callAsyncCoroutine: request sent to " << addr
+                  << ", waiting for response";
         auto res = co_await std::move(send_lazy);
         if (res) {
+            LOG(INFO) << "callAsyncCoroutine: response received from " << addr;
             cb(std::move(res.value().result()));
         } else {
             LOG(ERROR) << "RpcClient: async rpc to " << addr
@@ -134,27 +123,21 @@ async_simple::coro::Lazy<void> callAsyncCoroutine(
 
 }  // namespace rpc_detail
 
-// =========================================================================
-// RpcClient — unified outbound RPC client.
+// RpcClient  - unified outbound RPC client.
 //
-//   call<&Service::method>(addr, req)            — sync, blocks caller
-//   callAsync<&Service::method>(addr, req, cb)   — async, callback on
+//   call<&Service::method>(addr, req)             - sync, blocks caller
+//   callAsync<&Service::method>(addr, req, cb)    - async, callback on
 //                                                    global executor thread
-//   send<&Service::method>(addr, req)            — fire-and-forget
-// =========================================================================
+//   send<&Service::method>(addr, req)             - fire-and-forget
 
 class RpcClient {
    public:
     RpcClient() = default;
     ~RpcClient() = default;
 
-    // ---- Sync RPC ----
     template <auto Func, typename Req>
     auto call(const std::string& addr, Req req,
               std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
-        // Derive ResponseType directly from the function pointer to avoid
-        // instantiating call<Func> (which has overload resolution issues
-        // with GCC 11 and non-type template parameters).
         using ResponseType = decltype(coro_rpc::get_return_type<Func>());
 
         auto client = rpc_detail::createSyncClient();
@@ -174,12 +157,8 @@ class RpcClient {
         return std::move(result.value());
     }
 
-    // ---- Async RPC with callback ----
     template <auto Func, typename Req, typename Callback>
     void callAsync(const std::string& addr, Req req, Callback cb) {
-        // Derive ResponseType directly from the function pointer to avoid
-        // instantiating call<Func> (which has overload resolution issues
-        // with GCC 11 and non-type template parameters).
         using ResponseType = decltype(coro_rpc::get_return_type<Func>());
 
         auto task =
@@ -189,7 +168,6 @@ class RpcClient {
         rpc_detail::spawnOnExecutor(std::move(task));
     }
 
-    // ---- Fire-and-forget ----
     template <auto Func, typename Req>
     void send(const std::string& addr, Req req) {
         auto task =
@@ -198,7 +176,6 @@ class RpcClient {
         rpc_detail::spawnOnExecutor(std::move(task));
     }
 
-    // ---- Connection health ----
     bool isConnected(const std::string& addr) const;
     bool tryReconnect(const std::string& addr);
 
