@@ -26,13 +26,13 @@ struct RegisterRequest {
 };
 
 // Process-level connection metadata for a remote rank.
-// Returned in RegisterResponse so the Agent can feed TELinkManager.
+// Returned in RegisterResponse so the Agent can feed LinkManager.
 struct RankConnectionMetadata {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
     std::string agent_addr;
     std::string te_server_name;
-    // Warmup region addresses for TELinkManager handshake.
+    // Warmup region addresses for LinkManager handshake.
     uint64_t warmup_recv_addr = 0;
 };
 
@@ -164,6 +164,7 @@ struct ViewUpdateEffect {
     GroupDescriptor descriptor;
     GroupView view;
     std::vector<GlobalRank> required_acks;
+    std::optional<uint64_t> propose_id = std::nullopt;  // set for proposals
 };
 
 struct ReplyViewUpdateEffect {

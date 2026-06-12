@@ -86,8 +86,12 @@ class CoordinatorHost {
     void postProposeViewUpdate(coro_rpc::context<ProposeViewUpdateResponse> ctx,
                                ProposeViewUpdateRequest req);
 
-    void onViewUpdateAck(uint64_t propose_id, GlobalRank rank, uint64_t epoch,
+    void postProposalAck(uint64_t propose_id, GlobalRank rank, uint64_t epoch,
                          bool applied);
+
+    // Bootstrap 2PC ACK handler.  Called when an Agent ACKs a ViewUpdate
+    // during the BootstrapSyncing phase.
+    void postBootstrapAck(GroupId group_id, GlobalRank rank, uint64_t epoch);
 
     void postPublishEndpoint(coro_rpc::context<PublishEndpointResponse> ctx,
                              PublishEndpointRequest req);

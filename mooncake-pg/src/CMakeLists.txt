@@ -1,5 +1,5 @@
 add_library(mooncake_pg
-    control_plane/te_link_manager.cpp
+    control_plane/link_manager.cpp
     control_plane/coordinator.cpp
     control_plane/coordinator_host.cpp
     control_plane/agent.cpp

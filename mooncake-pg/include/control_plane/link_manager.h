@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_TE_LINK_MANAGER_H
-#define MOONCAKE_PG_TE_LINK_MANAGER_H
+#ifndef MOONCAKE_PG_LINK_MANAGER_H
+#define MOONCAKE_PG_LINK_MANAGER_H
 
 #include <array>
 #include <atomic>
@@ -41,7 +41,7 @@ struct TELinkEvent {
 };
 
 // =========================================================================
-// TELinkManager — process-level manager for shared TE physical links.
+// LinkManager — process-level manager for shared TE physical links.
 // Owned by MooncakeProcessContext; one instance per process.
 //
 // Responsibilities:
@@ -57,9 +57,9 @@ struct TELinkEvent {
 //     (openSegment, RDMA warmup) may block.
 // =========================================================================
 
-class TELinkManager {
+class LinkManager {
    public:
-    TELinkManager() = default;
+    LinkManager() = default;
 
     // ---- Lifecycle ----
 
@@ -126,10 +126,10 @@ class TELinkManager {
     void publishLinkUp(GlobalRank peer, TransferMetadata::SegmentID target_id);
     void publishLinkDown(GlobalRank peer);
 
-    ~TELinkManager() { shutdown(); }
+    ~LinkManager() { shutdown(); }
 
-    TELinkManager(const TELinkManager&) = delete;
-    TELinkManager& operator=(const TELinkManager&) = delete;
+    LinkManager(const LinkManager&) = delete;
+    LinkManager& operator=(const LinkManager&) = delete;
 
    private:
     // ================================================================
@@ -224,4 +224,4 @@ class TELinkManager {
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_TE_LINK_MANAGER_H
+#endif  // MOONCAKE_PG_LINK_MANAGER_H

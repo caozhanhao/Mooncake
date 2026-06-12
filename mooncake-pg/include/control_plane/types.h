@@ -51,11 +51,23 @@ struct GroupMember {
     GroupEndpointInfo endpoint_info;
 };
 
+// Group lifecycle status.
+// Bootstrapping  – collecting endpoints and waiting for all ranks to become
+// HEALTHY. BootstrapSyncing – Coordinator initiated 2PC barrier, waiting for
+// ACKs. Ready          – barrier达成, all ranks ready for data-plane transfers.
+enum class GroupStatus : uint8_t {
+    Bootstrapping = 0,
+    BootstrapSyncing = 1,
+    Ready = 2,
+};
+
 // Runtime states for a group.
-// epoch == kInvalidEpoch means the view has not been activated yet.
+// epoch starts at 0 and monotonically increases; the first real epoch after
+// bootstrap completion is 1.
 struct GroupView {
     GroupId group_id = 0;
-    uint64_t epoch = kInvalidEpoch;
+    GroupStatus status = GroupStatus::Bootstrapping;
+    uint64_t epoch = 0;
     std::vector<GroupMember> members;  // size == max_world_size_
 };
 

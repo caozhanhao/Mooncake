@@ -122,21 +122,12 @@ void MooncakeWorker::startWorker() {
                             task.attemptedRanksHost[j] = 1;
                         }
 
-                        // Check TE link status.
+                        // Use cached segment ID from TransferGroupMeta.
+                        // Control plane syncs this via applyViewChange.
                         TransferMetadata::SegmentID target_id =
                             group->segmentIDs[j];
-                        if (group->backend) {
-                            auto handle = group->backend->getProcessContext()
-                                              .te_link_manager.resolvePeer(
-                                                  static_cast<GlobalRank>(j));
-                            if (!handle) {
-                                task.failedRanksHost[j] = 1;
-                                continue;
-                            }
-                            target_id = handle->target_id;
-                        }
 
-                        uint64_t source = group->segmentInfos[group->rank]
+                        uint64_t source = group->segmentInfos[group->globalRank]
                                               .send_buffer[task.bufferOffset];
 
                         switch ((c10d::OpType)task.opType) {
@@ -214,15 +205,20 @@ void MooncakeWorker::startWorker() {
                             group->engine->getTransferStatus(
                                 task.batchID, rankToTaskId[i][j], status);
                             if (status.s != TransferStatusEnum::COMPLETED) {
-                                if (status.s == TransferStatusEnum::FAILED ||
-                                    (j != group->rank &&
-                                     diff.count() >
-                                         *group->collectiveTimeoutUs &&
-                                     group->engine->probePeerAliveByID(
-                                         group->segmentIDs[j]) !=
-                                         PeerLiveness::Alive)) {
+                                bool peer_dead = false;
+                                if (status.s == TransferStatusEnum::FAILED) {
+                                    peer_dead = true;
+                                } else if (j != group->globalRank &&
+                                           diff.count() >
+                                               *group->collectiveTimeoutUs) {
+                                    peer_dead =
+                                        group->engine->probePeerAliveByID(
+                                            group->segmentIDs[j]) !=
+                                        PeerLiveness::Alive;
+                                }
+                                if (peer_dead) {
                                     task.failedRanksHost[j] = 1;
-                                    LOG(ERROR) << "Rank " << group->rank
+                                    LOG(ERROR) << "Rank " << group->globalRank
                                                << " transfer to peer " << j
                                                << " failed for op "
                                                << (int)task.opType;
@@ -248,8 +244,9 @@ void MooncakeWorker::startWorker() {
                         }
                     }
 
-                    auto source_ptr = (int32_t*)group->segmentInfos[group->rank]
-                                          .send_sync[task.bufferOffset];
+                    auto source_ptr =
+                        (int32_t*)group->segmentInfos[group->globalRank]
+                            .send_sync[task.bufferOffset];
 
                     for (size_t j = 0; j < kMaxNumRanks; ++j) {
                         rankToTaskId[i][j] = kInvalidTaskId;
@@ -260,16 +257,9 @@ void MooncakeWorker::startWorker() {
                             continue;
                         }
 
-                        // Check TE link status.
+                        // Use cached segment ID from TransferGroupMeta.
                         TransferMetadata::SegmentID target_id =
                             group->segmentIDs[j];
-                        if (group->backend) {
-                            auto handle = group->backend->getProcessContext()
-                                              .te_link_manager.resolvePeer(
-                                                  static_cast<GlobalRank>(j));
-                            if (!handle) continue;
-                            target_id = handle->target_id;
-                        }
 
                         *source_ptr = 1;
                         rankToTaskId[i][j] = entries.size();
@@ -277,9 +267,10 @@ void MooncakeWorker::startWorker() {
                             .opcode = TransferRequest::WRITE,
                             .source = (void*)source_ptr,
                             .target_id = target_id,
-                            .target_offset = group->segmentInfos[j]
-                                                 .recv_sync[task.bufferOffset] +
-                                             group->rank * sizeof(int32_t),
+                            .target_offset =
+                                group->segmentInfos[j]
+                                    .recv_sync[task.bufferOffset] +
+                                group->globalRank * sizeof(int32_t),
                             .length = sizeof(int32_t),
                         });
                     }
@@ -291,8 +282,9 @@ void MooncakeWorker::startWorker() {
                 } else if (task_status[i].load(std::memory_order_acquire) ==
                            SIGNALED_1) {
                     bool task_done = true;
-                    auto signal_ptr = (int32_t*)group->segmentInfos[group->rank]
-                                          .recv_sync[task.bufferOffset];
+                    auto signal_ptr =
+                        (int32_t*)group->segmentInfos[group->globalRank]
+                            .recv_sync[task.bufferOffset];
 
                     auto now = clock::now();
                     auto diff =
@@ -311,15 +303,20 @@ void MooncakeWorker::startWorker() {
                             task.batchID, rankToTaskId[i][j], status);
                         if (signal_ptr[j] != 1 ||
                             status.s != TransferStatusEnum::COMPLETED) {
-                            if (status.s == TransferStatusEnum::FAILED ||
-                                (j != group->rank &&
-                                 diff.count() > *group->collectiveTimeoutUs &&
-                                 group->engine->probePeerAliveByID(
-                                     group->segmentIDs[j]) !=
-                                     PeerLiveness::Alive)) {
+                            bool peer_dead = false;
+                            if (status.s == TransferStatusEnum::FAILED) {
+                                peer_dead = true;
+                            } else if (j != group->globalRank &&
+                                       diff.count() >
+                                           *group->collectiveTimeoutUs) {
+                                peer_dead = group->engine->probePeerAliveByID(
+                                                group->segmentIDs[j]) !=
+                                            PeerLiveness::Alive;
+                            }
+                            if (peer_dead) {
                                 task.failedRanksHost[j] = 1;
                                 LOG(ERROR)
-                                    << "Rank " << group->rank
+                                    << "Rank " << group->globalRank
                                     << " sync to peer " << j
                                     << " failed for op " << (int)task.opType;
                             } else {

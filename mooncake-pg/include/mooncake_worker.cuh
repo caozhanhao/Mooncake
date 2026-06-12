@@ -32,26 +32,24 @@ static constexpr size_t kBufferSize = 1u << 24;
 
 class MooncakeBackend;
 
-struct SegmentInfo {
-    uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2];
-    uint64_t p2p_credit_region;
-    uint64_t p2p_ack_region;
-};
-
 struct TransferGroupMeta {
-    int rank;
+    int rank;               // InGroupRank (PyTorch ProcessGroup rank)
+    GlobalRank globalRank;  // GlobalRank (index into segmentInfos[])
+    GlobalRank rank_order[kMaxNumRanks];  // InGroupRank -> GlobalRank mapping
     int size;        // capacity: number of slots allocated (incl. inactive)
     int activeSize;  // visible group size: number of ranks that participate
     int taskCount;
     GroupId group_id = 0;
+    uint64_t epoch = 0;  // GroupView epoch, synced by control plane
     bool* activeRanks;
     bool* activeRanksDevice;
 #if !defined(__MUSA__)
     at::Tensor activeRanksTensor;
 #endif
     TransferEngine* engine;
-    TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
-    SegmentInfo segmentInfos[kMaxNumRanks];
+    TransferMetadata::SegmentID
+        segmentIDs[kMaxNumRanks];  // synced by control plane
+    GroupEndpointInfo segmentInfos[kMaxNumRanks];
     const size_t* collectiveTimeoutUs = nullptr;
     MooncakeBackend* backend = nullptr;  // for failure reporting / link check
 };

@@ -227,9 +227,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         tasks_[taskId].bufferOffset = bufferOffset;
         tasks_[taskId].transferGroupMeta = meta.get();
         tasks_[taskId].failedRanksHost = failedRanksPtr;
-        tensorToBuffer(
-            (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
-            state->currentPos, realSize);
+        tensorToBuffer((void*)meta->segmentInfos[meta->globalRank]
+                           .send_buffer[bufferOffset],
+                       state->currentPos, realSize);
 
         hasCallback_[taskId] = true;
 
@@ -239,9 +239,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
             for (int i = 0; i < meta->size; ++i) {
                 meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
             }
-            bufferToTensor(
-                (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
-                state->currentPos, realSize);
+            bufferToTensor((void*)meta->segmentInfos[meta->globalRank]
+                               .recv_buffer[bufferOffset],
+                           state->currentPos, realSize);
 
             state->currentPos += realSize;
 
@@ -286,9 +286,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             next_cuda_task_sequence_.fetch_add(1, std::memory_order_relaxed);
         submitted_tasks.push_back(
             {.task_id = static_cast<size_t>(taskId), .sequence = taskSequence});
-        tensorToBuffer(
-            (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
-            pos, realSize, enq_stream);
+        tensorToBuffer((void*)meta->segmentInfos[meta->globalRank]
+                           .send_buffer[bufferOffset],
+                       pos, realSize, enq_stream);
 
         hasCallback_[taskId] = false;
         launchEnqueueTaskKernel(
@@ -296,9 +296,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             meta.get(), tasks_device_, meta->size, meta->activeRanksDevice,
             meta->activeRanksTensor.data_ptr<int>(), failed_ranks.data(),
             taskId, enq_stream.stream());
-        bufferToTensor(
-            (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
-            pos, realSize, enq_stream);
+        bufferToTensor((void*)meta->segmentInfos[meta->globalRank]
+                           .recv_buffer[bufferOffset],
+                       pos, realSize, enq_stream);
 
         ++cudaTaskCount;
         ++meta->taskCount;

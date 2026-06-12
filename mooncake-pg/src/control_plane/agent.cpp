@@ -128,7 +128,7 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
 }
 
 // =========================================================================
-// handleLinkStateChanged — TELinkManager link up/down event
+// handleLinkStateChanged — LinkManager link up/down event
 // =========================================================================
 
 AgentApplyResult AgentStateMachine::handleLinkStateChanged(GlobalRank peer,
@@ -324,7 +324,7 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
 }
 
 // =========================================================================
-// syncRankStateSnapshot — sync state snapshot for TELinkManager
+// syncRankStateSnapshot — sync state snapshot for LinkManager
 // =========================================================================
 
 void AgentStateMachine::syncRankStateSnapshot(AgentApplyResult& effects) {

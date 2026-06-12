@@ -35,11 +35,13 @@ class CoordinatorStateMachine {
     virtual CoordinatorApplyResult<DeclareGroupResponse> handleDeclareGroup(
         const DeclareGroupRequest& req) = 0;
 
-    virtual CoordinatorApplyResult<void> handleViewUpdate(
+    virtual CoordinatorApplyResult<void> handleProposeViewUpdate(
         uint64_t propose_id, const ProposeViewUpdateRequest& req) = 0;
 
-    virtual CoordinatorApplyResult<void> handleViewUpdateAck(
-        uint64_t propose_id, GlobalRank rank, uint64_t epoch, bool applied) = 0;
+    virtual CoordinatorApplyResult<void> handleProposalAck(uint64_t propose_id,
+                                                           GlobalRank rank,
+                                                           uint64_t epoch,
+                                                           bool applied) = 0;
 
     virtual CoordinatorApplyResult<PublishEndpointResponse>
     handlePublishEndpoint(const PublishEndpointRequest& req) = 0;
@@ -48,6 +50,12 @@ class CoordinatorStateMachine {
         const TransferObservationReport& req) = 0;
 
     virtual CoordinatorApplyResult<void> checkTimeouts() = 0;
+
+    // Bootstrap 2PC ACK handler.  Called when an Agent ACKs a ViewUpdate
+    // during the BootstrapSyncing phase.
+    virtual CoordinatorApplyResult<void> handleBootstrapAck(GroupId group_id,
+                                                            GlobalRank rank,
+                                                            uint64_t epoch) = 0;
 };
 
 // =========================================================================
@@ -74,13 +82,13 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     CoordinatorApplyResult<DeclareGroupResponse> handleDeclareGroup(
         const DeclareGroupRequest& req) override;
 
-    CoordinatorApplyResult<void> handleViewUpdate(
+    CoordinatorApplyResult<void> handleProposeViewUpdate(
         uint64_t propose_id, const ProposeViewUpdateRequest& req) override;
 
-    CoordinatorApplyResult<void> handleViewUpdateAck(uint64_t propose_id,
-                                                     GlobalRank rank,
-                                                     uint64_t epoch,
-                                                     bool applied) override;
+    CoordinatorApplyResult<void> handleProposalAck(uint64_t propose_id,
+                                                   GlobalRank rank,
+                                                   uint64_t epoch,
+                                                   bool applied) override;
 
     CoordinatorApplyResult<PublishEndpointResponse> handlePublishEndpoint(
         const PublishEndpointRequest& req) override;
@@ -89,6 +97,10 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         const TransferObservationReport& req) override;
 
     CoordinatorApplyResult<void> checkTimeouts() override;
+
+    CoordinatorApplyResult<void> handleBootstrapAck(GroupId group_id,
+                                                    GlobalRank rank,
+                                                    uint64_t epoch) override;
 
     // ---- Public accessors for Host use ----
 
@@ -125,15 +137,22 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     std::unordered_map<GroupId, GroupDescriptor> group_descriptors_;
     std::unordered_map<GroupId, bool> group_auto_deactivate_;
 
-    struct PendingPropose {
+    // ---- 2PC ACK tracking ----
+
+    // Proposal 2PC (activate/deactivate).  Maps propose_id → pending state.
+    struct PendingProposal {
         uint64_t propose_id = 0;
         GroupId group_id = 0;
         ProposeViewUpdateResponse eventual_response;
         std::unordered_set<GlobalRank> waiting_acks;
         std::chrono::steady_clock::time_point deadline;
     };
+    std::unordered_map<uint64_t, PendingProposal> pending_proposal_acks_;
 
-    std::unordered_map<uint64_t, PendingPropose> pending_proposes_;
+    // Bootstrap 2PC.  Maps group_id → set of ranks whose ACK is still
+    // pending during the BootstrapSyncing phase.
+    std::unordered_map<GroupId, std::unordered_set<GlobalRank>>
+        pending_bootstrap_acks_;
 
     static constexpr auto kProposeTimeout = std::chrono::seconds(2);
     static constexpr auto kHeartbeatTimeout = std::chrono::seconds(5);
@@ -145,6 +164,10 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     void transitionToSynced(GlobalRank rank,
                             std::vector<CoordinatorEffect>& effects);
     void updateRankHealth(std::vector<CoordinatorEffect>& effects);
+
+    // Bootstrap state machine driver.  Called after every state-changing
+    // operation to check if any group can progress through its lifecycle.
+    void checkGroupTransitions(std::vector<CoordinatorEffect>& effects);
 
     bool isMutuallyConnected(GlobalRank a, GlobalRank b) const;
     std::vector<GlobalRank> findHealthySet() const;

@@ -19,7 +19,7 @@
 
 #include "control_plane/agent_host.h"
 #include "control_plane/coordinator_host.h"
-#include "control_plane/te_link_manager.h"
+#include "control_plane/link_manager.h"
 
 namespace mooncake {
 
@@ -50,7 +50,7 @@ struct MooncakeProcessContext {
     int next_group_id = 0;
 
     // === Process-level subsystems (no more singletons) ===
-    TELinkManager te_link_manager;
+    LinkManager link_manager;
     MooncakeWorkerManager worker_manager;
     P2PDeviceWorkerManager p2p_device_worker_manager;
 
@@ -264,11 +264,10 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     at::Tensor getActiveRanksTensor() { return meta_->activeRanksTensor; }
 
-    // Returns the current GroupView epoch.  Reads through the RCU snapshot
-    // so view and epoch are always consistent (no torn snapshot).
-    uint64_t getGroupEpoch() const { return getGroupView()->epoch; }
+    // Returns the current GroupView epoch, synced by control plane.
+    uint64_t getGroupEpoch() const { return meta_ ? meta_->epoch : 0; }
 
-    int getNumSyncedRanks();
+    int getNumSyncedRanks() { return meta_ ? meta_->activeSize : 0; }
 
     void extendGroupSizeTo(int size);
 
@@ -308,31 +307,8 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // Called by AgentHost after (re-)registration to re-publish endpoints.
     GroupEndpointPublication buildEndpointMetadata() const;
 
-    // Worker-thread accessor: returns a shared_ptr so the view remains alive
-    // for the duration of the worker task even if applyViewChange replaces it
-    // concurrently (RCU pattern).
-    std::shared_ptr<const GroupView> getGroupView() const {
-        std::lock_guard<std::mutex> lock(view_mutex_);
-        return group_view_ptr_;
-    }
-
-    // Worker-thread accessor: RCU-protected rank_order (InGroupRank→GlobalRank
-    // mapping).  Written by applyViewChange under the same mutex as the view.
-    std::shared_ptr<const std::vector<GlobalRank>> getRankOrder() const {
-        std::lock_guard<std::mutex> lock(view_mutex_);
-        return rank_order_ptr_;
-    }
-
     const GroupEndpointInfo& getLocalEndpointInfo() const {
-        return local_endpoint_info_;
-    }
-    GlobalRank getGlobalRank(int local_rank) const {
-        auto rank_order = getRankOrder();
-        if (local_rank >= 0 &&
-            local_rank < static_cast<int>(rank_order->size())) {
-            return (*rank_order)[local_rank];
-        }
-        return kInvalidGlobalRank;
+        return meta_->segmentInfos[meta_->globalRank];
     }
     AgentInterface& getAgent() { return agent_; }
     MooncakeProcessContext& getProcessContext() { return ctx_; }
@@ -348,18 +324,8 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     int32_t* cpu_sync_send_region_[2];
     int32_t* cpu_sync_recv_region_[2];
     AgentInterface& agent_;
-    GroupEndpointInfo local_endpoint_info_;
-    // RCU-style view: applyViewChange() swaps the shared_ptr under the mutex;
-    // worker threads acquire a shared_ptr copy before reading, so the view
-    // they see lives as long as they hold the copy.
-    mutable std::mutex view_mutex_;
-    std::shared_ptr<const GroupView> group_view_ptr_{
-        std::make_shared<const GroupView>()};
-    std::shared_ptr<const std::vector<GlobalRank>> rank_order_ptr_{
-        std::make_shared<const std::vector<GlobalRank>>()};
     std::shared_ptr<TransferGroupMeta> meta_;
     bool isShutdown_{false};
-    GroupId group_id_ = 0;
     int max_group_size_ =
         0;  // per-group capacity (max active members for this group)
     std::string localServerName_;

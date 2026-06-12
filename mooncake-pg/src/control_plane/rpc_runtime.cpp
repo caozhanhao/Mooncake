@@ -15,8 +15,17 @@ RpcServer::RpcServer(uint16_t port, unsigned thread_num)
 
 bool RpcServer::start() {
     if (!server_) return false;
-    auto ec = server_->start();
-    if (ec) {
+    // Use async_start() instead of start() to avoid blocking the calling
+    // thread.  start() calls async_start().get() which blocks until the
+    // server shuts down — this deadlocks initControlPlane since neither
+    // CoordinatorHost nor AgentHost can make progress after start().
+    // async_start() fires the accept loop on the server's own thread pool
+    // and returns immediately.  On listen failure the future is already
+    // resolved with an error code.
+    auto fut = server_->async_start();
+    if (fut.hasResult()) {
+        // Listen failed — the future resolved immediately.
+        auto ec = std::move(fut).get();
         LOG(ERROR) << "RpcServer: failed to start: " << ec.message();
         return false;
     }

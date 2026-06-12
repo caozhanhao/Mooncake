@@ -1,4 +1,4 @@
-#include "control_plane/te_link_manager.h"
+#include "control_plane/link_manager.h"
 
 #include <cstring>
 
@@ -39,22 +39,21 @@ static bool checkSupportFabricMem() {
 static bool checkSupportFabricMem() { return false; }
 #endif
 
-bool TELinkManager::supportFabricMem() {
+bool LinkManager::supportFabricMem() {
     static bool cached = checkSupportFabricMem();
     return cached;
 }
 
 // ---- Lifecycle -------------------------------------------------------------
 
-void TELinkManager::init(GlobalRank rank, int max_world_size,
-                         TransferEngine* engine) {
+void LinkManager::init(GlobalRank rank, int max_world_size,
+                       TransferEngine* engine) {
     // If already initialized, return.  Also reject init after shutdown
     // (re-init-after-shutdown is not supported — create a new process).
     if (initialized_.exchange(true, std::memory_order_acq_rel)) return;
     if (shutdown_.load(std::memory_order_acquire)) {
         initialized_.store(false, std::memory_order_release);
-        LOG(ERROR)
-            << "TELinkManager: init() called after shutdown(); ignoring.";
+        LOG(ERROR) << "LinkManager: init() called after shutdown(); ignoring.";
         return;
     }
 
@@ -78,8 +77,7 @@ void TELinkManager::init(GlobalRank rank, int max_world_size,
                                               kWildcardLocation);
         if (rc != 0) {
             warmup_send_region_.reset();
-            LOG(ERROR)
-                << "TELinkManager: failed to register warmup send region";
+            LOG(ERROR) << "LinkManager: failed to register warmup send region";
         }
 
         warmup_recv_region_ = std::make_unique<int32_t[]>(kMaxNumRanks);
@@ -90,8 +88,7 @@ void TELinkManager::init(GlobalRank rank, int max_world_size,
                                           kWildcardLocation);
         if (rc != 0) {
             warmup_recv_region_.reset();
-            LOG(ERROR)
-                << "TELinkManager: failed to register warmup recv region";
+            LOG(ERROR) << "LinkManager: failed to register warmup recv region";
         }
     }
 
@@ -116,7 +113,7 @@ void TELinkManager::init(GlobalRank rank, int max_world_size,
     poller_thread_ = std::thread([this] { pollerLoop(); });
 }
 
-void TELinkManager::shutdown() {
+void LinkManager::shutdown() {
     if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
 
     poller_running_.store(false, std::memory_order_release);
@@ -153,20 +150,18 @@ void TELinkManager::shutdown() {
     }
 }
 
-std::string TELinkManager::localServerName() const {
-    return local_server_name_;
-}
+std::string LinkManager::localServerName() const { return local_server_name_; }
 
-uint64_t TELinkManager::getWarmupRecvAddr() const {
+uint64_t LinkManager::getWarmupRecvAddr() const {
     if (skip_warmup_ || !warmup_recv_region_) return 0;
     return reinterpret_cast<uint64_t>(warmup_recv_region_.get());
 }
 
 // ---- Resource management ---------------------------------------------------
 
-void TELinkManager::enablePeerProbe(GlobalRank peer,
-                                    const std::string& server_name,
-                                    uint64_t warmup_recv_addr) {
+void LinkManager::enablePeerProbe(GlobalRank peer,
+                                  const std::string& server_name,
+                                  uint64_t warmup_recv_addr) {
     if (peer == rank_) return;
     if (peer < 0 || peer >= max_world_size_) return;
 
@@ -184,7 +179,7 @@ void TELinkManager::enablePeerProbe(GlobalRank peer,
     wakeup();
 }
 
-void TELinkManager::disconnect(GlobalRank peer) {
+void LinkManager::disconnect(GlobalRank peer) {
     if (peer == rank_) return;
     if (peer < 0 || peer >= max_world_size_) return;
 
@@ -192,7 +187,7 @@ void TELinkManager::disconnect(GlobalRank peer) {
     tearDownPeerLink(peer, /*stop_reconnect=*/false);
 }
 
-void TELinkManager::stopReconnect(GlobalRank peer) {
+void LinkManager::stopReconnect(GlobalRank peer) {
     if (peer == rank_) return;
     if (peer < 0 || peer >= max_world_size_) return;
 
@@ -200,28 +195,27 @@ void TELinkManager::stopReconnect(GlobalRank peer) {
     peers_[peer].candidate = false;
 }
 
-bool TELinkManager::isConnected(GlobalRank peer) const {
+bool LinkManager::isConnected(GlobalRank peer) const {
     if (peer < 0 || peer >= max_world_size_) return false;
     return read_state_[peer].link_connected.load(std::memory_order_acquire) !=
            0;
 }
 
-void TELinkManager::setEventCallback(EventCallback callback) {
+void LinkManager::setEventCallback(EventCallback callback) {
     std::lock_guard<std::mutex> lock(event_callback_mutex_);
     event_callback_ = std::move(callback);
 }
 
 // ---- Worker read model -----------------------------------------------------
 
-void TELinkManager::setRankStates(const std::vector<uint8_t>& states) {
+void LinkManager::setRankStates(const std::vector<uint8_t>& states) {
     for (int i = 0; i < max_world_size_ && i < static_cast<int>(states.size());
          ++i) {
         read_state_[i].rank_state.store(states[i], std::memory_order_release);
     }
 }
 
-std::optional<PeerReadHandle> TELinkManager::resolvePeer(
-    GlobalRank peer) const {
+std::optional<PeerReadHandle> LinkManager::resolvePeer(GlobalRank peer) const {
     if (peer < 0 || peer >= max_world_size_) return std::nullopt;
 
     // Use a version counter to detect torn reads: if the link goes down and
@@ -244,7 +238,7 @@ std::optional<PeerReadHandle> TELinkManager::resolvePeer(
     return handle;
 }
 
-bool TELinkManager::isRankReady(GlobalRank peer) const {
+bool LinkManager::isRankReady(GlobalRank peer) const {
     if (peer < 0 || peer >= max_world_size_) return false;
     return read_state_[peer].rank_state.load(std::memory_order_acquire) ==
                static_cast<uint8_t>(RankState::HEALTHY) &&
@@ -254,8 +248,8 @@ bool TELinkManager::isRankReady(GlobalRank peer) const {
 
 // ---- Internal: read model publication --------------------------------------
 
-void TELinkManager::publishLinkUp(GlobalRank peer,
-                                  TransferMetadata::SegmentID target_id) {
+void LinkManager::publishLinkUp(GlobalRank peer,
+                                TransferMetadata::SegmentID target_id) {
     if (peer < 0 || peer >= max_world_size_) return;
     // Order: target_id before link_connected before version increment.
     // resolvePeer uses the version counter to detect torn reads.
@@ -264,7 +258,7 @@ void TELinkManager::publishLinkUp(GlobalRank peer,
     read_state_[peer].version.fetch_add(1, std::memory_order_release);
 }
 
-void TELinkManager::publishLinkDown(GlobalRank peer) {
+void LinkManager::publishLinkDown(GlobalRank peer) {
     if (peer < 0 || peer >= max_world_size_) return;
     read_state_[peer].link_connected.store(0, std::memory_order_release);
     read_state_[peer].version.fetch_add(1, std::memory_order_release);
@@ -272,7 +266,7 @@ void TELinkManager::publishLinkDown(GlobalRank peer) {
 
 // ---- Internal: tear-down ---------------------------------------------------
 
-void TELinkManager::tearDownPeerLink(GlobalRank peer, bool stop_reconnect) {
+void LinkManager::tearDownPeerLink(GlobalRank peer, bool stop_reconnect) {
     auto& link = peers_[peer];
 
     if (link.target_id.has_value()) {
@@ -303,18 +297,18 @@ void TELinkManager::tearDownPeerLink(GlobalRank peer, bool stop_reconnect) {
     emit(TELinkEvent{.kind = TELinkEvent::Kind::LinkDown, .peer = peer});
 }
 
-void TELinkManager::emit(TELinkEvent event) {
+void LinkManager::emit(TELinkEvent event) {
     std::lock_guard<std::mutex> lock(event_callback_mutex_);
     if (event_callback_) {
         event_callback_(std::move(event));
     }
 }
 
-void TELinkManager::wakeup() { wakeup_cv_.notify_one(); }
+void LinkManager::wakeup() { wakeup_cv_.notify_one(); }
 
 // ---- Poller loop -----------------------------------------------------------
 
-void TELinkManager::pollerLoop() {
+void LinkManager::pollerLoop() {
     while (poller_running_.load(std::memory_order_acquire)) {
         bool did_work = false;
 
@@ -355,7 +349,7 @@ void TELinkManager::pollerLoop() {
 
 // ---- Probe a single peer ---------------------------------------------------
 
-bool TELinkManager::probePeer(GlobalRank peer) {
+bool LinkManager::probePeer(GlobalRank peer) {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     auto& link = peers_[peer];
 

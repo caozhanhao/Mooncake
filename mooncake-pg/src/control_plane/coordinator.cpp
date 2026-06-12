@@ -139,11 +139,11 @@ CentralizedCoordinatorStateMachine::handleDeclareGroup(
 }
 
 // =========================================================================
-// §7.7  handleViewUpdate (activate / deactivate)
+// §7.7  handleProposeViewUpdate (activate / deactivate)
 // =========================================================================
 
 CoordinatorApplyResult<void>
-CentralizedCoordinatorStateMachine::handleViewUpdate(
+CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     uint64_t propose_id, const ProposeViewUpdateRequest& req) {
     CoordinatorApplyResult<void> result;
     auto it = group_views_.find(req.group_id);
@@ -251,13 +251,13 @@ CentralizedCoordinatorStateMachine::handleViewUpdate(
 
     if (required_acks.empty()) {
         // Best-effort: broadcast + reply immediately.
-        result.effects.push_back(
-            ViewUpdateEffect{group_descriptors_[req.group_id], view, {}});
+        result.effects.push_back(ViewUpdateEffect{
+            group_descriptors_[req.group_id], view, {}, propose_id});
         result.effects.push_back(ReplyViewUpdateEffect{
             propose_id, {ViewUpdateStatus::Applied, view.epoch, {}, ""}});
     } else {
         // Strict Barrier: store pending, let Host broadcast, wait for ACKs.
-        pending_proposes_[propose_id] = PendingPropose{
+        pending_proposal_acks_[propose_id] = PendingProposal{
             propose_id,
             req.group_id,
             {ViewUpdateStatus::Applied, view.epoch, {}, ""},
@@ -266,24 +266,24 @@ CentralizedCoordinatorStateMachine::handleViewUpdate(
             std::chrono::steady_clock::now() + kProposeTimeout,
         };
         result.effects.push_back(ViewUpdateEffect{
-            group_descriptors_[req.group_id], view, required_acks});
+            group_descriptors_[req.group_id], view, required_acks, propose_id});
     }
 
     return result;
 }
 
 // =========================================================================
-// §7.7b  handleViewUpdateAck
+// §7.7b  handleProposalAck
 // =========================================================================
 
 CoordinatorApplyResult<void>
-CentralizedCoordinatorStateMachine::handleViewUpdateAck(uint64_t propose_id,
-                                                        GlobalRank rank,
-                                                        uint64_t epoch,
-                                                        bool applied) {
+CentralizedCoordinatorStateMachine::handleProposalAck(uint64_t propose_id,
+                                                      GlobalRank rank,
+                                                      uint64_t epoch,
+                                                      bool applied) {
     CoordinatorApplyResult<void> result;
-    auto it = pending_proposes_.find(propose_id);
-    if (it == pending_proposes_.end()) return result;  // already resolved
+    auto it = pending_proposal_acks_.find(propose_id);
+    if (it == pending_proposal_acks_.end()) return result;  // already resolved
 
     if (!applied || epoch != it->second.eventual_response.new_epoch)
         return result;
@@ -292,8 +292,29 @@ CentralizedCoordinatorStateMachine::handleViewUpdateAck(uint64_t propose_id,
     if (it->second.waiting_acks.empty()) {
         result.effects.push_back(
             ReplyViewUpdateEffect{propose_id, it->second.eventual_response});
-        pending_proposes_.erase(it);
+        pending_proposal_acks_.erase(it);
     }
+    return result;
+}
+
+// =========================================================================
+// §7.7c  handleBootstrapAck  (Bootstrap 2PC ACK handler)
+// =========================================================================
+
+CoordinatorApplyResult<void>
+CentralizedCoordinatorStateMachine::handleBootstrapAck(GroupId group_id,
+                                                       GlobalRank rank,
+                                                       uint64_t epoch) {
+    CoordinatorApplyResult<void> result;
+    auto it = group_views_.find(group_id);
+    if (it == group_views_.end()) return result;
+    if (it->second.status != GroupStatus::BootstrapSyncing) return result;
+    if (epoch != it->second.epoch) return result;  // stale ACK
+
+    auto ack_it = pending_bootstrap_acks_.find(group_id);
+    if (ack_it == pending_bootstrap_acks_.end()) return result;
+    ack_it->second.erase(rank);
+    checkGroupTransitions(result.effects);
     return result;
 }
 
@@ -316,9 +337,10 @@ CentralizedCoordinatorStateMachine::checkTimeouts() {
     }
 
     // --- Propose ACK timeout (Strict Barrier & Prune) ---
-    // NOTE: transitionToOffline below does NOT modify pending_proposes_,
+    // NOTE: transitionToOffline does NOT modify pending_proposal_acks_,
     // so the iterator remains valid across the call.
-    for (auto it = pending_proposes_.begin(); it != pending_proposes_.end();) {
+    for (auto it = pending_proposal_acks_.begin();
+         it != pending_proposal_acks_.end();) {
         if (now > it->second.deadline) {
             auto& pending = it->second;
             pending.eventual_response.status =
@@ -329,7 +351,7 @@ CentralizedCoordinatorStateMachine::checkTimeouts() {
             }
             result.effects.push_back(ReplyViewUpdateEffect{
                 pending.propose_id, pending.eventual_response});
-            it = pending_proposes_.erase(it);
+            it = pending_proposal_acks_.erase(it);
         } else {
             ++it;
         }
@@ -368,25 +390,24 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
             return result;
         }
 
-        auto& member = it->second.members[req.rank];
+        auto& view = it->second;
+        auto& member = view.members[req.rank];
+        member.agent_session_epoch = req.agent_session_epoch;
+        member.endpoint_epoch = ep.endpoint_epoch;
+        member.endpoint_info = ep.endpoint_info;
+
         if (member.active) {
-            // Rank is already active → accept new endpoint, push best-effort
-            // view update.  (e.g., replacement rank refreshed its endpoint.)
-            member.agent_session_epoch = req.agent_session_epoch;
-            member.endpoint_epoch = ep.endpoint_epoch;
-            member.endpoint_info = ep.endpoint_info;
-            it->second.epoch++;
-            result.effects.push_back(ViewUpdateEffect{
-                group_descriptors_[ep.group_id], it->second, {}});
-        } else {
-            // Inactive → store locally only.  No broadcast.
-            member.agent_session_epoch = req.agent_session_epoch;
-            member.endpoint_epoch = ep.endpoint_epoch;
-            member.endpoint_info = ep.endpoint_info;
+            if (view.status == GroupStatus::Ready) {
+                // Group already activated → push best-effort view update.
+                view.epoch++;
+                result.effects.push_back(ViewUpdateEffect{
+                    group_descriptors_[ep.group_id], view, {}, std::nullopt});
+            }
         }
     }
 
     result.response.success = true;
+    checkGroupTransitions(result.effects);
     return result;
 }
 
@@ -442,17 +463,17 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
             peer.link_status[rank] = 0;
     }
 
-    // Per-group endpoint validity is determined by agent_session_epoch in
-    // isRankActivatable().  Old endpoints become invalid automatically when
-    // the Agent re-registers with a new session epoch — no explicit clearing
-    // needed.
-
     effects.push_back(makeRankStateEffect(rank));
 
     // DO NOT modify active_ranks here.  Membership changes come from:
     //   - auto_deactivate=true → handleTransferObservation
     //   - Explicit deactivate_rank / disconnect
     //   - Strict Barrier & Prune → AppliedWithDroppedRanks
+
+    // DO NOT modify pending ACKs here.  Proposal timeout handles its own
+    // cleanup (AppliedWithDroppedRanks).  Bootstrap timeout is acceptable
+    // for now — a hanging waitUntilGroupReady is the expected failure mode
+    // when a peer dies during bootstrap.
 
     updateRankHealth(effects);
 }
@@ -599,10 +620,12 @@ void CentralizedCoordinatorStateMachine::updateRankHealth(
         }
         if (changed) {
             view.epoch++;
-            effects.push_back(
-                ViewUpdateEffect{group_descriptors_[group_id], view, {}});
+            effects.push_back(ViewUpdateEffect{
+                group_descriptors_[group_id], view, {}, std::nullopt});
         }
     }
+
+    checkGroupTransitions(effects);
 }
 
 // =========================================================================
@@ -643,6 +666,59 @@ bool CentralizedCoordinatorStateMachine::isActivatableSet(
         if (!isRankActivatable(group_id, r)) return false;
     }
     return true;
+}
+
+// =========================================================================
+// Private: checkGroupTransitions  (bootstrap state machine driver)
+// =========================================================================
+
+void CentralizedCoordinatorStateMachine::checkGroupTransitions(
+    std::vector<CoordinatorEffect>& effects) {
+    for (auto& [group_id, view] : group_views_) {
+        if (view.status == GroupStatus::Bootstrapping) {
+            // Collect all active ranks.
+            bool has_any_active = false;
+            bool all_ready = true;
+            for (int i = 0; i < max_world_size_; ++i) {
+                if (!view.members[i].active) continue;
+                has_any_active = true;
+                if (!isRankActivatable(group_id, i)) {
+                    all_ready = false;
+                    break;
+                }
+            }
+
+            if (has_any_active && all_ready) {
+                // All active ranks have endpoints and are HEALTHY.
+                // Transition to BootstrapSyncing and initiate 2PC.
+                view.status = GroupStatus::BootstrapSyncing;
+                view.epoch = (view.epoch == kInvalidEpoch) ? 1 : view.epoch + 1;
+
+                auto acks_needed =
+                    computeRequiredViewAcks(view, view, kInvalidGlobalRank);
+                pending_bootstrap_acks_[group_id] =
+                    std::unordered_set<GlobalRank>(acks_needed.begin(),
+                                                   acks_needed.end());
+
+                effects.push_back(ViewUpdateEffect{group_descriptors_[group_id],
+                                                   view, acks_needed,
+                                                   std::nullopt});
+            }
+        } else if (view.status == GroupStatus::BootstrapSyncing) {
+            auto it = pending_bootstrap_acks_.find(group_id);
+            if (it == pending_bootstrap_acks_.end()) continue;
+            auto& pending = it->second;
+
+            if (pending.empty()) {
+                // All ranks have ACKed.  Transition to Ready.
+                view.status = GroupStatus::Ready;
+                view.epoch++;
+                pending_bootstrap_acks_.erase(it);
+                effects.push_back(ViewUpdateEffect{
+                    group_descriptors_[group_id], view, {}, std::nullopt});
+            }
+        }
+    }
 }
 
 // =========================================================================
@@ -700,8 +776,9 @@ bool CentralizedCoordinatorStateMachine::declareGroup(
         // First declaration → create group.
         group_descriptors_[group_id] = declaration.descriptor;
         group_views_[group_id] = declaration.initial_view;
+        group_views_[group_id].status = GroupStatus::Bootstrapping;
         group_auto_deactivate_[group_id] = declaration.auto_deactivate;
-        response.current_view = declaration.initial_view;
+        response.current_view = group_views_[group_id];
         response.success = true;
         return true;
     }
@@ -776,7 +853,7 @@ RegisterResponse CentralizedCoordinatorStateMachine::buildRegisterResponse(
         resp.current_views.push_back(view);
     }
 
-    // All rank connection metadata (for TELinkManager).
+    // All rank connection metadata (for LinkManager).
     for (int i = 0; i < max_world_size_; ++i) {
         if (i == for_rank) continue;
         if (ranks_[i].state == RankState::OFFLINE) continue;

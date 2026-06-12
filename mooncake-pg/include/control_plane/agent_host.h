@@ -13,7 +13,7 @@
 #include "agent.h"
 #include "rpc.h"
 #include "serialized_executor.h"
-#include "te_link_manager.h"
+#include "link_manager.h"
 
 #include "pg_utils.h"
 
@@ -99,7 +99,7 @@ class AgentRpcServiceImpl : public AgentRpcService {
 //   - SerializedExecutor (single-threaded event loop)
 //   - Agent RPC server (receives Coordinator pushes)
 //   - Coordinator RPC client (sends register/heartbeat/propose/etc.)
-//   - TELinkManager event callback
+//   - LinkManager event callback
 //   - Transfer observation queue (thread-safe)
 //
 // Bootstrap: waitUntilRegistered() / waitUntilGroupReady() block the caller
@@ -114,8 +114,7 @@ class AgentHost : public AgentInterface {
         std::chrono::milliseconds(100);
 
     AgentHost(c10::intrusive_ptr<c10d::Store> store, const std::string& host_ip,
-              GlobalRank rank, int max_world_size,
-              TELinkManager& te_link_manager);
+              GlobalRank rank, int max_world_size, LinkManager& link_manager);
 
     ~AgentHost() override;
 
@@ -153,7 +152,7 @@ class AgentHost : public AgentInterface {
     void postRankStateUpdate(RankStateUpdatePush push);
     void postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                         ViewUpdatePush push);
-    // ---- TELinkManager event callback ----
+    // ---- LinkManager event callback ----
 
     void postTELinkEvent(TELinkEvent event);
 
@@ -162,7 +161,7 @@ class AgentHost : public AgentInterface {
     SerializedExecutor executor_;  // serialized event loop
 
     // Process-level TE link manager (non-owning, owned by ProcessContext).
-    TELinkManager& te_link_manager_;
+    LinkManager& link_manager_;
 
     c10::intrusive_ptr<c10d::Store> store_;
     std::string host_ip_;

@@ -11,7 +11,7 @@
 #include "memory_location.h"
 #include "mooncake_worker.cuh"
 #include "pg_utils.h"
-#include "control_plane/te_link_manager.h"
+#include "control_plane/link_manager.h"
 
 namespace mooncake {
 
@@ -82,14 +82,14 @@ MooncakeBackend::MooncakeBackend(
     }
     localServerName_ = ctx_.engine->getLocalIpAndPort();
 
-    // Initialize process-level TELinkManager (first backend triggers init).
-    auto& link_mgr = ctx_.te_link_manager;
+    // Initialize process-level LinkManager (first backend triggers init).
+    auto& link_mgr = ctx_.link_manager;
     if (!link_mgr.isInitialized()) {
         link_mgr.init(rank, max_group_size_, ctx_.engine);
     }
 
     // Build rank_order from global_ranks_in_group (or identity fallback).
-    // This is used for the GroupDeclaration and for getGlobalRank().
+    // This is used for the GroupDeclaration and for meta_->rank_order.
     std::vector<GlobalRank> initial_rank_order;
     initial_rank_order.reserve(size);
     if (globalRanks.size() == static_cast<size_t>(size)) {
@@ -199,6 +199,10 @@ MooncakeBackend::MooncakeBackend(
 
     meta_ = std::make_shared<TransferGroupMeta>();
     meta_->rank = rank;
+    meta_->globalRank = initial_rank_order[rank];
+    for (int i = 0; i < max_group_size_; ++i) {
+        meta_->rank_order[i] = initial_rank_order[i];
+    }
     meta_->size = max_group_size_;  // slot capacity
     meta_->activeSize = size;
     meta_->taskCount = 0;
@@ -226,58 +230,46 @@ MooncakeBackend::MooncakeBackend(
         meta_->activeRanksTensor.slice(0, size, max_group_size_).fill_(0);
     }
 
-    // Store local endpoint info for Agent-based endpoint publication.
-    local_endpoint_info_.send_buffer[0] = (uint64_t)send_buffer_[0];
-    local_endpoint_info_.send_buffer[1] = (uint64_t)send_buffer_[1];
-    local_endpoint_info_.recv_buffer[0] = (uint64_t)recv_buffer_[0];
-    local_endpoint_info_.recv_buffer[1] = (uint64_t)recv_buffer_[1];
-    local_endpoint_info_.send_sync[0] = (uint64_t)cpu_sync_send_region_[0];
-    local_endpoint_info_.send_sync[1] = (uint64_t)cpu_sync_send_region_[1];
-    local_endpoint_info_.recv_sync[0] = (uint64_t)cpu_sync_recv_region_[0];
-    local_endpoint_info_.recv_sync[1] = (uint64_t)cpu_sync_recv_region_[1];
-    local_endpoint_info_.p2p_credit_region =
-        (uint64_t)p2p_proxy_->credit_region();
-    local_endpoint_info_.p2p_ack_region = (uint64_t)p2p_proxy_->ack_region();
-
-    // Populate segmentInfos for local rank (worker thread access).
-    meta_->segmentInfos[rank].send_buffer[0] = (uint64_t)send_buffer_[0];
-    meta_->segmentInfos[rank].send_buffer[1] = (uint64_t)send_buffer_[1];
-    meta_->segmentInfos[rank].recv_buffer[0] = (uint64_t)recv_buffer_[0];
-    meta_->segmentInfos[rank].recv_buffer[1] = (uint64_t)recv_buffer_[1];
-    meta_->segmentInfos[rank].send_sync[0] = (uint64_t)cpu_sync_send_region_[0];
-    meta_->segmentInfos[rank].send_sync[1] = (uint64_t)cpu_sync_send_region_[1];
-    meta_->segmentInfos[rank].recv_sync[0] = (uint64_t)cpu_sync_recv_region_[0];
-    meta_->segmentInfos[rank].recv_sync[1] = (uint64_t)cpu_sync_recv_region_[1];
-    meta_->segmentInfos[rank].p2p_credit_region =
-        (uint64_t)p2p_proxy_->credit_region();
-    meta_->segmentInfos[rank].p2p_ack_region =
-        (uint64_t)p2p_proxy_->ack_region();
+    // Store local endpoint info in segmentInfos for worker thread access.
+    auto& local_ep = meta_->segmentInfos[meta_->globalRank];
+    local_ep.send_buffer[0] = (uint64_t)send_buffer_[0];
+    local_ep.send_buffer[1] = (uint64_t)send_buffer_[1];
+    local_ep.recv_buffer[0] = (uint64_t)recv_buffer_[0];
+    local_ep.recv_buffer[1] = (uint64_t)recv_buffer_[1];
+    local_ep.send_sync[0] = (uint64_t)cpu_sync_send_region_[0];
+    local_ep.send_sync[1] = (uint64_t)cpu_sync_send_region_[1];
+    local_ep.recv_sync[0] = (uint64_t)cpu_sync_recv_region_[0];
+    local_ep.recv_sync[1] = (uint64_t)cpu_sync_recv_region_[1];
+    local_ep.p2p_credit_region = (uint64_t)p2p_proxy_->credit_region();
+    local_ep.p2p_ack_region = (uint64_t)p2p_proxy_->ack_region();
 
     // ---- Agent-based bootstrap (new path) ----
     // Register this group with the Agent, publish local endpoint, and block
     // until the Coordinator returns the authoritative GroupView.
     {
-        group_id_ = static_cast<int32_t>(ctx_.next_group_id);
-        meta_->group_id = group_id_;
+        meta_->group_id = static_cast<int32_t>(ctx_.next_group_id);
 
         // Build GroupDeclaration.
         GroupDeclaration declaration;
-        declaration.descriptor.group_id = group_id_;
+        declaration.descriptor.group_id = meta_->group_id;
         declaration.descriptor.rank_order = std::move(initial_rank_order);
         declaration.auto_deactivate =
             options_ ? options_->autoDeactivateOnFailure_ : true;
 
-        // Build initial_view: founding members (ranks 0..size-1) are active.
+        // Build initial_view: founding members are active.
         // Other ranks' endpoints arrive via publishEndpoint.
-        declaration.initial_view.group_id = group_id_;
-        declaration.initial_view.epoch = kInvalidEpoch;
+        declaration.initial_view.group_id = meta_->group_id;
+        declaration.initial_view.epoch =
+            0;  // Coordinator sets real epoch on activation
         declaration.initial_view.members.resize(max_group_size_);
         for (int i = 0; i < size; ++i) {
-            declaration.initial_view.members[i].active = true;
+            declaration.initial_view
+                .members[declaration.descriptor.rank_order[i]]
+                .active = true;
         }
-        declaration.initial_view.members[rank].endpoint_info =
-            local_endpoint_info_;
-        declaration.initial_view.members[rank].endpoint_epoch =
+        declaration.initial_view.members[meta_->globalRank].endpoint_info =
+            local_ep;
+        declaration.initial_view.members[meta_->globalRank].endpoint_epoch =
             kInitialEndpointEpoch;
 
         // Register with Agent (declares group to Coordinator asynchronously).
@@ -286,9 +278,9 @@ MooncakeBackend::MooncakeBackend(
         // Publish local endpoint (passive registration, no broadcast).
         // agent_session_epoch is NOT set here — the Host fills it.
         agent_.publishLocalEndpoint(GroupEndpointPublication{
-            .group_id = group_id_,
+            .group_id = meta_->group_id,
             .endpoint_epoch = kInitialEndpointEpoch,
-            .endpoint_info = local_endpoint_info_,
+            .endpoint_info = local_ep,
         });
 
         // Bootstrap: block until Agent is registered and GroupView is ready.
@@ -296,8 +288,8 @@ MooncakeBackend::MooncakeBackend(
             throw std::runtime_error(
                 "MooncakeBackend: Agent registration timed out");
         }
-        auto view =
-            agent_.waitUntilGroupReady(group_id_, std::chrono::seconds(30));
+        auto view = agent_.waitUntilGroupReady(meta_->group_id,
+                                               std::chrono::seconds(30));
         applyViewChange(declaration.descriptor, view);
     }
     // ---- End Agent-based bootstrap ----
@@ -932,15 +924,11 @@ void MooncakeBackend::shutdown() {
 }
 
 void MooncakeBackend::syncActiveRanksTensor() {
-    auto view_ptr = getGroupView();
-    const auto& members = view_ptr->members;
+    // Read from meta_->activeRanks (synced by control plane via
+    // applyViewChange).
     std::vector<int32_t> active_ranks(meta_->size);
     for (int i = 0; i < meta_->size; ++i) {
-        if (i < static_cast<int>(members.size())) {
-            active_ranks[i] = members[i].active ? 1 : 0;
-        } else {
-            active_ranks[i] = meta_->activeRanks ? meta_->activeRanks[i] : 0;
-        }
+        active_ranks[i] = (meta_->activeRanks && meta_->activeRanks[i]) ? 1 : 0;
     }
 
     auto cpu_tensor = torch::tensor(active_ranks, torch::dtype(torch::kInt32));
@@ -959,15 +947,6 @@ void MooncakeBackend::syncActiveRanksTensor() {
     }
 }
 
-int MooncakeBackend::getNumSyncedRanks() {
-    auto view_ptr = getGroupView();
-    int count = 0;
-    for (const auto& m : view_ptr->members) {
-        if (m.active) count++;
-    }
-    return count;
-}
-
 void MooncakeBackend::extendGroupSizeTo(int newSize) {
     // Deprecated: in the Coordinator-based path, group size is determined
     // by GroupView.rank_order.  This is a no-op stub kept for compatibility.
@@ -981,7 +960,7 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
     for (const int rank : ranks) {
         TORCH_CHECK(rank >= 0 && rank < kMaxNumRanks, "Rank out of range");
         output.push_back(
-            ctx_.te_link_manager.isRankReady(static_cast<GlobalRank>(rank)));
+            ctx_.link_manager.isRankReady(static_cast<GlobalRank>(rank)));
     }
     return output;
 }
@@ -1001,7 +980,7 @@ ProposeViewUpdateResponse MooncakeBackend::activateRank(
     for (int r : ranks) {
         global_ranks.push_back(static_cast<GlobalRank>(r));
     }
-    auto resp = agent_.proposeActivate(group_id_, global_ranks);
+    auto resp = agent_.proposeActivate(meta_->group_id, global_ranks);
     if (resp.status == ViewUpdateStatus::Rejected) {
         LOG(ERROR) << "MooncakeBackend: activate_rank rejected: "
                    << resp.reject_reason;
@@ -1016,7 +995,7 @@ ProposeViewUpdateResponse MooncakeBackend::deactivateRank(
     for (int r : ranks) {
         global_ranks.push_back(static_cast<GlobalRank>(r));
     }
-    auto resp = agent_.proposeDeactivate(group_id_, global_ranks);
+    auto resp = agent_.proposeDeactivate(meta_->group_id, global_ranks);
     if (resp.status == ViewUpdateStatus::Rejected) {
         LOG(ERROR) << "MooncakeBackend: deactivate_rank rejected: "
                    << resp.reject_reason;
@@ -1038,55 +1017,32 @@ void MooncakeBackend::joinGroup() {
 
 void MooncakeBackend::applyViewChange(const GroupDescriptor& descriptor,
                                       const GroupView& view) {
-    // RCU-style swap: publish both the GroupView and rank_order under the
-    // same mutex so worker threads always see a consistent pair.
-    {
-        auto new_view = std::make_shared<const GroupView>(view);
-        auto new_rank_order = std::make_shared<const std::vector<GlobalRank>>(
-            descriptor.rank_order);
-        std::lock_guard<std::mutex> lock(view_mutex_);
-        group_view_ptr_ = std::move(new_view);
-        rank_order_ptr_ = std::move(new_rank_order);
+    // Sync rank_order for P2P proxy InGroupRank -> GlobalRank mapping.
+    if (meta_) {
+        meta_->epoch = view.epoch;
+        for (size_t i = 0; i < descriptor.rank_order.size() && i < kMaxNumRanks;
+             ++i) {
+            meta_->rank_order[i] = descriptor.rank_order[i];
+        }
     }
 
-    // Sync TransferGroupMeta for worker thread access.
+    // Sync TransferGroupMeta for data plane access (worker thread, P2P proxy).
+    // The Coordinator guarantees all active members have published endpoints
+    // and are HEALTHY before transitioning to Ready status, so we can safely
+    // sync everything here.
     if (meta_ && meta_->activeRanks) {
         for (int i = 0;
              i < static_cast<int>(view.members.size()) && i < meta_->size;
              ++i) {
             meta_->activeRanks[i] = view.members[i].active;
-
-            // Update segmentIDs and segmentInfos from GroupView +
-            // TELinkManager.
             if (view.members[i].active &&
                 view.members[i].endpoint_epoch != kInvalidEpoch) {
-                // Resolve TE segment ID via TELinkManager.
-                auto handle = ctx_.te_link_manager.resolvePeer(
-                    static_cast<GlobalRank>(i));
+                meta_->segmentInfos[i] = view.members[i].endpoint_info;
+                auto handle =
+                    ctx_.link_manager.resolvePeer(static_cast<GlobalRank>(i));
                 if (handle) {
                     meta_->segmentIDs[i] = handle->target_id;
                 }
-                // Copy endpoint info from view.
-                meta_->segmentInfos[i].send_buffer[0] =
-                    view.members[i].endpoint_info.send_buffer[0];
-                meta_->segmentInfos[i].send_buffer[1] =
-                    view.members[i].endpoint_info.send_buffer[1];
-                meta_->segmentInfos[i].recv_buffer[0] =
-                    view.members[i].endpoint_info.recv_buffer[0];
-                meta_->segmentInfos[i].recv_buffer[1] =
-                    view.members[i].endpoint_info.recv_buffer[1];
-                meta_->segmentInfos[i].send_sync[0] =
-                    view.members[i].endpoint_info.send_sync[0];
-                meta_->segmentInfos[i].send_sync[1] =
-                    view.members[i].endpoint_info.send_sync[1];
-                meta_->segmentInfos[i].recv_sync[0] =
-                    view.members[i].endpoint_info.recv_sync[0];
-                meta_->segmentInfos[i].recv_sync[1] =
-                    view.members[i].endpoint_info.recv_sync[1];
-                meta_->segmentInfos[i].p2p_credit_region =
-                    view.members[i].endpoint_info.p2p_credit_region;
-                meta_->segmentInfos[i].p2p_ack_region =
-                    view.members[i].endpoint_info.p2p_ack_region;
             }
         }
     }
@@ -1110,9 +1066,6 @@ void MooncakeBackend::onPeerLinkReset(GlobalRank peer) {
 }
 
 void MooncakeBackend::markViewStale() {
-    auto empty_view = std::make_shared<const GroupView>();
-    std::lock_guard<std::mutex> lock(view_mutex_);
-    group_view_ptr_ = std::move(empty_view);
     // Mark all peers as inactive so worker threads stop using them.
     if (meta_ && meta_->activeRanks) {
         for (int i = 0; i < meta_->size; ++i) {
@@ -1123,9 +1076,9 @@ void MooncakeBackend::markViewStale() {
 
 GroupEndpointPublication MooncakeBackend::buildEndpointMetadata() const {
     GroupEndpointPublication ep;
-    ep.group_id = group_id_;
+    ep.group_id = meta_->group_id;
     ep.endpoint_epoch = kInitialEndpointEpoch;
-    ep.endpoint_info = local_endpoint_info_;
+    ep.endpoint_info = meta_->segmentInfos[meta_->globalRank];
     // agent_session_epoch is NOT set here — the Host fills it in the
     // enclosing PublishEndpointRequest before sending the RPC.
     return ep;
