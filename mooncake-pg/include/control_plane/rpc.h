@@ -159,14 +159,20 @@ struct PushEffect {
     Push push;
 };
 
+// Route for ViewUpdate ACKs.  Bootstrap ACKs always go to the bootstrap 2PC
+// handler; proposal ACKs additionally go to the proposal 2PC handler and carry
+// the propose_id that originated the push.
+struct BootstrapAckRoute {};
+struct ProposalAckRoute {
+    uint64_t propose_id = 0;
+};
+using ViewUpdateAckRoute = std::variant<BootstrapAckRoute, ProposalAckRoute>;
+
 struct ViewUpdateEffect {
     GroupDescriptor descriptor;
     GroupView view;
     std::vector<GlobalRank> required_acks;
-    // Set for proposal-originated pushes (activate/deactivate), nullopt for
-    // bootstrap and best-effort endpoint updates.  Used by CoordinatorHost to
-    // route ACKs back to the correct 2PC handler.
-    std::optional<uint64_t> propose_id = std::nullopt;
+    ViewUpdateAckRoute ack_route = BootstrapAckRoute{};
 };
 
 struct ReplyViewUpdateEffect {

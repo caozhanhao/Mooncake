@@ -19,7 +19,6 @@
 
 namespace mooncake {
 
-// Forward declarations.
 class RpcServer;
 class RpcClient;
 class MooncakeBackend;
@@ -40,21 +39,21 @@ class MooncakeBackend;
 //                                            |
 //                                    SerializedExecutor (tick)
 //                                            |
-//                              +-------------------------------+
+//                              +--------------------------------+
 //                              | AgentStateMachine              |
 //                              |  (pure state machine, no I/O)  |
-//                              +-------------------------------+
+//                              +--------------------------------+
 //                                            |
 //                                    returns Effect list
 //                                            |
-//                              +-------------------------------+
+//                              +--------------------------------+
 //                              | runEffects()                   |
 //                              |  EnablePeerProbe -> LinkManager|
 //                              |  SendObservation -> RPC        |
 //                              |  ApplyViewToBackend -> backend |
 //                              |  NotifyTEUnreachable -> fanout |
 //                              |              ...               |
-//                              +-------------------------------+
+//                              +--------------------------------+
 //
 //   Coordinator pushes:                LinkManager events:
 //   onPeerJoined -> postPeerJoined()   LinkUp/LinkDown -> postTELinkEvent()
@@ -65,11 +64,6 @@ class MooncakeBackend;
 // It strictly follows the Coordinator's authoritative broadcasts.
 
 // AgentInterface  - control-plane service interface exposed to MooncakeBackend.
-//
-// AgentHost is the sole implementation.  The interface exists so that
-// MooncakeBackend can receive an AgentInterface& via dependency injection
-// without depending on the full AgentHost (RPC, executor, TE manager).
-
 class AgentInterface {
    public:
     virtual ~AgentInterface() = default;
@@ -100,10 +94,9 @@ class AgentInterface {
         std::vector<uint8_t> succeeded_ranks) = 0;
 };
 
-// AgentRpcServiceImpl  - thin RPC handler for Coordinator->Agent pushes.
-
 class AgentHost;
 
+// AgentRpcServiceImpl  - thin RPC handler for Coordinator->Agent pushes.
 class AgentRpcServiceImpl : public AgentRpcService {
    public:
     explicit AgentRpcServiceImpl(AgentHost& host) : host_(host) {}
@@ -117,22 +110,7 @@ class AgentRpcServiceImpl : public AgentRpcService {
     AgentHost& host_;
 };
 
-// AgentHost  - execution host for the AgentStateMachine state machine.
-//
-// Implements the AgentInterface for MooncakeBackend dependency injection.
-//
-// Owns:
-//   - AgentStateMachine (pure state machine)
-//   - SerializedExecutor (single-threaded event loop)
-//   - Agent RPC server (receives Coordinator pushes)
-//   - Coordinator RPC client (sends register/heartbeat/propose/etc.)
-//   - LinkManager event callback
-//   - Transfer observation queue (thread-safe)
-//
-// Bootstrap: waitUntilRegistered() / waitUntilGroupReady() block the caller
-// thread using std::promise/std::future until the executor thread completes
-// the initial registration handshake.
-
+// AgentHost - execution host for the agent state machine.
 class AgentHost : public AgentInterface {
    public:
     static constexpr auto kCoordinatorAddrTimeout = std::chrono::seconds(30);
@@ -176,8 +154,8 @@ class AgentHost : public AgentInterface {
     void postTELinkEvent(TELinkEvent event);
 
    private:
-    AgentStateMachine agent_;      // pure state machine
-    SerializedExecutor executor_;  // serialized event loop
+    AgentStateMachine agent_;
+    SerializedExecutor executor_;
 
     // Process-level TE link manager (non-owning, owned by ProcessContext).
     LinkManager& link_manager_;
@@ -189,19 +167,15 @@ class AgentHost : public AgentInterface {
 
     std::string coordinator_addr_;
     uint64_t agent_session_epoch_ = 0;
-    bool register_in_flight_ =
-        false;  // true while waiting for registerAgent RPC response
 
     // RPC infrastructure.
     std::unique_ptr<RpcServer> rpc_server_;
     std::unique_ptr<RpcClient> rpc_client_;
     std::unique_ptr<AgentRpcServiceImpl> rpc_impl_;
 
-    // Bootstrap synchronization: condition_variable so callers can retry
-    // waitUntilRegistered() after a timeout without double-get_future() UB.
-    mutable std::mutex registration_mutex_;
-    std::condition_variable registration_cv_;
+    // Bootstrap synchronization: one-shot latch with executor-managed promises.
     bool registration_done_ = false;
+    std::vector<std::shared_ptr<std::promise<void>>> registration_promises_;
 
     // group_ready_promises_ is fulfilled when declareGroup returns and
     // the GroupView is applied.
@@ -218,6 +192,10 @@ class AgentHost : public AgentInterface {
 
     void startRegisterRpc();
     void tick();
+
+    void doRegisterGroup(GroupDeclaration declaration,
+                         MooncakeBackend* backend);
+    void doPublishLocalEndpoint(GroupEndpointPublication endpoint);
 
     void runEffects(const AgentApplyResult& effects);
     template <typename F>

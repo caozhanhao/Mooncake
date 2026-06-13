@@ -19,7 +19,6 @@ namespace mooncake {
 // All methods are pure, synchronous, single-threaded functions.  They mutate
 // internal state, return a response (if applicable) and a list of side-effects
 // for the Host to execute.  No RPC, no I/O, no threads.
-
 class CoordinatorStateMachine {
    public:
     virtual ~CoordinatorStateMachine() = default;
@@ -41,6 +40,10 @@ class CoordinatorStateMachine {
                                                            uint64_t epoch,
                                                            bool applied) = 0;
 
+    virtual CoordinatorApplyResult<void> handleBootstrapAck(GroupId group_id,
+                                                            GlobalRank rank,
+                                                            uint64_t epoch) = 0;
+
     virtual CoordinatorApplyResult<PublishEndpointResponse>
     handlePublishEndpoint(const PublishEndpointRequest& req) = 0;
 
@@ -48,23 +51,10 @@ class CoordinatorStateMachine {
         const TransferObservationReport& req) = 0;
 
     virtual CoordinatorApplyResult<void> checkTimeouts() = 0;
-
-    // Bootstrap 2PC ACK handler.  Called when an Agent ACKs a ViewUpdate
-    // during the BootstrapSyncing phase.
-    virtual CoordinatorApplyResult<void> handleBootstrapAck(GroupId group_id,
-                                                            GlobalRank rank,
-                                                            uint64_t epoch) = 0;
 };
 
-// CentralizedCoordinatorStateMachine  - single-node implementation of the
+// CentralizedCoordinatorStateMachine - single-node implementation of the
 // Coordinator state machine.
-//
-// Runs inside the Rank 0 process.  All state lives in std::array /
-// std::unordered_map  - the fixed kMaxNumRanks cap keeps allocation simple.
-//
-// Thread safety: NOT thread-safe.  Must be called from a single thread
-// (the Host's SerializedExecutor).
-
 class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
    public:
     explicit CentralizedCoordinatorStateMachine(int max_world_size);
@@ -103,7 +93,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         return ranks_[rank].state;
     }
 
-    // Callers must check rankInValidRange before calling.
     const std::string& getAgentAddr(GlobalRank rank) const {
         return ranks_[rank].agent_addr;
     }
@@ -127,7 +116,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     std::unordered_map<GroupId, GroupDescriptor> group_descriptors_;
     std::unordered_map<GroupId, bool> group_auto_deactivate_;
 
-    //
     // Two independent 2PC flows share the same ViewUpdate ACK path:
     //   1. Proposal 2PC (activate/deactivate) - keyed by propose_id
     //   2. Bootstrap 2PC (initial group readiness) - keyed by group_id

@@ -21,8 +21,9 @@ class RpcClient;
 // Control Plane Architecture (Coordinator side)
 // =========================================================================
 //
-// The Coordinator runs inside Rank 0's process.  It is the authoritative
-// source of truth for rank health (RankState) and group membership (GroupView).
+// The CentralizedCoordinator runs inside Rank 0's process.  It is the
+// authoritative source of truth for rank health (RankState) and group
+// membership (GroupView).
 //
 //   Agent (any rank)                 CoordinatorHost (Rank 0)
 //   +-----------------+              +---------------------------+
@@ -35,34 +36,25 @@ class RpcClient;
 //                                            |
 //                                    SerializedExecutor
 //                                            |
-//                              +-------------------------------+
+//                              +------------------------------------+
 //                              | CentralizedCoordinatorStateMachine |
-//                              |  (pure state machine, no I/O)     |
-//                              +-------------------------------+
+//                              |  (pure state machine, no I/O)      |
+//                              +------------------------------------+
 //                                            |
 //                                    returns Effect list
 //                                            |
-//                              +-------------------------------+
-//                              | runEffects()                   |
+//                              +-----------------------------------+
+//                              | runEffects()                      |
 //                              |  RankStateUpdatePush -> broadcast |
-//                              |  ViewUpdatePush -> callAsync    |
-//                              |  ReplyViewUpdateEffect -> reply |
-//                              +-------------------------------+
+//                              |  ViewUpdatePush -> callAsync      |
+//                              |  ReplyViewUpdateEffect -> reply   |
+//                              +-----------------------------------+
 //
-// Key design: the state machine is 100% synchronous and lock-free.
-// All I/O (RPC, network) happens in the Host layer via effects.
-//
-// Two independent 2PC flows:
-//   1. Proposal 2PC (activate/deactivate): propose_id-keyed, Strict Barrier
-//   2. Bootstrap 2PC (group readiness): group_id-keyed, waits for all ACKs
-// Both share the same ViewUpdate ACK path; CoordinatorHost routes each ACK
-// to the correct handler based on whether the push had a propose_id.
-
-// CoordinatorRpcServiceImpl  - thin RPC handler that forwards all calls
-// to CoordinatorHost::post*().
 
 class CoordinatorHost;
 
+// CoordinatorRpcServiceImpl  - thin RPC handler that forwards all calls
+// to CoordinatorHost::post*().
 class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
    public:
     explicit CoordinatorRpcServiceImpl(CoordinatorHost& host) : host_(host) {}
@@ -88,17 +80,7 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
     CoordinatorHost& host_;
 };
 
-// CoordinatorHost  - execution host for the Coordinator state machine.
-//
-// Owns:
-//   - CentralizedCoordinatorStateMachine (pure state machine)
-//   - SerializedExecutor (single-threaded event loop)
-//   - RPC server (for Agent->Coordinator calls)
-//   - RpcClient (for Coordinator->Agent pushes)
-//
-// All state machine methods execute on the SerializedExecutor thread.
-// RPC handlers are thin: they just post to the executor.
-
+// CoordinatorHost - execution host for the Coordinator state machine.
 class CoordinatorHost {
    public:
     CoordinatorHost(c10::intrusive_ptr<c10d::Store> store,
@@ -124,8 +106,6 @@ class CoordinatorHost {
     void postProposalAck(uint64_t propose_id, GlobalRank rank, uint64_t epoch,
                          bool applied);
 
-    // Bootstrap 2PC ACK handler.  Called when an Agent ACKs a ViewUpdate
-    // during the BootstrapSyncing phase.
     void postBootstrapAck(GroupId group_id, GlobalRank rank, uint64_t epoch);
 
     void postPublishEndpoint(coro_rpc::context<PublishEndpointResponse> ctx,

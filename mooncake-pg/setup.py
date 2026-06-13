@@ -30,7 +30,7 @@ abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 current_dir = os.path.abspath(os.path.dirname(__file__))
 
 abi_define = f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}"
-cxx_args = [abi_define, "-std=c++20", "-O3", "-g0"]
+cxx_args = [abi_define, "-std=c++20", "-O0", "-g"]
 
 cuda_libraries = ["ibverbs", "mlx5"]
 cuda_library_dirs = []

@@ -4,10 +4,13 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <exception>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace mooncake {
@@ -72,6 +75,39 @@ class SerializedExecutor {
         }
     }
 
+    // Post a task and block the caller until it completes on the executor
+    // thread.  The task's return value (if any) is forwarded to the caller;
+    // exceptions thrown inside the task are re-raised on the caller.
+    //
+    // Must NOT be called from the executor thread itself (deadlock).
+    template <typename F>
+    auto postAndWait(F&& f) -> std::invoke_result_t<F> {
+        using R = std::invoke_result_t<F>;
+        std::promise<R> promise;
+        auto future = promise.get_future();
+        bool ok = post([&promise, fn = std::forward<F>(f)]() mutable {
+            try {
+                if constexpr (std::is_void_v<R>) {
+                    fn();
+                    promise.set_value();
+                } else {
+                    promise.set_value(fn());
+                }
+            } catch (...) {
+                promise.set_exception(std::current_exception());
+            }
+        });
+        if (!ok) {
+            throw std::runtime_error(
+                "SerializedExecutor::postAndWait: executor not running");
+        }
+        if constexpr (std::is_void_v<R>) {
+            future.get();
+        } else {
+            return future.get();
+        }
+    }
+
     // Post a task to the executor.  May be called from any thread.
     // Tasks are processed in FIFO order on the executor thread.
     // Returns false if the executor is not running (task is silently dropped).
@@ -103,12 +139,6 @@ class SerializedExecutor {
 
    private:
     void loop() {
-        static int loop_count = 0;
-        if (++loop_count <= 2) {
-            fprintf(stderr,
-                    "SerializedExecutor::loop() started, iteration %d\n",
-                    loop_count);
-        }
         while (running_.load(std::memory_order_acquire)) {
             std::vector<std::function<void()>> batch;
             {

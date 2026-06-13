@@ -384,6 +384,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
                 // handshake.
                 link.state = PeerLinkState::CONNECTED;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
+                publishLinkUp(peer, segment_id);
                 emit(TELinkEvent{.kind = TELinkEvent::Kind::LinkUp,
                                  .peer = peer,
                                  .target_id = segment_id});
@@ -436,6 +437,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
                 link.warmup_batch_id = std::nullopt;
                 link.state = PeerLinkState::CONNECTED;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
+                publishLinkUp(peer, link.target_id.value());
                 emit(TELinkEvent{.kind = TELinkEvent::Kind::LinkUp,
                                  .peer = peer,
                                  .target_id = link.target_id});
@@ -472,6 +474,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
                     &warmup_recv_region_[peer])) {
                 link.state = PeerLinkState::CONNECTED;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
+                publishLinkUp(peer, link.target_id.value());
                 emit(TELinkEvent{.kind = TELinkEvent::Kind::LinkUp,
                                  .peer = peer,
                                  .target_id = link.target_id});

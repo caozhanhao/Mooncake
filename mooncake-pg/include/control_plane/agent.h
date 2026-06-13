@@ -10,7 +10,7 @@
 
 namespace mooncake {
 
-// AgentStateMachine -- Pure state machine for the control-plane client.
+// AgentStateMachine - Pure state machine for the control-plane client.
 class AgentStateMachine {
    public:
     AgentStateMachine(GlobalRank rank, int max_world_size);
@@ -21,6 +21,7 @@ class AgentStateMachine {
     AgentApplyResult handlePeerJoined(const PeerJoinedPush& push);
     AgentApplyResult handleRankStateUpdate(const RankStateUpdatePush& push);
     AgentApplyResult handleViewUpdate(const ViewUpdatePush& push);
+    AgentApplyResult applyGroupView(GroupId group_id, const GroupView& view);
     AgentApplyResult handleLinkStateChanged(GlobalRank peer, bool connected);
 
     HeartbeatRequest buildHeartbeat() const;
@@ -29,7 +30,6 @@ class AgentStateMachine {
     AgentApplyResult prepareCleanSlateRegister();
     AgentApplyResult markOffline();
 
-    // Set the agent session epoch (called by Host on executor thread).
     void setAgentSessionEpoch(uint64_t epoch) {
         agent_session_epoch_.store(epoch, std::memory_order_release);
     }
@@ -40,15 +40,20 @@ class AgentStateMachine {
     GroupView getGroupView(GroupId group_id) const;
     const GroupDescriptor* getGroupDescriptor(GroupId group_id) const;
 
-    enum class CoordinatorConnection { Connected, Disconnected };
+    enum class CoordinatorConnection { Connected, Registering, Disconnected };
     CoordinatorConnection getCoordinatorConnection() const {
         return coordinator_connection_;
     }
     void setCoordinatorConnected() {
         coordinator_connection_ = CoordinatorConnection::Connected;
     }
+    void setCoordinatorRegistering() {
+        coordinator_connection_ = CoordinatorConnection::Registering;
+    }
+    void setCoordinatorDisconnected() {
+        coordinator_connection_ = CoordinatorConnection::Disconnected;
+    }
 
-    RankState getSelfRankState() const { return rank_state_; }
     uint64_t getAgentSessionEpoch() const {
         return agent_session_epoch_.load(std::memory_order_acquire);
     }
@@ -79,8 +84,6 @@ class AgentStateMachine {
     // Updated by processTransferObservation when a transfer observation
     // differs from the last reported value (both success and failure
     // transitions trigger an immediate reportTransferObservation RPC).
-    // Seeded to true on peer registration so the first observation of
-    // any kind (success or failure) triggers a report.
     std::array<bool, kMaxNumRanks> last_reported_peer_status_{};
 
     // Snapshot of Coordinator-authoritative rank states, published to

@@ -19,7 +19,9 @@ CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
         << kMaxNumRanks << ")";
     for (int i = 0; i < kMaxNumRanks; ++i) {
         ranks_[i].link_status.assign(max_world_size_, 0);
-        ranks_[i].link_status[i] = 1;
+        if (i < max_world_size_) {
+            ranks_[i].link_status[i] = 1;
+        }
     }
 }
 
@@ -240,8 +242,11 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
 
     if (required_acks.empty()) {
         // Best-effort: broadcast + reply immediately.
-        result.effects.push_back(ViewUpdateEffect{
-            group_descriptors_[req.group_id], view, {}, propose_id});
+        result.effects.push_back(
+            ViewUpdateEffect{group_descriptors_[req.group_id],
+                             view,
+                             {},
+                             ProposalAckRoute{propose_id}});
         result.effects.push_back(ReplyViewUpdateEffect{
             propose_id, {ViewUpdateStatus::Applied, view.epoch, {}, ""}});
     } else {
@@ -254,8 +259,9 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
                                            required_acks.end()),
             std::chrono::steady_clock::now() + kProposeTimeout,
         };
-        result.effects.push_back(ViewUpdateEffect{
-            group_descriptors_[req.group_id], view, required_acks, propose_id});
+        result.effects.push_back(
+            ViewUpdateEffect{group_descriptors_[req.group_id], view,
+                             required_acks, ProposalAckRoute{propose_id}});
     }
 
     return result;
@@ -320,8 +326,6 @@ CentralizedCoordinatorStateMachine::checkTimeouts() {
     }
 
     // Propose ACK timeout (Strict Barrier & Prune)
-    // NOTE: transitionToOffline does NOT modify pending_proposal_acks_,
-    // so the iterator remains valid across the call.
     for (auto it = pending_proposal_acks_.begin();
          it != pending_proposal_acks_.end();) {
         if (now > it->second.deadline) {
@@ -381,8 +385,11 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
             if (view.status == GroupStatus::Ready) {
                 // Group already activated -> push best-effort view update.
                 view.epoch++;
-                result.effects.push_back(ViewUpdateEffect{
-                    group_descriptors_[ep.group_id], view, {}, std::nullopt});
+                result.effects.push_back(
+                    ViewUpdateEffect{group_descriptors_[ep.group_id],
+                                     view,
+                                     {},
+                                     BootstrapAckRoute{}});
             }
         }
     }
@@ -441,17 +448,6 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
     }
 
     effects.push_back(makeRankStateEffect(rank));
-
-    // DO NOT modify active_ranks here.  Membership changes come from:
-    //   - auto_deactivate=true -> handleTransferObservation
-    //   - Explicit deactivate_rank / disconnect
-    //   - Strict Barrier & Prune -> AppliedWithDroppedRanks
-
-    // DO NOT modify pending ACKs here.  Proposal timeout handles its own
-    // cleanup (AppliedWithDroppedRanks).  Bootstrap timeout is acceptable
-    // for now  - a hanging waitUntilGroupReady is the expected failure mode
-    // when a peer dies during bootstrap.
-
     updateRankHealth(effects);
 }
 
@@ -459,8 +455,6 @@ void CentralizedCoordinatorStateMachine::transitionToSynced(
     GlobalRank rank, std::vector<CoordinatorEffect>& effects) {
     ranks_[rank].state = RankState::SYNCED;
     effects.push_back(makeRankStateEffect(rank));
-    // Do NOT recompute healthy set here  - a newly-SYNCED rank has
-    // link_status_ all zeros, so it cannot affect the healthy set.
 }
 
 // Private: authoritative HEALTHY computation
@@ -583,13 +577,12 @@ void CentralizedCoordinatorStateMachine::updateRankHealth(
     }
 
     // 2. For auto_deactivate groups, remove unhealthy ranks from the active
-    //    set.  This subsumes the per-group deactivation that was previously in
-    //    handleTransferObservation, and also fires on heartbeat-timeout ->
-    //    transitionToOffline -> updateRankHealth, fixing the bug where LinkDown
-    //    could suppress transfer-observation reports and leave a dead rank
-    //    stuck as active=true forever.
+    //    set. However, during bootstrap / BootstrapSyncing we do NOT do this:
+    //    we wait for full mutual connectivity and let waitUntilGroupReady()
+    //    time out if a peer is truly dead.
     for (auto& [group_id, view] : group_views_) {
         if (!group_auto_deactivate_[group_id]) continue;
+        if (view.status != GroupStatus::Ready) continue;
         bool changed = false;
         for (int i = 0; i < max_world_size_; ++i) {
             if (!view.members[i].active) continue;
@@ -603,7 +596,7 @@ void CentralizedCoordinatorStateMachine::updateRankHealth(
         if (changed) {
             view.epoch++;
             effects.push_back(ViewUpdateEffect{
-                group_descriptors_[group_id], view, {}, std::nullopt});
+                group_descriptors_[group_id], view, {}, BootstrapAckRoute{}});
         }
     }
 
@@ -624,6 +617,15 @@ bool CentralizedCoordinatorStateMachine::isRankActivatable(
 
     auto it = group_views_.find(group_id);
     if (it == group_views_.end()) return false;
+
+    // Require mutual TE connectivity with every other active rank.
+    // A rank being HEALTHY alone is not enough: the Coordinator may promote
+    // single-node "cliques" before all-to-all links are established.
+    for (int i = 0; i < max_world_size_; ++i) {
+        if (i == rank) continue;
+        if (!it->second.members[i].active) continue;
+        if (!isMutuallyConnected(rank, i)) return false;
+    }
 
     const auto& member = it->second.members[rank];
     // endpoint_epoch is monotonically increasing and never reset.
@@ -652,12 +654,11 @@ bool CentralizedCoordinatorStateMachine::isActivatableSet(
 //
 // Group lifecycle:
 //   declareGroup() creates a group in Bootstrapping status.
-//   Once all active ranks have valid endpoints and are HEALTHY, this
-//   function transitions to BootstrapSyncing and broadcasts a ViewUpdate
-//   to collect ACKs from all active ranks (a 2PC barrier).
+//   Once all active ranks have valid endpoints, are HEALTHY, and are mutually
+//   TE-connected, this function transitions to BootstrapSyncing and broadcasts
+//   a ViewUpdate to collect ACKs from all active ranks (a 2PC barrier).
 //   Once all ACKs arrive, the group transitions to Ready.
 //   waitUntilGroupReady() unblocks only when status == Ready.
-
 void CentralizedCoordinatorStateMachine::checkGroupTransitions(
     std::vector<CoordinatorEffect>& effects) {
     for (auto& [group_id, view] : group_views_) {
@@ -688,7 +689,7 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
 
                 effects.push_back(ViewUpdateEffect{group_descriptors_[group_id],
                                                    view, acks_needed,
-                                                   std::nullopt});
+                                                   BootstrapAckRoute{}});
             }
         } else if (view.status == GroupStatus::BootstrapSyncing) {
             // If a peer dies during this phase, its ACK never arrives.
@@ -703,8 +704,10 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                 view.status = GroupStatus::Ready;
                 view.epoch++;
                 pending_bootstrap_acks_.erase(it);
-                effects.push_back(ViewUpdateEffect{
-                    group_descriptors_[group_id], view, {}, std::nullopt});
+                effects.push_back(ViewUpdateEffect{group_descriptors_[group_id],
+                                                   view,
+                                                   {},
+                                                   BootstrapAckRoute{}});
             }
         }
     }

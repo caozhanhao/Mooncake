@@ -50,8 +50,6 @@ const GroupDescriptor* AgentStateMachine::getGroupDescriptor(
     return nullptr;
 }
 
-// handlePeerJoined  - new rank registered
-
 AgentApplyResult AgentStateMachine::handlePeerJoined(
     const PeerJoinedPush& push) {
     AgentApplyResult effects;
@@ -100,8 +98,6 @@ AgentApplyResult AgentStateMachine::handleRankStateUpdate(
     return effects;
 }
 
-// handleViewUpdate  - new GroupView received
-
 AgentApplyResult AgentStateMachine::handleViewUpdate(
     const ViewUpdatePush& push) {
     AgentApplyResult effects;
@@ -117,7 +113,20 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
     return effects;
 }
 
-// handleLinkStateChanged  - LinkManager link up/down event
+// applyGroupView  - apply a GroupView received as an RPC response (e.g.
+// declareGroup).  Unlike handleViewUpdate, this does not carry a new
+// descriptor; the local descriptor registered with the group is preserved.
+AgentApplyResult AgentStateMachine::applyGroupView(GroupId group_id,
+                                                   const GroupView& view) {
+    AgentApplyResult effects;
+    auto it = groups_.find(group_id);
+    if (it == groups_.end()) return effects;
+
+    it->second.view = view;
+    effects.push_back(
+        ApplyViewToBackend{group_id, it->second.descriptor, view});
+    return effects;
+}
 
 AgentApplyResult AgentStateMachine::handleLinkStateChanged(GlobalRank peer,
                                                            bool connected) {
@@ -131,28 +140,32 @@ AgentApplyResult AgentStateMachine::handleLinkStateChanged(GlobalRank peer,
     link_connected_[peer] = connected;
 
     if (!connected) {
-        // On link down, notify all backends to reset their P2P peer state.
-        // The state machine doesn't hold backend pointers, so this is modeled
-        // as an effect for the Host to execute (forEachBackend fanout).
         effects.push_back(NotifyTEUnreachable{peer});
+    } else {
+        // Link came up: re-apply current Ready views so backends refresh their
+        // cached segment IDs for this peer.  This is required for link recovery
+        // (the view stays Ready while the TE link is rebuilt) and covers any
+        // edge case where a Ready view was applied before the local TE link
+        // finished establishing.
+        for (const auto& [group_id, entry] : groups_) {
+            if (entry.view.status == GroupStatus::Ready) {
+                effects.push_back(
+                    ApplyViewToBackend{group_id, entry.descriptor, entry.view});
+            }
+        }
     }
     return effects;
 }
 
-// buildHeartbeat
-
 HeartbeatRequest AgentStateMachine::buildHeartbeat() const {
     HeartbeatRequest req;
     req.rank = rank_;
-    // Report physical link state, not the transfer-observation debounce cache.
     req.link_status.resize(max_world_size_, 0);
     for (int i = 0; i < max_world_size_; ++i)
         req.link_status[i] = link_connected_[i] ? 1 : 0;
     req.link_status[rank_] = 1;
     return req;
 }
-
-// applyRegisterResponse  - process full state from Coordinator
 
 AgentApplyResult AgentStateMachine::applyRegisterResponse(
     const RegisterResponse& resp) {
@@ -204,8 +217,6 @@ AgentApplyResult AgentStateMachine::applyRegisterResponse(
     return effects;
 }
 
-// prepareCleanSlateRegister  - full reset before re-registration
-
 AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
     AgentApplyResult effects;
 
@@ -224,8 +235,6 @@ AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
 
     return effects;
 }
-
-// markOffline  - Coordinator connection lost
 
 AgentApplyResult AgentStateMachine::markOffline() {
     AgentApplyResult effects;
@@ -258,7 +267,6 @@ AgentApplyResult AgentStateMachine::markOffline() {
 // reportTransferObservation RPC and update the cache. This covers both failure
 // (true->false) and recovery (false->true) transitions. Unchanged observations
 // piggyback on the next heartbeat.
-
 AgentApplyResult AgentStateMachine::processTransferObservation(
     const TransferObservationEvent& event) {
     AgentApplyResult effects;
@@ -306,12 +314,7 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
     return effects;
 }
 
-// syncRankStateSnapshot  - sync state snapshot for LinkManager
-
 void AgentStateMachine::syncRankStateSnapshot(AgentApplyResult& effects) {
-    // rank_state_ strictly tracks the Coordinator-authoritative broadcast.
-    // No local HEALTHY downgrade is performed here.
-
     bool snapshot_changed = false;
     for (int j = 0; j < max_world_size_; ++j) {
         uint8_t new_val = static_cast<uint8_t>(global_rank_states_[j]);

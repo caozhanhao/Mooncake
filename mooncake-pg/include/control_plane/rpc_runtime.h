@@ -58,6 +58,7 @@ struct RpcSharedState {
     std::mutex mutex;
     std::unordered_map<std::string, std::shared_ptr<coro_rpc::coro_rpc_client>>
         clients;
+    std::atomic<bool> shutdown{false};
 };
 
 // Coroutine-based connect + cache lookup.
@@ -75,13 +76,18 @@ std::unique_ptr<coro_rpc::coro_rpc_client> createSyncClient();
 template <auto Func, typename Req>
 async_simple::coro::Lazy<void> sendCoroutine(
     std::shared_ptr<RpcSharedState> state, const std::string& addr, Req req) {
+    if (state->shutdown.load(std::memory_order_acquire)) co_return;
     auto client = co_await getOrCreateClientAsync(state, addr);
     if (!client) co_return;
     try {
         auto send_lazy =
             co_await client->template send_request<Func, Req>(std::move(req));
         co_await std::move(send_lazy);
-    } catch (...) {
+    } catch (const std::exception& e) {
+        if (!state->shutdown.load(std::memory_order_acquire)) {
+            LOG(ERROR) << "RpcClient: fire-and-forget RPC to " << addr
+                       << " failed: " << e.what();
+        }
     }
 }
 
@@ -92,31 +98,32 @@ template <auto Func, typename Req, typename ResponseType, typename Callback>
 async_simple::coro::Lazy<void> callAsyncCoroutine(
     std::shared_ptr<RpcSharedState> state, const std::string& addr, Req req,
     Callback cb) {
-    LOG(INFO) << "callAsyncCoroutine: connecting to " << addr;
+    if (state->shutdown.load(std::memory_order_acquire)) co_return;
     auto client = co_await getOrCreateClientAsync(state, addr);
     if (!client) {
-        LOG(ERROR) << "callAsyncCoroutine: failed to connect to " << addr;
+        if (!state->shutdown.load(std::memory_order_acquire)) {
+            LOG(ERROR) << "callAsyncCoroutine: failed to connect to " << addr;
+        }
         cb(ResponseType{});
         co_return;
     }
-    LOG(INFO) << "callAsyncCoroutine: connected to " << addr
-              << ", sending request";
     try {
         auto send_lazy =
             co_await client->template send_request<Func, Req>(std::move(req));
-        LOG(INFO) << "callAsyncCoroutine: request sent to " << addr
-                  << ", waiting for response";
         auto res = co_await std::move(send_lazy);
         if (res) {
-            LOG(INFO) << "callAsyncCoroutine: response received from " << addr;
             cb(std::move(res.value().result()));
         } else {
-            LOG(ERROR) << "RpcClient: async rpc to " << addr
-                       << " failed: " << res.error().msg;
+            if (!state->shutdown.load(std::memory_order_acquire)) {
+                LOG(ERROR) << "RpcClient: async rpc to " << addr
+                           << " failed: " << res.error().msg;
+            }
             cb(ResponseType{});
         }
     } catch (const std::exception& e) {
-        LOG(ERROR) << "RpcClient: async rpc caught exception: " << e.what();
+        if (!state->shutdown.load(std::memory_order_acquire)) {
+            LOG(ERROR) << "RpcClient: async rpc caught exception: " << e.what();
+        }
         cb(ResponseType{});
     }
 }
@@ -178,6 +185,11 @@ class RpcClient {
 
     bool isConnected(const std::string& addr) const;
     bool tryReconnect(const std::string& addr);
+
+    // Mark the client as shutting down.  In-flight async coroutines will
+    // drop silently instead of logging errors or invoking callbacks that may
+    // access a destroyed AgentHost.
+    void shutdown() { state_->shutdown.store(true, std::memory_order_release); }
 
    private:
     std::shared_ptr<rpc_detail::RpcSharedState> state_ =

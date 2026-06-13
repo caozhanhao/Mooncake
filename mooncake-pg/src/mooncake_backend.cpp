@@ -113,7 +113,7 @@ MooncakeBackend::MooncakeBackend(
         LOG(INFO) << "MooncakeBackend: rank=" << rank << " size=" << size
                   << " globalRanks=[" << gr << "]"
                   << " initial_rank_order=[" << ro << "]"
-                  << " globalRank=" << meta_->globalRank;
+                  << " globalRank=" << initial_rank_order[rank];
     }
 
     // Register buffers
@@ -207,6 +207,9 @@ MooncakeBackend::MooncakeBackend(
     p2p_device_worker_->registerProxy(p2p_proxy_);
 
     meta_ = std::make_shared<TransferGroupMeta>();
+    for (int i = 0; i < kMaxNumRanks; ++i) {
+        meta_->segmentIDs[i] = static_cast<TransferMetadata::SegmentID>(-1);
+    }
     meta_->rank = rank;
     meta_->globalRank = initial_rank_order[rank];
     for (int i = 0; i < max_group_size_; ++i) {
@@ -281,22 +284,24 @@ MooncakeBackend::MooncakeBackend(
         declaration.initial_view.members[meta_->globalRank].endpoint_epoch =
             kInitialEndpointEpoch;
 
-        // Register with Agent (declares group to Coordinator asynchronously).
+        // Bootstrap: wait for Agent registration before declaring the group.
+        // The Coordinator rejects declareGroup if the agent is still OFFLINE.
+        if (!agent_.waitUntilRegistered(std::chrono::seconds(30))) {
+            throw std::runtime_error(
+                "MooncakeBackend: Agent registration timed out");
+        }
+
+        // Declare group to Coordinator (synchronous — blocks until the
+        // Coordinator has processed declareGroup).
         agent_.registerGroup(declaration, this);
 
-        // Publish local endpoint (passive registration, no broadcast).
-        // agent_session_epoch is NOT set here — the Host fills it.
+        // Publish local endpoint (synchronous — group exists on Coordinator
+        // because registerGroup returned).
         agent_.publishLocalEndpoint(GroupEndpointPublication{
             .group_id = meta_->group_id,
             .endpoint_epoch = kInitialEndpointEpoch,
             .endpoint_info = local_ep,
         });
-
-        // Bootstrap: block until Agent is registered and GroupView is ready.
-        if (!agent_.waitUntilRegistered(std::chrono::seconds(30))) {
-            throw std::runtime_error(
-                "MooncakeBackend: Agent registration timed out");
-        }
         auto view = agent_.waitUntilGroupReady(meta_->group_id,
                                                std::chrono::seconds(30));
         applyViewChange(declaration.descriptor, view);
@@ -1037,8 +1042,10 @@ void MooncakeBackend::applyViewChange(const GroupDescriptor& descriptor,
 
     // Sync TransferGroupMeta for data plane access (worker thread, P2P proxy).
     // The Coordinator guarantees all active members have published endpoints
-    // and are HEALTHY before transitioning to Ready status, so we can safely
-    // sync everything here.
+    // and are HEALTHY before transitioning to Ready status, but the local TE
+    // link may still be establishing.  If resolvePeer() misses a peer, the
+    // LinkUp handler in AgentStateMachine will re-apply the Ready view to
+    // refresh the cached segment ID once the link is up.
     if (meta_ && meta_->activeRanks) {
         for (int i = 0;
              i < static_cast<int>(view.members.size()) && i < meta_->size;
@@ -1051,6 +1058,12 @@ void MooncakeBackend::applyViewChange(const GroupDescriptor& descriptor,
                     ctx_.link_manager.resolvePeer(static_cast<GlobalRank>(i));
                 if (handle) {
                     meta_->segmentIDs[i] = handle->target_id;
+                } else {
+                    LOG(WARNING)
+                        << "MooncakeBackend: applyViewChange rank="
+                        << meta_->globalRank << " TE link to peer=" << i
+                        << " not ready yet; segmentID will be refreshed on "
+                           "LinkUp";
                 }
             }
         }
