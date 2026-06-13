@@ -200,7 +200,10 @@ MooncakeBackend::MooncakeBackend(
         ctx_.engine, P2PProxy::Options{
                          .is_cpu = isCpu_,
                          .rank = rank_,
-                         .size = size_,
+                         // Use max_group_size_ (capacity) rather than the
+                         // initial world size so that P2PProxy can handle
+                         // future peers during elastic extension/recovery.
+                         .size = max_group_size_,
                          .cuda_device_index = cuda_device_index,
                          .p2p_timeout_us = &ctx_.p2p_timeout_us,
                      });
@@ -1033,7 +1036,15 @@ void MooncakeBackend::applyViewChange(const GroupDescriptor& descriptor,
                                       const GroupView& view) {
     // Sync rank_order for P2P proxy InGroupRank -> GlobalRank mapping.
     if (meta_) {
-        meta_->epoch = view.epoch;
+        if (meta_->epoch != view.epoch) {
+            // Membership boundary (extension/recovery/deactivation): reset the
+            // collective sequence so that all ranks, including joiners and
+            // replacements, agree on the double-buffer parity. Re-applying the
+            // same view (e.g. on LinkUp) leaves epoch unchanged, so in-flight
+            // double buffering is not disrupted.
+            meta_->taskCount = 0;
+            meta_->epoch = view.epoch;
+        }
         for (size_t i = 0; i < descriptor.rank_order.size() && i < kMaxNumRanks;
              ++i) {
             meta_->rank_order[i] = descriptor.rank_order[i];

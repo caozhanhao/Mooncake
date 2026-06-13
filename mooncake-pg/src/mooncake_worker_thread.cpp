@@ -199,6 +199,9 @@ void MooncakeWorker::startWorker() {
                             if (!group->activeRanks[j]) {
                                 continue;
                             }
+                            if (task.failedRanksHost[j]) {
+                                continue;
+                            }
                             if (rankToTaskId[i][j] == kInvalidTaskId) {
                                 continue;
                             }
@@ -256,6 +259,9 @@ void MooncakeWorker::startWorker() {
                         if (!group->activeRanks[j]) {
                             continue;
                         }
+                        if (task.failedRanksHost[j]) {
+                            continue;
+                        }
 
                         // Use cached segment ID from TransferGroupMeta.
                         TransferMetadata::SegmentID target_id =
@@ -294,6 +300,9 @@ void MooncakeWorker::startWorker() {
                     TransferStatus status;
                     for (int j = 0; j < group->size; ++j) {
                         if (!group->activeRanks[j]) {
+                            continue;
+                        }
+                        if (task.failedRanksHost[j]) {
                             continue;
                         }
                         if (rankToTaskId[i][j] == kInvalidTaskId) {
