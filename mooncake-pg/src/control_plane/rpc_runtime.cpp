@@ -27,7 +27,6 @@ bool RpcServer::start() {
         LOG(ERROR) << "RpcServer: failed to start: " << ec.message();
         return false;
     }
-    LOG(INFO) << "RpcServer: listening on port " << server_->port();
     return true;
 }
 

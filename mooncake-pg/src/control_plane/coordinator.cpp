@@ -347,7 +347,7 @@ CentralizedCoordinatorStateMachine::checkTimeouts() {
     return result;
 }
 
-// publishEndpoint  - passive endpoint registration
+// publishEndpoint - endpoint registration
 
 CoordinatorApplyResult<PublishEndpointResponse>
 CentralizedCoordinatorStateMachine::handlePublishEndpoint(
@@ -427,8 +427,7 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
         if (bitAt(req.failed_ranks, j)) reporter.link_status[j] = 0;
     }
 
-    // Recompute authoritative health (updateRankHealth now also handles
-    // auto_deactivate for all groups, not just the reporting group).
+    // Recompute authoritative health
     updateRankHealth(result.effects);
 
     return result;

@@ -38,7 +38,7 @@ struct TELinkEvent {
 // Responsibilities:
 //   1. Physical link lifecycle: openSegment, warmup handshake, closeSegment
 //   2. Low-frequency candidate probe for idle/inactive peers
-//   3. Lock-free worker read model: resolvePeer() / isGroupReady()
+//   3. Lock-free worker read model: resolvePeer() / isRankReady()
 class LinkManager {
    public:
     LinkManager() = default;
@@ -90,7 +90,7 @@ class LinkManager {
     std::optional<PeerReadHandle> resolvePeer(GlobalRank peer) const;
 
     // Check whether the peer is ready for group operations:
-    // RankState == HEALTHY && TE link is up.
+    // RankState == HEALTHY && local TE link is up.
     // Used by pg.get_peer_state().
     bool isRankReady(GlobalRank peer) const;
 

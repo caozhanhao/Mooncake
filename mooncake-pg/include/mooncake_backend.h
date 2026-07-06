@@ -23,15 +23,8 @@
 
 namespace mooncake {
 
-// =========================================================================
-// MooncakeProcessContext — process-level container.
-//
-// Owned by pg_py.cpp (file-scope static).  Config fields can be set by Python
-// setters BEFORE the first backend is created.  engine is eagerly allocated
-// so that set_device_filter works pre-init.  engine->init() and agent_host
-// are lazily initialised on the first createMooncakeBackend() call.
-// =========================================================================
-
+// MooncakeProcessContext -- process-level container.
+// Owned by pg_py.cpp (file-scope static).
 struct MooncakeProcessContext {
     // === Configuration (Python setters may modify before first backend) ===
     TransferEngine* external_engine = nullptr;
@@ -48,6 +41,7 @@ struct MooncakeProcessContext {
     TransferEngine* engine = owned_engine.get();
     bool engine_initialized = false;
     int next_group_id = 0;
+    int max_world_size = 0;
 
     // === Process-level subsystems (no more singletons) ===
     LinkManager link_manager;
@@ -119,15 +113,15 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension)
             : activeRanks_{activeRanks}, isExtension_{isExtension} {}
         MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
-                               int maxWorldSize)
+                               int maxGroupSize)
             : activeRanks_{activeRanks},
               isExtension_{isExtension},
-              maxWorldSize_{maxWorldSize} {}
+              maxGroupSize_{maxGroupSize} {}
         MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
-                               int maxWorldSize, bool autoDeactivateOnFailure)
+                               int maxGroupSize, bool autoDeactivateOnFailure)
             : activeRanks_{activeRanks},
               isExtension_{isExtension},
-              maxWorldSize_{maxWorldSize},
+              maxGroupSize_{maxGroupSize},
               autoDeactivateOnFailure_{autoDeactivateOnFailure} {}
 
         ~MooncakeBackendOptions() override = default;
@@ -137,7 +131,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         // Optional upper bound for connection polling / reserved rank slots.
         // When > 0, the backend may pre-size internal rank metadata to this
         // value (while PyTorch's group_size() remains unchanged).
-        int maxWorldSize_ = -1;
+        int maxGroupSize_ = -1;
 
         // Controls whether PG automatically deactivates failed ranks on
         // timeout or operation failure.
@@ -147,10 +141,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         // When set to false, PG only reports failures through per-operation
         // failedRanks, while leaving the active rank unchanged so that the
         // caller can decide whether and how to handle the failure.
-        //
-        // Note that the upper layer is responsible for maintaining active rank
-        // consistency. Any automatic deactivation in PG is local to the current
-        // rank only; no cross-rank synchronization is performed implicitly.
         bool autoDeactivateOnFailure_ = true;
     };
 
@@ -278,8 +268,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     ProposeViewUpdateResponse deactivateRank(const std::vector<int>& ranks);
 
     void joinGroup();
-
-    // ---- New methods for Agent/Host integration ----
 
     // Atomically update the worker-visible group view (descriptor + members).
     // Called by AgentHost from the executor thread when a ViewUpdatePush

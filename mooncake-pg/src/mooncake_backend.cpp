@@ -26,8 +26,6 @@ constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
 constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 constexpr int kBarrierDummyTensorSize = 1;
 
-// All process-level state is in MooncakeProcessContext (pg_py.cpp).
-
 /**
  * @brief Initialize Mooncake backend state from the PyTorch process-group
  * information and optional Mooncake-specific options.
@@ -44,15 +42,15 @@ MooncakeBackend::MooncakeBackend(
       agent_(agent) {
     const int rank = distBackendOpts.group_rank;
     const int size = distBackendOpts.group_size;
-    const int max_group_size = (options_ && options_->maxWorldSize_ > 0)
-                                   ? options_->maxWorldSize_
+    const int max_group_size = (options_ && options_->maxGroupSize_ > 0)
+                                   ? options_->maxGroupSize_
                                    : size;
 
     TORCH_CHECK(max_group_size >= 0 &&
                     static_cast<size_t>(max_group_size) <= kMaxNumRanks,
-                "max_world_size out of range");
+                "max_group_size out of range");
     TORCH_CHECK(max_group_size >= size,
-                "max_world_size must be >= process group size");
+                "max_group_size must be >= process group size");
     TORCH_CHECK(rank >= 0 && rank < max_group_size, "rank out of valid range");
 
     max_group_size_ = max_group_size;
@@ -81,7 +79,7 @@ MooncakeBackend::MooncakeBackend(
     }
     localServerName_ = ctx_.engine->getLocalIpAndPort();
 
-    // Build rank_order from global_ranks_in_group (or identity fallback).
+    // Build rank_order from global_ranks_in_group.
     // This is used for the GroupDeclaration and for meta_->rank_order.
     std::vector<GlobalRank> initial_rank_order;
     initial_rank_order.reserve(size);
@@ -250,7 +248,6 @@ MooncakeBackend::MooncakeBackend(
     meta_->backend = this;
     p2p_proxy_->bindMeta(meta_);
 
-    // Legacy activeRanks allocation (for backward compat with GPU kernel).
     if (isCpu) {
         meta_->activeRanks = new bool[kMaxNumRanks]{};
     } else {
@@ -282,7 +279,6 @@ MooncakeBackend::MooncakeBackend(
     local_ep.p2p_credit_region = (uint64_t)p2p_proxy_->credit_region();
     local_ep.p2p_ack_region = (uint64_t)p2p_proxy_->ack_region();
 
-    // ---- Agent-based bootstrap (new path) ----
     // Register this group with the Agent, publish local endpoint, and block
     // until the Coordinator returns the authoritative GroupView.
     {
@@ -300,7 +296,7 @@ MooncakeBackend::MooncakeBackend(
         declaration.initial_view.group_id = meta_->group_id;
         declaration.initial_view.epoch =
             0;  // Coordinator sets real epoch on activation
-        declaration.initial_view.members.resize(max_group_size_);
+        declaration.initial_view.members.resize(ctx_.max_world_size);
         for (int i = 0; i < size; ++i) {
             declaration.initial_view
                 .members[declaration.descriptor.rank_order[i]]
@@ -313,16 +309,19 @@ MooncakeBackend::MooncakeBackend(
 
         // Bootstrap: wait for Agent registration before declaring the group.
         // The Coordinator rejects declareGroup if the agent is still OFFLINE.
+        LOG(INFO) << "MooncakeBackend: waiting for Agent registration rank="
+                  << rank;
         if (!agent_.waitUntilRegistered(std::chrono::seconds(30))) {
             throw std::runtime_error(
                 "MooncakeBackend: Agent registration timed out");
         }
+        LOG(INFO) << "MooncakeBackend: Agent registration done rank=" << rank;
 
-        // Declare group to Coordinator (synchronous — blocks until the
+        // Declare group to Coordinator (synchronous - blocks until the
         // Coordinator has processed declareGroup).
         agent_.registerGroup(declaration, this);
 
-        // Publish local endpoint (synchronous — group exists on Coordinator
+        // Publish local endpoint (synchronous - group exists on Coordinator
         // because registerGroup returned).
         agent_.publishLocalEndpoint(GroupEndpointPublication{
             .group_id = meta_->group_id,
@@ -333,8 +332,6 @@ MooncakeBackend::MooncakeBackend(
                                                std::chrono::seconds(30));
         applyViewChange(declaration.descriptor, view);
     }
-    // ---- End Agent-based bootstrap ----
-
     // Register a lightweight Backend shim so that PyTorch's P2P dispatch path
     // (batch_isend_irecv → _get_backend → getBackend) can find a registered
     // Backend for this ProcessGroup.  The shim delegates send/recv back to us.
@@ -924,16 +921,12 @@ void MooncakeBackend::shutdown() {
     // Phase 2: Drain collective tasks for this backend
     has_hung_operation |= !worker_->drainTasks(meta_.get());
 
-    // Phase 3: Drain warm-up transfers for connection poller (legacy)
-    // ConnectionPoller cleanup: no-op — connection_ctx_ is not created
-    // in the Agent-based path.
-
-    // Phase 4: CUDA synchronization
+    // Phase 3: CUDA synchronization
     if (!isCpu_ && !has_hung_operation) {
         cudaDeviceSynchronize();
     }
 
-    // Phase 5: Release resources if no hung operations
+    // Phase 4: Release resources if no hung operations
     if (has_hung_operation) {
         p2p_proxy_->abandonResources();
     }
@@ -969,7 +962,7 @@ void MooncakeBackend::syncActiveRanksTensor() {
     // applyViewChange).
     std::vector<int32_t> active_ranks(meta_->size);
     for (int i = 0; i < meta_->size; ++i) {
-        active_ranks[i] = (meta_->activeRanks && meta_->activeRanks[i]) ? 1 : 0;
+        active_ranks[i] = meta_->activeRanks[i] ? 1 : 0;
     }
 
     auto cpu_tensor = torch::tensor(active_ranks, torch::dtype(torch::kInt32));
@@ -1008,7 +1001,7 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
 
 void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
     // Deprecated: replaced by Agent::proposeActivate.  This is a no-op
-    // stub kept for API compatibility — it now just calls activateRank.
+    // stub kept for API compatibility - it now just calls activateRank.
     LOG(WARNING) << "MooncakeBackend::recoverRanks is deprecated; "
                  << "calling activateRank instead.";
     activateRank(ranks);
@@ -1052,10 +1045,6 @@ void MooncakeBackend::joinGroup() {
                  << "groups are auto-registered by Agent during construction.";
 }
 
-// =========================================================================
-// New methods for Agent/Host integration
-// =========================================================================
-
 void MooncakeBackend::applyViewChange(const GroupDescriptor& descriptor,
                                       const GroupView& view) {
     // Sync rank_order for P2P proxy InGroupRank -> GlobalRank mapping.
@@ -1076,11 +1065,6 @@ void MooncakeBackend::applyViewChange(const GroupDescriptor& descriptor,
     }
 
     // Sync TransferGroupMeta for data plane access (worker thread, P2P proxy).
-    // The Coordinator guarantees all active members have published endpoints
-    // and are HEALTHY before transitioning to Ready status, but the local TE
-    // link may still be establishing.  If resolvePeer() misses a peer, the
-    // LinkUp handler in AgentStateMachine will re-apply the Ready view to
-    // refresh the cached segment ID once the link is up.
     if (meta_ && meta_->activeRanks) {
         for (int i = 0;
              i < static_cast<int>(view.members.size()) && i < meta_->size;
@@ -1094,7 +1078,9 @@ void MooncakeBackend::applyViewChange(const GroupDescriptor& descriptor,
                 if (handle) {
                     meta_->segmentIDs[i] = handle->target_id;
                 } else {
-                    LOG(WARNING)
+                    // FIXME: Should not happen unless TE link is down after
+                    // warmup
+                    LOG(ERROR)
                         << "MooncakeBackend: applyViewChange rank="
                         << meta_->globalRank << " TE link to peer=" << i
                         << " not ready yet; segmentID will be refreshed on "
@@ -1103,10 +1089,6 @@ void MooncakeBackend::applyViewChange(const GroupDescriptor& descriptor,
             }
         }
     }
-
-    // activeRanksTensor sync happens inside GPU kernels (launchEnqueueTask-
-    // Kernel) and the CPU path (putTaskCpu).  Do NOT sync from the executor
-    // thread — a host→device copy while a kernel is running can deadlock.
 
     // Recalculate activeSize from the view (count of active members).
     int new_active_size = 0;
@@ -1136,7 +1118,7 @@ GroupEndpointPublication MooncakeBackend::buildEndpointMetadata() const {
     ep.group_id = meta_->group_id;
     ep.endpoint_epoch = kInitialEndpointEpoch;
     ep.endpoint_info = meta_->segmentInfos[meta_->globalRank];
-    // agent_session_epoch is NOT set here — the Host fills it in the
+    // agent_session_epoch is NOT set here - the Host fills it in the
     // enclosing PublishEndpointRequest before sending the RPC.
     return ep;
 }

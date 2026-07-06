@@ -13,7 +13,7 @@ namespace py = pybind11;
 
 namespace mooncake {
 
-// Process-level context — definition in mooncake_backend.h.
+// Process-level context -- definition in mooncake_backend.h.
 static MooncakeProcessContext g_ctx;
 
 static std::once_flag g_init_control_plane_once;
@@ -30,6 +30,11 @@ static void requireMacaHostTransport() {
 static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
                                    int rank, int max_world_size) {
     std::call_once(g_init_control_plane_once, [&] {
+        g_ctx.max_world_size = max_world_size;
+
+        LOG(INFO) << "initControlPlane BEGIN rank=" << rank
+                  << " store_ptr=" << store.get();
+
         // Ordering constraint: AgentHost::start() sends registerAgent
         // immediately, which includes LinkManager's localServerName() and
         // getWarmupRecvAddr().  These must be non-empty, so the engine and
@@ -46,9 +51,7 @@ static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
                                     max_world_size, g_ctx.engine);
         }
 
-        // Rank 0 hosts the Coordinator in-process.  It must start BEFORE
-        // AgentHost so the coordinator_addr key is in the Store when
-        // AgentHost::start() reads it.
+        // Rank 0 hosts the Coordinator in-process.
         if (rank == 0) {
             g_ctx.coordinator_host = std::make_unique<CoordinatorHost>(
                 store, g_ctx.host_ip, max_world_size);
@@ -68,11 +71,7 @@ c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeBackend(
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
     int rank = distBackendOpts.group_rank;
-    int size = distBackendOpts.group_size;
-    int max_size = (backendOptions && backendOptions->maxWorldSize_ > 0)
-                       ? backendOptions->maxWorldSize_
-                       : size;
-    auto& host = initControlPlane(distBackendOpts.store, rank, max_size);
+    auto& host = initControlPlane(distBackendOpts.store, rank, kMaxNumRanks);
     return c10::make_intrusive<MooncakeBackend>(
         std::move(distBackendOpts), std::move(backendOptions), host, g_ctx);
 }
@@ -82,11 +81,7 @@ c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeCpuBackend(
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
     int rank = distBackendOpts.group_rank;
-    int size = distBackendOpts.group_size;
-    int max_size = (backendOptions && backendOptions->maxWorldSize_ > 0)
-                       ? backendOptions->maxWorldSize_
-                       : size;
-    auto& host = initControlPlane(distBackendOpts.store, rank, max_size);
+    auto& host = initControlPlane(distBackendOpts.store, rank, kMaxNumRanks);
     return c10::make_intrusive<MooncakeBackend>(std::move(distBackendOpts),
                                                 std::move(backendOptions), host,
                                                 g_ctx, true);
@@ -248,9 +243,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(py::init<at::Tensor, bool>(), py::arg("active_ranks"),
              py::arg("is_extension"))
         .def(py::init<at::Tensor, bool, int>(), py::arg("active_ranks"),
-             py::arg("is_extension"), py::arg("max_world_size"))
+             py::arg("is_extension"), py::arg("max_group_size"))
         .def(py::init<at::Tensor, bool, int, bool>(), py::arg("active_ranks"),
-             py::arg("is_extension"), py::arg("max_world_size"),
+             py::arg("is_extension"), py::arg("max_group_size"),
              py::arg("auto_deactivate_on_failure"));
 }
 

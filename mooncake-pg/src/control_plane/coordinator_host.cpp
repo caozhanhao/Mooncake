@@ -53,7 +53,7 @@ CoordinatorHost::CoordinatorHost(c10::intrusive_ptr<c10d::Store> store,
       max_world_size_(max_world_size),
       rpc_client_(std::make_unique<RpcClient>()) {}
 
-CoordinatorHost::~CoordinatorHost() { shutdown(); }
+CoordinatorHost::~CoordinatorHost() {}
 
 void CoordinatorHost::start() {
     // Start RPC server.
@@ -71,7 +71,6 @@ void CoordinatorHost::start() {
     // Write Coordinator address to Store for Agent discovery.
     std::string addr = rpc_server_->getListenAddr(host_ip_);
     store_->set("coordinator_addr", addr);
-    LOG(INFO) << "CoordinatorHost: published address " << addr;
 
     // Set up periodic tick.
     executor_.setTickCallback([this]() {
@@ -83,9 +82,9 @@ void CoordinatorHost::start() {
 }
 
 void CoordinatorHost::shutdown() {
-    // 1. Stop RPC server  - no new requests accepted.
+    // 1. Stop RPC server - no new requests accepted.
     if (rpc_server_) rpc_server_->shutdown();
-    // 2. Drain the executor  - all posted tasks complete.
+    // 2. Drain the executor - all posted tasks complete.
     executor_.shutdown();
     // 3. Fail any pending 2PC proposals so clients don't hang.
     for (auto& [propose_id, ctx] : pending_rpcs_) {
@@ -97,16 +96,11 @@ void CoordinatorHost::shutdown() {
 
 void CoordinatorHost::postRegister(coro_rpc::context<RegisterResponse> ctx,
                                    RegisterRequest req) {
-    LOG(INFO) << "CoordinatorHost: postRegister rank=" << req.rank
-              << " addr=" << req.agent_addr;
     executor_.post(
         [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
-            LOG(INFO) << "CoordinatorHost: handling register rank=" << req.rank;
-            auto result = state_machine_.handleRegister(req);
-            LOG(INFO) << "CoordinatorHost: register rank=" << req.rank
-                      << " success=" << result.response.success;
-            ctx.response_msg(std::move(result.response));
-            runEffects(result.effects);
+            auto r = state_machine_.handleRegister(req);
+            runEffects(r.effects);
+            ctx.response_msg(std::move(r.response));
         });
 }
 

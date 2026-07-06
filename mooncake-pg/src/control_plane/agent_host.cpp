@@ -54,27 +54,36 @@ void AgentHost::start() {
                                  &AgentRpcService::onRankStateUpdate,
                                  &AgentRpcService::onViewUpdate>(
         rpc_impl_.get());
-    if (!rpc_server_->start()) {
-        LOG(ERROR) << "AgentHost: failed to start RPC server";
+    bool server_started = rpc_server_->start();
+    if (!server_started) {
+        LOG(ERROR) << "AgentHost: failed to start RPC server rank=" << rank_;
     }
+    LOG(INFO) << "AgentHost::start() RPC server started=" << server_started
+              << " rank=" << rank_;
 
     // Read Coordinator address from Store with backoff poll.
     // We cannot guarantee the Coordinator is initialised before this
     // Agent  - non-rank-0 processes may reach this point before rank 0
-    // has written the key.  check() is non-blocking; the predicate
-    // catches exceptions so a transient Store failure retries instead
-    // of crashing the process.
+    // has written the key.  wait() blocks the predicate thread until the
+    // key is set (or the Store connection fails), so we run it inside the
+    // BackoffWaiter predicate which catches exceptions and retries.
     BackoffWaiter waiter(BackoffWaiterConfig::constantSleep(
         AgentHost::kCoordinatorAddrPollInterval));
 
+    LOG(INFO) << "AgentHost::start() waiting for coordinator_addr rank="
+              << rank_ << " store_ptr=" << store_.get();
     bool found = waiter.wait_for(AgentHost::kCoordinatorAddrTimeout, [this]() {
         try {
-            if (store_->check({"coordinator_addr"})) {
-                coordinator_addr_ = store_->get_to_str("coordinator_addr");
-                return !coordinator_addr_.empty();
-            }
+            LOG(INFO) << "AgentHost: checking coordinator_addr rank=" << rank_
+                      << " store_ptr=" << store_.get();
+            store_->wait({"coordinator_addr"});
+            coordinator_addr_ = store_->get_to_str("coordinator_addr");
+            LOG(INFO) << "AgentHost: got coordinator_addr=" << coordinator_addr_
+                      << " rank=" << rank_ << " store_ptr=" << store_.get();
+            return !coordinator_addr_.empty();
         } catch (const std::exception& e) {
-            LOG(WARNING) << "AgentHost: store access failed: " << e.what();
+            LOG(WARNING) << "AgentHost: store access failed rank=" << rank_
+                         << ": " << e.what();
         }
         return false;
     });
@@ -377,17 +386,9 @@ void AgentHost::startRegisterRpc() {
     req.agent_session_epoch = ++agent_session_epoch_;
     agent_.setAgentSessionEpoch(agent_session_epoch_);
 
-    LOG(INFO) << "AgentHost: sending registerAgent to " << coordinator_addr_
-              << " rank=" << rank_ << " epoch=" << agent_session_epoch_
-              << " agent_addr=" << req.agent_addr;
-
     rpc_client_->callAsync<&CoordinatorRpcService::registerAgent>(
         coordinator_addr_, std::move(req), [this](RegisterResponse resp) {
-            LOG(INFO) << "AgentHost: registerAgent callback fired, rank="
-                      << rank_ << " success=" << resp.success;
             executor_.post([this, resp = std::move(resp)]() mutable {
-                LOG(INFO) << "AgentHost: processing registerResponse, rank="
-                          << rank_ << " success=" << resp.success;
                 auto effects = agent_.applyRegisterResponse(resp);
                 runEffects(effects);
 
@@ -532,6 +533,7 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
             },
             effect);
     }
+    LOG(INFO) << "AgentHost: runEffects end rank=" << rank_;
 }
 
 }  // namespace mooncake
