@@ -295,9 +295,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
         hasCallback_[taskId] = false;
         launchEnqueueTaskKernel(
             (int)opType, realSize, broadcastRoot, bufferOffset, taskSequence,
-            meta.get(), tasks_device_, meta->size, meta->activeRanksDevice,
-            meta->activeRanksTensor.data_ptr<int>(), failed_ranks.data(),
-            taskId, enq_stream.stream());
+            meta.get(), tasks_device_, failed_ranks.data(),
+            failed_ranks.attemptedData(), taskId, enq_stream.stream());
         bufferToTensor((void*)meta->segmentInfos[meta->globalRank]
                            .recv_buffer[bufferOffset],
                        pos, realSize, enq_stream);

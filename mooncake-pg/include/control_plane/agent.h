@@ -15,13 +15,12 @@ class AgentStateMachine {
    public:
     AgentStateMachine(GlobalRank rank, int max_world_size);
 
-    void registerGroup(const GroupDeclaration& declaration);
-    void unregisterGroup(GroupId group_id);
+    void joinGroup(const GroupView& group, bool auto_deactivate);
+    void leaveGroup(GroupId group_id);
 
     AgentApplyResult handlePeerJoined(const PeerJoinedPush& push);
     AgentApplyResult handleRankStateUpdate(const RankStateUpdatePush& push);
     AgentApplyResult handleViewUpdate(const ViewUpdatePush& push);
-    AgentApplyResult applyGroupView(GroupId group_id, const GroupView& view);
     AgentApplyResult handleLinkStateChanged(GlobalRank peer, bool connected);
 
     HeartbeatRequest buildHeartbeat() const;
@@ -38,7 +37,6 @@ class AgentStateMachine {
         const TransferObservationEvent& event);
 
     GroupView getGroupView(GroupId group_id) const;
-    const GroupDescriptor* getGroupDescriptor(GroupId group_id) const;
 
     enum class CoordinatorConnection { Connected, Registering, Disconnected };
     CoordinatorConnection getCoordinatorConnection() const {
@@ -63,13 +61,9 @@ class AgentStateMachine {
     int max_world_size_;
 
     RankState rank_state_ = RankState::OFFLINE;
-    // Monotonically incremented on (re-)registration.  Written only from
-    // the executor thread; read from caller threads (proposeActivate / etc.)
-    // via the atomic accessors above.
     std::atomic<uint64_t> agent_session_epoch_{0};
 
     struct GroupEntry {
-        GroupDescriptor descriptor;
         GroupView view;
         bool auto_deactivate = true;
     };
@@ -81,9 +75,6 @@ class AgentStateMachine {
     std::array<bool, kMaxNumRanks> link_connected_{};
 
     // Last peer reachability status reported to the Coordinator.
-    // Updated by processTransferObservation when a transfer observation
-    // differs from the last reported value (both success and failure
-    // transitions trigger an immediate reportTransferObservation RPC).
     std::array<bool, kMaxNumRanks> last_reported_peer_status_{};
 
     // Snapshot of Coordinator-authoritative rank states, published to

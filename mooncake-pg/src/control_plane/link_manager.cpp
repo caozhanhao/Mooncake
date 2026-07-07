@@ -44,9 +44,6 @@ bool LinkManager::supportFabricMem() {
 
 void LinkManager::init(GlobalRank rank, int max_world_size,
                        TransferEngine* engine) {
-    LOG(INFO) << "LinkManager::init() called, rank=" << rank
-              << " max_world_size=" << max_world_size
-              << " engine=" << (void*)engine;
     // If already initialized, return.  Also reject init after shutdown
     // (re-init-after-shutdown is not supported  - create a new process).
     if (initialized_.exchange(true, std::memory_order_acq_rel)) {
@@ -85,9 +82,6 @@ void LinkManager::init(GlobalRank rank, int max_world_size,
         warmup_recv_region_ = std::make_unique<int32_t[]>(kMaxNumRanks);
         std::memset(warmup_recv_region_.get(), 0,
                     kMaxNumRanks * sizeof(int32_t));
-        LOG(INFO) << "LinkManager: registering warmup_recv_region addr="
-                  << (void*)warmup_recv_region_.get()
-                  << " length=" << kMaxNumRanks * sizeof(int32_t);
         rc = engine_->registerLocalMemory(warmup_recv_region_.get(),
                                           kMaxNumRanks * sizeof(int32_t),
                                           kWildcardLocation);
@@ -96,9 +90,6 @@ void LinkManager::init(GlobalRank rank, int max_world_size,
                 << "LinkManager: failed to register warmup recv region, rc="
                 << rc;
             warmup_recv_region_.reset();
-        } else {
-            LOG(INFO) << "LinkManager: warmup_recv_region registered OK, "
-                      << "getWarmupRecvAddr=" << (void*)getWarmupRecvAddr();
         }
     }
 
@@ -172,11 +163,6 @@ void LinkManager::enablePeerProbe(GlobalRank peer,
                                   uint64_t warmup_recv_addr) {
     if (peer == rank_) return;
     if (peer < 0 || peer >= max_world_size_) return;
-
-    LOG(INFO) << "LinkManager: enablePeerProbe rank " << peer
-              << " server_name=" << server_name
-              << " warmup_recv_addr=" << (void*)warmup_recv_addr
-              << " skip_warmup=" << skip_warmup_;
 
     std::lock_guard<std::mutex> lock(peers_mutex_);
     auto& link = peers_[peer];
@@ -365,19 +351,15 @@ bool LinkManager::probePeer(GlobalRank peer) {
             // which is truthy so a plain !segment_id check would miss it.
             if (segment_id == static_cast<SegmentHandle>(-1)) {
                 // openSegment failed  - backoff and retry.
+                LOG(WARNING)
+                    << "[LINK] openSegment failed rank=" << rank_
+                    << " peer=" << peer << " server_name=" << link.server_name;
                 link.probe_backoff = std::min(link.probe_backoff * 2,
                                               PeerLink::kProbeBackoffMax);
                 return false;
             }
 
             link.target_id = segment_id;
-
-            LOG(INFO) << "LinkManager: probePeer rank " << peer
-                      << " openSegment OK, segment_id=" << segment_id
-                      << " server_name=" << link.server_name
-                      << " warmup_recv_addr=" << (void*)link.warmup_recv_addr
-                      << " skip_warmup=" << link.skip_warmup
-                      << " will_initiate_warmup=" << (peer <= rank_);
 
             if (link.skip_warmup) {
                 // MNNVL fabric: connectivity is guaranteed, skip warmup
@@ -398,12 +380,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
                 auto batch_id = engine_->allocateBatchID(1);
                 uint64_t target_offset =
                     link.warmup_recv_addr + rank_ * sizeof(int32_t);
-                LOG(INFO) << "LinkManager: warmup write rank " << rank_
-                          << " -> " << peer << " segment_id=" << segment_id
-                          << " warmup_recv_addr="
-                          << (void*)link.warmup_recv_addr
-                          << " target_offset=" << (void*)target_offset
-                          << " source=" << (void*)warmup_send_region_.get();
+
                 engine_->submitTransfer(batch_id,
                                         {TransferRequest{
                                             .opcode = TransferRequest::WRITE,
@@ -431,8 +408,6 @@ bool LinkManager::probePeer(GlobalRank peer) {
             engine_->getTransferStatus(link.warmup_batch_id.value(), 0, status);
 
             if (status.s == TransferStatusEnum::COMPLETED) {
-                LOG(INFO) << "LinkManager: warmup rank " << rank_ << " -> "
-                          << peer << " COMPLETED";
                 engine_->freeBatchID(link.warmup_batch_id.value());
                 link.warmup_batch_id = std::nullopt;
                 link.state = PeerLinkState::CONNECTED;

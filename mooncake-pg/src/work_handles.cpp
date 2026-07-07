@@ -9,23 +9,37 @@ namespace mooncake {
 
 FailedRanks FailedRanks::allocate(int n, bool isCpu) {
     if (isCpu) {
-        return {torch::zeros({n}, torch::kInt32), nullptr};
+        return {torch::zeros({n}, torch::kInt32), nullptr,
+                torch::zeros({n}, torch::kInt32), nullptr};
     }
-    int* host_ptr = nullptr;
-    int* dev_ptr = nullptr;
-    cudaError_t err =
-        cudaHostAlloc(&host_ptr, n * sizeof(int), cudaHostAllocMapped);
-    TORCH_CHECK(err == cudaSuccess,
-                "cudaHostAlloc failed: ", cudaGetErrorString(err));
-    err = cudaHostGetDevicePointer(reinterpret_cast<void**>(&dev_ptr), host_ptr,
-                                   0);
-    TORCH_CHECK(err == cudaSuccess,
-                "cudaHostGetDevicePointer failed: ", cudaGetErrorString(err));
-    std::memset(host_ptr, 0, n * sizeof(int));
-    auto deleter = [](void* ptr) { cudaFreeHost(ptr); };
-    auto t = torch::from_blob(host_ptr, {n}, deleter,
-                              torch::TensorOptions().dtype(torch::kInt32));
-    return {t, dev_ptr};
+    auto alloc_mapped = [n](at::Tensor& tensor, int*& host_ptr, int*& dev_ptr) {
+        cudaError_t err =
+            cudaHostAlloc(&host_ptr, n * sizeof(int), cudaHostAllocMapped);
+        TORCH_CHECK(err == cudaSuccess, "cudaHostAlloc failed: ",
+                    cudaGetErrorString(err));
+        err = cudaHostGetDevicePointer(reinterpret_cast<void**>(&dev_ptr),
+                                       host_ptr, 0);
+        TORCH_CHECK(err == cudaSuccess,
+                    "cudaHostGetDevicePointer failed: ",
+                    cudaGetErrorString(err));
+        std::memset(host_ptr, 0, n * sizeof(int));
+        auto deleter = [](void* ptr) { cudaFreeHost(ptr); };
+        tensor = torch::from_blob(
+            host_ptr, {n}, deleter,
+            torch::TensorOptions().dtype(torch::kInt32));
+    };
+
+    at::Tensor failed_tensor;
+    int* failed_host = nullptr;
+    int* failed_dev = nullptr;
+    alloc_mapped(failed_tensor, failed_host, failed_dev);
+
+    at::Tensor attempted_tensor;
+    int* attempted_host = nullptr;
+    int* attempted_dev = nullptr;
+    alloc_mapped(attempted_tensor, attempted_host, attempted_dev);
+
+    return {failed_tensor, failed_dev, attempted_tensor, attempted_dev};
 }
 
 bool MooncakeWorkCuda::wait(std::chrono::milliseconds timeout) {

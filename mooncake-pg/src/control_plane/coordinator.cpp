@@ -48,8 +48,14 @@ CentralizedCoordinatorStateMachine::handleRegister(const RegisterRequest& req) {
         result.response.success = false;
         result.response.error_msg =
             "rank already registered, and is not offline.";
+        LOG(INFO) << "[COORD] registerAgent rank=" << req.rank
+                  << " rejected: already registered";
         return result;
     }
+
+    LOG(INFO) << "[COORD] registerAgent rank=" << req.rank
+              << " addr=" << req.agent_addr
+              << " session=" << req.agent_session_epoch;
 
     // A new session makes old endpoints invalid.
     // We do NOT reset endpoint_epoch (it stays monotonically increasing).
@@ -80,6 +86,8 @@ CentralizedCoordinatorStateMachine::handleHeartbeat(
     if (!rankInValidRange(req.rank)) {
         result.response.acknowledge = false;
         result.response.require_reregister = true;
+        LOG(INFO) << "[COORD] heartbeat rank=" << req.rank
+                  << " rejected: rank out of range";
         return result;
     }
     auto& info = ranks_[req.rank];
@@ -88,6 +96,11 @@ CentralizedCoordinatorStateMachine::handleHeartbeat(
         info.agent_session_epoch != req.agent_session_epoch) {
         result.response.acknowledge = false;
         result.response.require_reregister = true;
+        LOG(INFO) << "[COORD] heartbeat rank=" << req.rank
+                  << " rejected: stale session (state="
+                  << static_cast<int>(info.state)
+                  << " session=" << info.agent_session_epoch
+                  << " req_session=" << req.agent_session_epoch << ")";
         return result;
     }
 
@@ -104,12 +117,12 @@ CentralizedCoordinatorStateMachine::handleHeartbeat(
     return result;
 }
 
-// declareGroup
+// joinGroup
 
-CoordinatorApplyResult<DeclareGroupResponse>
-CentralizedCoordinatorStateMachine::handleDeclareGroup(
-    const DeclareGroupRequest& req) {
-    CoordinatorApplyResult<DeclareGroupResponse> result;
+CoordinatorApplyResult<JoinGroupResponse>
+CentralizedCoordinatorStateMachine::handleJoinGroup(
+    const JoinGroupRequest& req) {
+    CoordinatorApplyResult<JoinGroupResponse> result;
     if (!rankInValidRange(req.rank)) {
         result.response.success = false;
         result.response.reject_reason = "rank out of valid range";
@@ -121,10 +134,16 @@ CentralizedCoordinatorStateMachine::handleDeclareGroup(
         info.agent_session_epoch != req.agent_session_epoch) {
         result.response.success = false;
         result.response.reject_reason = "stale agent session epoch";
+        LOG(INFO) << "[COORD] joinGroup rank=" << req.rank
+                  << " group=" << req.group.group_id
+                  << " rejected: stale session (state="
+                  << static_cast<int>(info.state)
+                  << " session=" << info.agent_session_epoch
+                  << " req_session=" << req.agent_session_epoch << ")";
         return result;
     }
 
-    bool ok = declareGroup(req.group, result.response);
+    bool ok = joinGroup(req.group, req.auto_deactivate, result.response);
     if (!ok) return result;
 
     result.response.success = true;
@@ -176,10 +195,10 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     }
 
     if (req.is_activate) {
-        // group_descriptors_ is populated synchronously with group_views_ in
-        // declareGroup; both should always exist together.
-        auto desc_it = group_descriptors_.find(req.group_id);
-        if (desc_it == group_descriptors_.end()) {
+        // group_views_ is populated synchronously with group_views_ in
+        // joinGroup; both should always exist together.
+        auto desc_it = group_views_.find(req.group_id);
+        if (desc_it == group_views_.end()) {
             result.effects.push_back(ReplyViewUpdateEffect{
                 propose_id,
                 {ViewUpdateStatus::Rejected,
@@ -200,7 +219,7 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
 
         // Check activatable before applying changes.
         for (GlobalRank rank : req.requested_ranks) {
-            if (!view.members[rank].active) changed = true;
+            if (!view.members[rank].isActive()) changed = true;
         }
 
         if (changed &&
@@ -216,13 +235,13 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
 
         // Apply.
         for (GlobalRank rank : req.requested_ranks) {
-            view.members[rank].active = true;
+            view.members[rank].status = GroupMemberStatus::kActive;
         }
     } else {
         // deactivate
         for (GlobalRank rank : req.requested_ranks) {
-            if (view.members[rank].active) {
-                view.members[rank].active = false;
+            if (view.members[rank].isActive()) {
+                view.members[rank].status = GroupMemberStatus::kInactive;
                 changed = true;
             }
         }
@@ -243,8 +262,7 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     if (required_acks.empty()) {
         // Best-effort: broadcast + reply immediately.
         result.effects.push_back(
-            ViewUpdateEffect{group_descriptors_[req.group_id],
-                             view,
+            ViewUpdateEffect{view,
                              {},
                              ProposalAckRoute{propose_id}});
         result.effects.push_back(ReplyViewUpdateEffect{
@@ -260,7 +278,7 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
             std::chrono::steady_clock::now() + kProposeTimeout,
         };
         result.effects.push_back(
-            ViewUpdateEffect{group_descriptors_[req.group_id], view,
+            ViewUpdateEffect{view,
                              required_acks, ProposalAckRoute{propose_id}});
     }
 
@@ -381,13 +399,12 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
         member.endpoint_epoch = ep.endpoint_epoch;
         member.endpoint_info = ep.endpoint_info;
 
-        if (member.active) {
+        if (member.isActive()) {
             if (view.status == GroupStatus::Ready) {
                 // Group already activated -> push best-effort view update.
                 view.epoch++;
                 result.effects.push_back(
-                    ViewUpdateEffect{group_descriptors_[ep.group_id],
-                                     view,
+                    ViewUpdateEffect{view,
                                      {},
                                      BootstrapAckRoute{}});
             }
@@ -427,9 +444,65 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
         if (bitAt(req.failed_ranks, j)) reporter.link_status[j] = 0;
     }
 
+    LOG(INFO) << "[COORD] handleTransferObservation reporter=" << req.reporter_rank
+              << " link_status=";
+    for (int j = 0; j < max_world_size_; ++j) {
+        LOG(INFO) << "[COORD]   peer=" << j << " status=" << (int)reporter.link_status[j];
+    }
+
     // Recompute authoritative health
     updateRankHealth(result.effects);
 
+    return result;
+}
+
+// handleLeaveGroup - explicit, fire-and-forget group departure.
+
+CoordinatorApplyResult<void>
+CentralizedCoordinatorStateMachine::handleLeaveGroup(
+    const LeaveGroupRequest& req) {
+    CoordinatorApplyResult<void> result;
+    if (!rankInValidRange(req.rank)) {
+        LOG(INFO) << "[COORD] leaveGroup rank=" << req.rank
+                  << " group=" << req.group_id
+                  << " rejected: rank out of range";
+        return result;
+    }
+
+    auto it = group_views_.find(req.group_id);
+    if (it == group_views_.end()) {
+        LOG(INFO) << "[COORD] leaveGroup rank=" << req.rank
+                  << " group=" << req.group_id << " rejected: group not found";
+        return result;
+    }
+
+    // Reject stale session epochs (e.g. the Agent re-registered after a
+    // disconnect and this is a delayed leave from the old session).
+    if (ranks_[req.rank].agent_session_epoch != req.agent_session_epoch) {
+        LOG(INFO) << "[COORD] leaveGroup rank=" << req.rank
+                  << " group=" << req.group_id << " rejected: stale session";
+        return result;
+    }
+
+    auto& view = it->second;
+    auto& member = view.members[req.rank];
+    if (member.hasLeft()) {
+        LOG(INFO) << "[COORD] leaveGroup rank=" << req.rank
+                  << " group=" << req.group_id << " ignored: already left";
+        return result;
+    }
+
+    LOG(INFO) << "[COORD] leaveGroup rank=" << req.rank
+              << " group=" << req.group_id
+              << " old_status=" << static_cast<int>(member.status);
+
+    member.status = GroupMemberStatus::kLeft;
+    member.endpoint_epoch = kInvalidEpoch;
+    view.epoch++;
+
+    if (canEraseGroup(view)) {
+        eraseGroup(req.group_id, result.effects);
+    }
     return result;
 }
 
@@ -437,6 +510,8 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
 
 void CentralizedCoordinatorStateMachine::transitionToOffline(
     GlobalRank rank, std::vector<CoordinatorEffect>& effects) {
+    LOG(INFO) << "[COORD] transitionToOffline rank=" << rank
+              << " state=" << static_cast<int>(ranks_[rank].state);
     ranks_[rank].state = RankState::OFFLINE;
     ranks_[rank].link_status.assign(max_world_size_, 0);
 
@@ -444,6 +519,25 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
     for (auto& peer : ranks_) {
         if (peer.link_status.size() > static_cast<size_t>(rank))
             peer.link_status[rank] = 0;
+    }
+
+    // Mark the failed rank as inactive in every group it still belongs to.
+    std::vector<GroupId> groups_to_erase;
+    for (auto& [group_id, view] : group_views_) {
+        if (!rankInValidRange(rank)) continue;
+        auto& member = view.members[rank];
+        if (member.status == GroupMemberStatus::kActive) {
+            member.status = GroupMemberStatus::kInactive;
+            view.epoch++;
+            effects.push_back(ViewUpdateEffect{
+                view, {}, BootstrapAckRoute{}});
+        }
+        if (canEraseGroup(view)) {
+            groups_to_erase.push_back(group_id);
+        }
+    }
+    for (GroupId group_id : groups_to_erase) {
+        eraseGroup(group_id, effects);
     }
 
     effects.push_back(makeRankStateEffect(rank));
@@ -584,18 +678,22 @@ void CentralizedCoordinatorStateMachine::updateRankHealth(
         if (view.status != GroupStatus::Ready) continue;
         bool changed = false;
         for (int i = 0; i < max_world_size_; ++i) {
-            if (!view.members[i].active) continue;
+            if (!view.members[i].isActive()) continue;
             bool in_healthy = std::find(healthy_set.begin(), healthy_set.end(),
                                         i) != healthy_set.end();
             if (!in_healthy) {
-                view.members[i].active = false;
+                view.members[i].status = GroupMemberStatus::kInactive;
                 changed = true;
+                LOG(INFO) << "[COORD] auto_deactivate group=" << group_id
+                          << " rank=" << i;
             }
         }
         if (changed) {
             view.epoch++;
             effects.push_back(ViewUpdateEffect{
-                group_descriptors_[group_id], view, {}, BootstrapAckRoute{}});
+                view, {}, BootstrapAckRoute{}});
+            LOG(INFO) << "[COORD] auto_deactivate view update group=" << group_id
+                      << " epoch=" << view.epoch;
         }
     }
 
@@ -609,50 +707,56 @@ bool CentralizedCoordinatorStateMachine::rankInValidRange(
     return rank >= 0 && rank < max_world_size_;
 }
 
-bool CentralizedCoordinatorStateMachine::isRankActivatable(
-    GroupId group_id, GlobalRank rank) const {
-    if (!rankInValidRange(rank)) return false;
-    if (ranks_[rank].state != RankState::HEALTHY) return false;
-
-    auto it = group_views_.find(group_id);
-    if (it == group_views_.end()) return false;
-
-    // Require mutual TE connectivity with every other active rank.
-    // A rank being HEALTHY alone is not enough: the Coordinator may promote
-    // single-node "cliques" before all-to-all links are established.
-    for (int i = 0; i < max_world_size_; ++i) {
-        if (i == rank) continue;
-        if (!it->second.members[i].active) continue;
-        if (!isMutuallyConnected(rank, i)) return false;
-    }
-
-    const auto& member = it->second.members[rank];
-    // endpoint_epoch is monotonically increasing and never reset.
-    // Validity requires the Agent session epoch to match the current session.
-    return member.endpoint_epoch != kInvalidEpoch &&
-           member.agent_session_epoch == ranks_[rank].agent_session_epoch;
-}
-
 bool CentralizedCoordinatorStateMachine::isActivatableSet(
     GroupId group_id, const std::vector<GlobalRank>& new_ranks,
     const GroupView& old_view) const {
-    // Check all currently-active ranks + new ranks.
-    // Degraded groups (with non-activatable active members) will fail.
+    // Build the future active set: old active ∪ new ranks.
+    std::vector<GlobalRank> future_active;
     for (int i = 0; i < max_world_size_; ++i) {
-        if (!old_view.members[i].active) continue;
-        if (!isRankActivatable(group_id, i)) return false;
+        if (old_view.members[i].isActive()) {
+            future_active.push_back(i);
+        }
     }
     for (GlobalRank r : new_ranks) {
-        if (old_view.members[r].active) continue;  // already checked above
-        if (!isRankActivatable(group_id, r)) return false;
+        if (!old_view.members[r].isActive()) {
+            future_active.push_back(r);
+        }
+    }
+
+    // Every rank in the future set must be activatable with respect to the
+    // full future set.  This guarantees all-to-all mutual connectivity:
+    // old <-> old, old <-> new, and new <-> new.
+    for (GlobalRank r : future_active) {
+        if (!isRankActivatable(group_id, r, future_active)) return false;
     }
     return true;
+}
+
+bool CentralizedCoordinatorStateMachine::isRankActivatable(
+    GroupId group_id, GlobalRank rank,
+    const std::vector<GlobalRank>& peer_ranks) const {
+    if (!rankInValidRange(rank)) return false;
+    if (ranks_[rank].state != RankState::HEALTHY) return false;
+
+    for (GlobalRank other : peer_ranks) {
+        if (other == rank) continue;
+        if (!isMutuallyConnected(rank, other)) return false;
+    }
+
+    auto group = group_views_.find(group_id);
+    if (group == group_views_.end()) return false;
+
+    const auto& member = group->second.members[rank];
+    return (member.status == GroupMemberStatus::kActive ||
+            member.status == GroupMemberStatus::kInactive) &&
+           member.endpoint_epoch != kInvalidEpoch &&
+           member.agent_session_epoch == ranks_[rank].agent_session_epoch;
 }
 
 // checkGroupTransitions - bootstrap state machine driver.
 //
 // Group lifecycle:
-//   declareGroup() creates a group in Bootstrapping status.
+//   joinGroup() creates a group in Bootstrapping status.
 //   Once all active ranks have valid endpoints, are HEALTHY, and are mutually
 //   TE-connected, this function transitions to BootstrapSyncing and broadcasts
 //   a ViewUpdate to collect ACKs from all active ranks (a 2PC barrier).
@@ -663,12 +767,17 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
     for (auto& [group_id, view] : group_views_) {
         if (view.status == GroupStatus::Bootstrapping) {
             // Collect all active ranks.
+            std::vector<GlobalRank> peer_ranks;
             bool has_any_active = false;
-            bool all_ready = true;
             for (int i = 0; i < max_world_size_; ++i) {
-                if (!view.members[i].active) continue;
+                if (!view.members[i].isActive()) continue;
                 has_any_active = true;
-                if (!isRankActivatable(group_id, i)) {
+                peer_ranks.push_back(i);
+            }
+
+            bool all_ready = true;
+            for (GlobalRank r : peer_ranks) {
+                if (!isRankActivatable(group_id, r, peer_ranks)) {
                     all_ready = false;
                     break;
                 }
@@ -686,9 +795,11 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                     std::unordered_set<GlobalRank>(acks_needed.begin(),
                                                    acks_needed.end());
 
-                effects.push_back(ViewUpdateEffect{group_descriptors_[group_id],
-                                                   view, acks_needed,
+                effects.push_back(ViewUpdateEffect{view, acks_needed,
                                                    BootstrapAckRoute{}});
+                LOG(INFO) << "[COORD] group=" << group_id
+                          << " transitioned to BootstrapSyncing epoch="
+                          << view.epoch;
             }
         } else if (view.status == GroupStatus::BootstrapSyncing) {
             // If a peer dies during this phase, its ACK never arrives.
@@ -703,23 +814,25 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                 view.status = GroupStatus::Ready;
                 view.epoch++;
                 pending_bootstrap_acks_.erase(it);
-                effects.push_back(ViewUpdateEffect{group_descriptors_[group_id],
-                                                   view,
+                effects.push_back(ViewUpdateEffect{view,
                                                    {},
                                                    BootstrapAckRoute{}});
+                LOG(INFO) << "[COORD] group=" << group_id
+                          << " transitioned to Ready epoch=" << view.epoch;
             }
         }
     }
 }
 
-// Private: declareGroup
+// Private: joinGroup
 
-bool CentralizedCoordinatorStateMachine::declareGroup(
-    const GroupDeclaration& declaration, DeclareGroupResponse& response) {
-    GroupId group_id = declaration.descriptor.group_id;
+bool CentralizedCoordinatorStateMachine::joinGroup(
+    const GroupView& group, bool auto_deactivate,
+    JoinGroupResponse& response) {
+    GroupId group_id = group.group_id;
 
     // Validate rank_order elements.
-    for (GlobalRank r : declaration.descriptor.rank_order) {
+    for (GlobalRank r : group.rank_order) {
         if (!rankInValidRange(r)) {
             response.success = false;
             response.reject_reason = "rank_order contains invalid GlobalRank";
@@ -729,52 +842,36 @@ bool CentralizedCoordinatorStateMachine::declareGroup(
 
     // Validate no duplicates in rank_order.
     {
-        std::set<GlobalRank> seen(declaration.descriptor.rank_order.begin(),
-                                  declaration.descriptor.rank_order.end());
-        if (seen.size() != declaration.descriptor.rank_order.size()) {
+        std::set<GlobalRank> seen(group.rank_order.begin(),
+                                  group.rank_order.end());
+        if (seen.size() != group.rank_order.size()) {
             response.success = false;
             response.reject_reason = "rank_order contains duplicate ranks";
             return false;
         }
     }
 
-    // Validate initial_view.members size.
-    const auto& initial = declaration.initial_view;
-    if (initial.members.size() != static_cast<size_t>(max_world_size_)) {
-        response.success = false;
-        response.reject_reason = "initial_view.members size != max_world_size";
-        return false;
-    }
-
-    // Active ranks must appear in rank_order.
-    for (int i = 0; i < max_world_size_; ++i) {
-        if (initial.members[i].active) {
-            if (std::find(declaration.descriptor.rank_order.begin(),
-                          declaration.descriptor.rank_order.end(),
-                          i) == declaration.descriptor.rank_order.end()) {
-                response.success = false;
-                response.reject_reason =
-                    "initial active rank not in rank_order";
-                return false;
-            }
-        }
-    }
-
     auto it = group_views_.find(group_id);
     if (it == group_views_.end()) {
         // First declaration -> create group.
-        group_descriptors_[group_id] = declaration.descriptor;
-        group_views_[group_id] = declaration.initial_view;
-        group_views_[group_id].status = GroupStatus::Bootstrapping;
-        group_auto_deactivate_[group_id] = declaration.auto_deactivate;
-        response.current_view = group_views_[group_id];
+        // Founding members are all entries in rank_order.
+        GroupView view;
+        view.group_id = group_id;
+        view.rank_order = group.rank_order;
+        view.members.resize(max_world_size_);
+        for (GlobalRank r : group.rank_order) {
+            view.members[r].status = GroupMemberStatus::kActive;
+        }
+        view.status = GroupStatus::Bootstrapping;
+        group_views_[group_id] = std::move(view);
+        group_auto_deactivate_[group_id] = auto_deactivate;
         response.success = true;
         return true;
     }
 
     // Group already exists -> validate rank_order prefix.
-    const auto& existing_order = group_descriptors_[group_id].rank_order;
-    const auto& new_order = declaration.descriptor.rank_order;
+    const auto& existing_order = group_views_[group_id].rank_order;
+    const auto& new_order = group.rank_order;
 
     if (new_order.size() > existing_order.size()) {
         response.success = false;
@@ -792,13 +889,44 @@ bool CentralizedCoordinatorStateMachine::declareGroup(
         }
     }
 
-    // Return current authoritative view.
-    response.current_view = it->second;
     response.success = true;
     return true;
 }
 
 // Private: helpers
+
+bool CentralizedCoordinatorStateMachine::canEraseGroup(
+    const GroupView& view) const {
+    return std::all_of(view.members.begin(), view.members.end(),
+                       [](const GroupMember& m) {
+                           return m.status == GroupMemberStatus::kNone ||
+                                  m.status == GroupMemberStatus::kLeft;
+                       });
+}
+
+void CentralizedCoordinatorStateMachine::eraseGroup(
+    GroupId group_id, std::vector<CoordinatorEffect>& effects) {
+    // Erase pending bootstrap state if present.
+    pending_bootstrap_acks_.erase(group_id);
+
+    // Erase any pending proposals for this group so replies are not sent
+    // after the group is gone.
+    for (auto it = pending_proposal_acks_.begin();
+         it != pending_proposal_acks_.end();) {
+        if (it->second.group_id == group_id) {
+            effects.push_back(ReplyViewUpdateEffect{
+                it->first,
+                {ViewUpdateStatus::Rejected, 0, {}, "group was destroyed"}});
+            it = pending_proposal_acks_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    group_views_.erase(group_id);
+    group_views_.erase(group_id);
+    group_auto_deactivate_.erase(group_id);
+}
 
 std::vector<GlobalRank>
 CentralizedCoordinatorStateMachine::computeRequiredViewAcks(
@@ -811,7 +939,7 @@ CentralizedCoordinatorStateMachine::computeRequiredViewAcks(
     for (int i = 0; i < max_world_size_; ++i) {
         if (i == proposer) continue;
         if (ranks_[i].state == RankState::OFFLINE) continue;
-        if (old_view.members[i].active || new_view.members[i].active) {
+        if (old_view.members[i].isActive() || new_view.members[i].isActive()) {
             required.insert(i);
         }
     }
@@ -830,14 +958,9 @@ RegisterResponse CentralizedCoordinatorStateMachine::buildRegisterResponse(
         resp.all_rank_states[i] = static_cast<uint8_t>(ranks_[i].state);
     }
 
-    // All group descriptors.
-    for (const auto& [gid, desc] : group_descriptors_) {
-        resp.group_descriptors.push_back(desc);
-    }
-
-    // All current views.
+    // All groups (view includes rank_order and member state).
     for (const auto& [gid, view] : group_views_) {
-        resp.current_views.push_back(view);
+        resp.groups.push_back(view);
     }
 
     // All rank connection metadata (for LinkManager).

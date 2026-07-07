@@ -29,11 +29,14 @@ class CoordinatorStateMachine {
     virtual CoordinatorApplyResult<HeartbeatResponse> handleHeartbeat(
         const HeartbeatRequest& req) = 0;
 
-    virtual CoordinatorApplyResult<DeclareGroupResponse> handleDeclareGroup(
-        const DeclareGroupRequest& req) = 0;
+    virtual CoordinatorApplyResult<JoinGroupResponse> handleJoinGroup(
+        const JoinGroupRequest& req) = 0;
 
     virtual CoordinatorApplyResult<void> handleProposeViewUpdate(
         uint64_t propose_id, const ProposeViewUpdateRequest& req) = 0;
+
+    virtual CoordinatorApplyResult<void> handleLeaveGroup(
+        const LeaveGroupRequest& req) = 0;
 
     virtual CoordinatorApplyResult<void> handleProposalAck(uint64_t propose_id,
                                                            GlobalRank rank,
@@ -65,8 +68,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     CoordinatorApplyResult<HeartbeatResponse> handleHeartbeat(
         const HeartbeatRequest& req) override;
 
-    CoordinatorApplyResult<DeclareGroupResponse> handleDeclareGroup(
-        const DeclareGroupRequest& req) override;
+    CoordinatorApplyResult<JoinGroupResponse> handleJoinGroup(
+        const JoinGroupRequest& req) override;
 
     CoordinatorApplyResult<void> handleProposeViewUpdate(
         uint64_t propose_id, const ProposeViewUpdateRequest& req) override;
@@ -83,6 +86,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         const TransferObservationReport& req) override;
 
     CoordinatorApplyResult<void> checkTimeouts() override;
+
+    CoordinatorApplyResult<void> handleLeaveGroup(
+        const LeaveGroupRequest& req) override;
 
     CoordinatorApplyResult<void> handleBootstrapAck(GroupId group_id,
                                                     GlobalRank rank,
@@ -113,7 +119,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     std::array<RankInfo, kMaxNumRanks> ranks_;
 
     std::unordered_map<GroupId, GroupView> group_views_;
-    std::unordered_map<GroupId, GroupDescriptor> group_descriptors_;
     std::unordered_map<GroupId, bool> group_auto_deactivate_;
 
     // Two independent 2PC flows share the same ViewUpdate ACK path:
@@ -155,14 +160,18 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     bool isMutuallyConnected(GlobalRank a, GlobalRank b) const;
     std::vector<GlobalRank> findHealthySet() const;
 
+    bool canEraseGroup(const GroupView& view) const;
+    void eraseGroup(GroupId group_id, std::vector<CoordinatorEffect>& effects);
+
     bool rankInValidRange(GlobalRank rank) const;
-    bool isRankActivatable(GroupId group_id, GlobalRank rank) const;
+    bool isRankActivatable(GroupId group_id, GlobalRank rank,
+                           const std::vector<GlobalRank>& peer_ranks) const;
     bool isActivatableSet(GroupId group_id,
                           const std::vector<GlobalRank>& new_ranks,
                           const GroupView& old_view) const;
 
-    bool declareGroup(const GroupDeclaration& declaration,
-                      DeclareGroupResponse& response);
+    bool joinGroup(const GroupView& group, bool auto_deactivate,
+                      JoinGroupResponse& response);
 
     std::vector<GlobalRank> computeRequiredViewAcks(const GroupView& old_view,
                                                     const GroupView& new_view,

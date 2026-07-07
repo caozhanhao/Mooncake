@@ -20,16 +20,15 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
 
 // Group lifecycle
 
-void AgentStateMachine::registerGroup(const GroupDeclaration& declaration) {
-    GroupId group_id = declaration.descriptor.group_id;
+void AgentStateMachine::joinGroup(const GroupView& group,
+                                  bool auto_deactivate) {
     GroupEntry entry;
-    entry.descriptor = declaration.descriptor;
-    entry.auto_deactivate = declaration.auto_deactivate;
-    // View is populated later via handleViewUpdate.
-    groups_[group_id] = std::move(entry);
+    entry.view = group;
+    entry.auto_deactivate = auto_deactivate;
+    groups_[group.group_id] = std::move(entry);
 }
 
-void AgentStateMachine::unregisterGroup(GroupId group_id) {
+void AgentStateMachine::leaveGroup(GroupId group_id) {
     groups_.erase(group_id);
 }
 
@@ -39,15 +38,6 @@ GroupView AgentStateMachine::getGroupView(GroupId group_id) const {
         return it->second.view;
     }
     return GroupView{};
-}
-
-const GroupDescriptor* AgentStateMachine::getGroupDescriptor(
-    GroupId group_id) const {
-    auto it = groups_.find(group_id);
-    if (it != groups_.end()) {
-        return &it->second.descriptor;
-    }
-    return nullptr;
 }
 
 AgentApplyResult AgentStateMachine::handlePeerJoined(
@@ -104,27 +94,9 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
     auto it = groups_.find(push.group_id);
     if (it == groups_.end()) return effects;
 
-    // Update descriptor (rank_order may have grown via activate) and view.
-    it->second.descriptor = push.descriptor;
     it->second.view = push.view;
 
-    effects.push_back(
-        ApplyViewToBackend{push.group_id, push.descriptor, push.view});
-    return effects;
-}
-
-// applyGroupView  - apply a GroupView received as an RPC response (e.g.
-// declareGroup).  Unlike handleViewUpdate, this does not carry a new
-// descriptor; the local descriptor registered with the group is preserved.
-AgentApplyResult AgentStateMachine::applyGroupView(GroupId group_id,
-                                                   const GroupView& view) {
-    AgentApplyResult effects;
-    auto it = groups_.find(group_id);
-    if (it == groups_.end()) return effects;
-
-    it->second.view = view;
-    effects.push_back(
-        ApplyViewToBackend{group_id, it->second.descriptor, view});
+    effects.push_back(ApplyViewToBackend{push.group_id, push.view});
     return effects;
 }
 
@@ -150,7 +122,7 @@ AgentApplyResult AgentStateMachine::handleLinkStateChanged(GlobalRank peer,
         for (const auto& [group_id, entry] : groups_) {
             if (entry.view.status == GroupStatus::Ready) {
                 effects.push_back(
-                    ApplyViewToBackend{group_id, entry.descriptor, entry.view});
+                    ApplyViewToBackend{group_id, entry.view});
             }
         }
     }
@@ -189,17 +161,11 @@ AgentApplyResult AgentStateMachine::applyRegisterResponse(
             static_cast<RankState>(resp.all_rank_states[i]);
     }
 
-    // Populate group descriptors.
-    for (const auto& desc : resp.group_descriptors) {
-        groups_[desc.group_id].descriptor = desc;
-    }
-
-    // Populate group views.
-    for (const auto& view : resp.current_views) {
+    // Populate groups (view includes rank_order and member state).
+    for (const auto& view : resp.groups) {
         auto& group = groups_[view.group_id];
         group.view = view;
-        effects.push_back(
-            ApplyViewToBackend{view.group_id, group.descriptor, view});
+        effects.push_back(ApplyViewToBackend{view.group_id, view});
     }
 
     // Populate connection metadata and trigger peer probes.
@@ -309,6 +275,17 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
 
     if (has_changed) {
         effects.push_back(SendTransferObservation{std::move(req)});
+        LOG(INFO) << "[AGENT] processTransferObservation has_changed rank=" << rank_
+                  << " attempted=";
+        for (int j = 0; j < max_world_size_; ++j) {
+            if (req.attempted_ranks[j]) {
+                LOG(INFO) << "[AGENT]   peer=" << j
+                          << " succeeded=" << (int)req.succeeded_ranks[j]
+                          << " failed=" << (int)req.failed_ranks[j];
+            }
+        }
+    } else {
+        LOG(INFO) << "[AGENT] processTransferObservation no_change rank=" << rank_;
     }
 
     return effects;

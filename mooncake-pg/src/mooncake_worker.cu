@@ -18,10 +18,8 @@ namespace mooncake {
 __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
                                   uint64_t submitSequence, void* meta,
-                                  Task* tasks, int numRanks,
-                                  const bool* activeRanks,
-                                  int* activeRanksTensor,
-                                  int* failedRanksHostPtr, size_t taskId) {
+                                  Task* tasks, int* failedRanksHostPtr,
+                                  int* attemptedRanksHostPtr, size_t taskId) {
     // Copy task into slot
     tasks[taskId].opType = opType;
     tasks[taskId].tensorSize = tensorSize;
@@ -30,6 +28,7 @@ __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
     tasks[taskId].submitSequence = submitSequence;
     tasks[taskId].transferGroupMeta = meta;
     tasks[taskId].failedRanksHost = failedRanksHostPtr;
+    tasks[taskId].attemptedRanksHost = attemptedRanksHostPtr;
 
     // Publish task metadata before notifying the host worker thread.
     __threadfence_system();
@@ -38,9 +37,6 @@ __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
     // Spin-wait until CPU proxy sets DONE
     while (tasks[taskId].active) {
         __threadfence_system();
-    }
-    for (int i = 0; i < numRanks; ++i) {
-        activeRanksTensor[i] = activeRanks[i] ? 1 : 0;
     }
 }
 
@@ -143,13 +139,12 @@ namespace mooncake {
 void launchEnqueueTaskKernel(int opType, size_t tensorSize,
                              int64_t broadcastRoot, int bufferOffset,
                              uint64_t submitSequence, void* meta, Task* tasks,
-                             int numRanks, const bool* activeRanks,
-                             int* activeRanksTensor, int* failedRanksHostPtr,
-                             size_t taskId, cudaStream_t stream) {
+                             int* failedRanksHostPtr,
+                             int* attemptedRanksHostPtr, size_t taskId,
+                             cudaStream_t stream) {
     enqueueTaskKernel<<<1, 1, 0, stream>>>(
         opType, tensorSize, broadcastRoot, bufferOffset, submitSequence, meta,
-        tasks, numRanks, activeRanks, activeRanksTensor, failedRanksHostPtr,
-        taskId);
+        tasks, failedRanksHostPtr, attemptedRanksHostPtr, taskId);
 }
 
 #define DEF_LAUNCH_REDUCE(scalar_t, suffix)                                   \

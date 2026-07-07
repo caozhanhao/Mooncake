@@ -17,11 +17,13 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
-#include "control_plane/agent_host.h"
 #include "control_plane/coordinator_host.h"
 #include "control_plane/link_manager.h"
 
 namespace mooncake {
+
+class AgentInterface;
+class AgentHost;
 
 // MooncakeProcessContext -- process-level container.
 // Owned by pg_py.cpp (file-scope static).
@@ -54,7 +56,8 @@ struct MooncakeProcessContext {
 
     std::unique_ptr<AgentHost> agent_host;
 
-    MooncakeProcessContext() = default;
+    MooncakeProcessContext();
+    ~MooncakeProcessContext();
 
     // Non-copyable, non-movable: engine pointer points to either owned_engine
     // or external_engine, and would dangle after a move.
@@ -272,8 +275,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // Atomically update the worker-visible group view (descriptor + members).
     // Called by AgentHost from the executor thread when a ViewUpdatePush
     // is received from the Coordinator.
-    void applyViewChange(const GroupDescriptor& descriptor,
-                         const GroupView& view);
+    void applyViewChange(const GroupView& view);
 
     // Called by AgentHost when a TE link to `peer` goes down.
     // Resets the per-backend P2PProxy state for the affected peer.
@@ -284,9 +286,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     // Sync the activeRanksTensor on CPU/GPU from the current GroupView.
     void syncActiveRanksTensor();
-
-    // Free meta_->activeRanks and reset device pointers.
-    void destroyMeta();
 
     // Build a GroupEndpointMetadata for this backend's current local endpoint.
     // Called by AgentHost after (re-)registration to re-publish endpoints.
@@ -314,6 +313,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     int max_group_size_ =
         0;  // per-group capacity (max active members for this group)
     std::string localServerName_;
+    mutable uint64_t next_endpoint_epoch_ = kInitialEndpointEpoch;
 
     // P2P async infrastructure
     // p2p_proxy_ is created in MooncakeBackend, but can live longer than

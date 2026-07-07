@@ -49,21 +49,37 @@ struct GroupEndpointInfo {
     uint64_t p2p_ack_region = 0;
 };
 
+// Membership state of one rank inside a single GroupView.
+enum class GroupMemberStatus : uint8_t {
+    kNone = 0,      // slot has never belonged to this group
+    kLeft = 1,      // rank explicitly left the group (called destroy_group)
+    kInactive = 2,  // deactivated
+    kActive = 3,    // rank is an active member
+};
+
 // Rank state inside a single GroupView.
 //
 // endpoint_epoch is monotonically increasing and never reset.  kInvalidEpoch
 // means "no endpoint published yet".  Validity requires agent_session_epoch
 // to match the rank's current session AND endpoint_epoch != kInvalidEpoch.
 struct GroupMember {
-    bool active = false;
+    GroupMemberStatus status = GroupMemberStatus::kNone;
     uint64_t agent_session_epoch = kInvalidEpoch;
     uint64_t endpoint_epoch = kInvalidEpoch;
     GroupEndpointInfo endpoint_info;
+
+    bool isActive() const { return status == GroupMemberStatus::kActive; }
+    bool isMember() const {
+        return status == GroupMemberStatus::kActive ||
+               status == GroupMemberStatus::kInactive ||
+               status == GroupMemberStatus::kLeft;
+    }
+    bool hasLeft() const { return status == GroupMemberStatus::kLeft; }
 };
 
 // Group lifecycle status.
 //
-//   declareGroup()
+//   joinGroup()
 //       |
 //       v
 //   Bootstrapping  -- all active ranks HEALTHY + have endpoints -->
@@ -72,7 +88,7 @@ struct GroupMember {
 //        publishEndpoint     waits for ACKs from all active ranks)
 //        calls)                        |
 //                                      v  (all ACKs received)
-//                                  Ready
+//                                    Ready
 //                               (group usable for data-plane transfers)
 //
 //   Bootstrapping      - collecting endpoints and waiting for all active ranks
@@ -89,27 +105,15 @@ enum class GroupStatus : uint8_t {
     Ready = 2,
 };
 
-// Runtime states for a group.
+// Runtime state for a group.  rank_order maps InGroupRank → GlobalRank.
 // epoch starts at 0 and monotonically increases; the first real epoch after
 // bootstrap completion is 1.
 struct GroupView {
     GroupId group_id = 0;
     GroupStatus status = GroupStatus::Bootstrapping;
     uint64_t epoch = 0;
-    std::vector<GroupMember> members;  // size == max_world_size_
-};
-
-// Group identity
-struct GroupDescriptor {
-    GroupId group_id = 0;
-    std::vector<GlobalRank> rank_order;
-};
-
-// GroupDeclaration, submitted by each backend at creation time
-struct GroupDeclaration {
-    GroupDescriptor descriptor;
-    GroupView initial_view;
-    bool auto_deactivate = true;
+    std::vector<GlobalRank> rank_order;   // InGroupRank → GlobalRank
+    std::vector<GroupMember> members;     // indexed by GlobalRank
 };
 
 // TransferObservationEvent, worker thread -> Agent queue

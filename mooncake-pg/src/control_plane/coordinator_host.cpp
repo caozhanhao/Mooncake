@@ -20,9 +20,13 @@ void CoordinatorRpcServiceImpl::heartbeat(
     host_.postHeartbeat(std::move(ctx), std::move(req));
 }
 
-void CoordinatorRpcServiceImpl::declareGroup(
-    coro_rpc::context<DeclareGroupResponse> ctx, DeclareGroupRequest req) {
-    host_.postDeclareGroup(std::move(ctx), std::move(req));
+void CoordinatorRpcServiceImpl::joinGroup(
+    coro_rpc::context<JoinGroupResponse> ctx, JoinGroupRequest req) {
+    host_.postJoinGroup(std::move(ctx), std::move(req));
+}
+
+void CoordinatorRpcServiceImpl::leaveGroup(LeaveGroupRequest req) {
+    host_.postLeaveGroup(std::move(req));
 }
 
 void CoordinatorRpcServiceImpl::proposeViewUpdate(
@@ -61,9 +65,10 @@ void CoordinatorHost::start() {
     rpc_impl_ = std::make_unique<CoordinatorRpcServiceImpl>(*this);
     rpc_server_->registerHandler<
         &CoordinatorRpcService::registerAgent,
-        &CoordinatorRpcService::heartbeat, &CoordinatorRpcService::declareGroup,
+        &CoordinatorRpcService::heartbeat, &CoordinatorRpcService::joinGroup,
         &CoordinatorRpcService::proposeViewUpdate,
         &CoordinatorRpcService::publishEndpoint,
+        &CoordinatorRpcService::leaveGroup,
         &CoordinatorRpcService::reportTransferObservation>(rpc_impl_.get());
 
     rpc_server_->start();
@@ -114,14 +119,21 @@ void CoordinatorHost::postHeartbeat(coro_rpc::context<HeartbeatResponse> ctx,
         });
 }
 
-void CoordinatorHost::postDeclareGroup(
-    coro_rpc::context<DeclareGroupResponse> ctx, DeclareGroupRequest req) {
+void CoordinatorHost::postJoinGroup(
+    coro_rpc::context<JoinGroupResponse> ctx, JoinGroupRequest req) {
     executor_.post(
         [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
-            auto result = state_machine_.handleDeclareGroup(req);
+            auto result = state_machine_.handleJoinGroup(req);
             ctx.response_msg(std::move(result.response));
             runEffects(result.effects);
         });
+}
+
+void CoordinatorHost::postLeaveGroup(LeaveGroupRequest req) {
+    executor_.post([this, req = std::move(req)]() {
+        auto result = state_machine_.handleLeaveGroup(req);
+        runEffects(result.effects);
+    });
 }
 
 void CoordinatorHost::postProposeViewUpdate(
@@ -156,14 +168,9 @@ void CoordinatorHost::postBootstrapAck(GroupId group_id, GlobalRank rank,
 void CoordinatorHost::postPublishEndpoint(
     coro_rpc::context<PublishEndpointResponse> ctx,
     PublishEndpointRequest req) {
-    LOG(INFO) << "CoordinatorHost: postPublishEndpoint rank=" << req.rank
-              << " epoch=" << req.agent_session_epoch
-              << " num_endpoints=" << req.endpoints.size();
     executor_.post(
         [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
             auto result = state_machine_.handlePublishEndpoint(req);
-            LOG(INFO) << "CoordinatorHost: publishEndpoint rank=" << req.rank
-                      << " success=" << result.response.success;
             ctx.response_msg(std::move(result.response));
             runEffects(result.effects);
         });
@@ -228,11 +235,17 @@ void CoordinatorHost::pushToAgent(GlobalRank rank, const PeerJoinedPush& msg) {
 }
 
 void CoordinatorHost::pushViewUpdate(const ViewUpdateEffect& effect) {
-    ViewUpdatePush push{effect.view.group_id, effect.descriptor, effect.view};
+    ViewUpdatePush push{effect.view.group_id, effect.view};
     auto group_id = effect.view.group_id;
     auto ack_route = effect.ack_route;  // capture for ACK routing
 
     for (int i = 0; i < max_world_size_; ++i) {
+        const auto& member = effect.view.members[i];
+        if (member.status == GroupMemberStatus::kNone ||
+            member.status == GroupMemberStatus::kLeft) {
+            continue;
+        }
+
         const auto& addr = state_machine_.getAgentAddr(i);
         if (state_machine_.getRankState(i) == RankState::OFFLINE ||
             addr.empty())

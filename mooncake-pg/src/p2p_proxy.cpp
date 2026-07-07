@@ -11,6 +11,7 @@
 #include <thread>
 #include "memory_location.h"
 #include "pg_utils.h"
+#include "control_plane/agent_host.h"
 
 namespace mooncake {
 

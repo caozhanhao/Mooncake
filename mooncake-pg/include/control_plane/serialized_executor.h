@@ -35,7 +35,7 @@ class SerializedExecutor {
 
     ~SerializedExecutor() { shutdown(); }
 
-    // Start the executor thread.  Idempotent  - second call is a no-op.
+    // Start the executor thread.  Idempotent - second call is a no-op.
     void start() {
         if (running_.exchange(true, std::memory_order_acq_rel)) return;
         thread_ = std::thread([this] { loop(); });

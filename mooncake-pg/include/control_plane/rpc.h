@@ -39,8 +39,7 @@ struct RegisterResponse {
     bool success = false;
     std::string error_msg;
     std::vector<uint8_t> all_rank_states;
-    std::vector<GroupDescriptor> group_descriptors;
-    std::vector<GroupView> current_views;
+    std::vector<GroupView> groups;
     std::vector<RankConnectionMetadata> rank_connections;
 };
 
@@ -55,15 +54,15 @@ struct HeartbeatResponse {
     bool require_reregister = false;
 };
 
-struct DeclareGroupRequest {
+struct JoinGroupRequest {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
-    GroupDeclaration group;
+    GroupView group;
+    bool auto_deactivate = true;
 };
 
-struct DeclareGroupResponse {
+struct JoinGroupResponse {
     bool success = false;
-    GroupView current_view;
     std::string reject_reason;
 };
 
@@ -108,6 +107,12 @@ struct PublishEndpointResponse {
     std::string reject_reason;
 };
 
+struct LeaveGroupRequest {
+    GroupId group_id = 0;
+    GlobalRank rank = kInvalidGlobalRank;
+    uint64_t agent_session_epoch = 0;
+};
+
 struct TransferObservationReport {
     GroupId group_id = 0;
     GlobalRank reporter_rank = kInvalidGlobalRank;
@@ -132,7 +137,6 @@ struct RankStateUpdatePush {
 
 struct ViewUpdatePush {
     GroupId group_id = 0;
-    GroupDescriptor descriptor;
     GroupView view;
 };
 
@@ -169,7 +173,6 @@ struct ProposalAckRoute {
 using ViewUpdateAckRoute = std::variant<BootstrapAckRoute, ProposalAckRoute>;
 
 struct ViewUpdateEffect {
-    GroupDescriptor descriptor;
     GroupView view;
     std::vector<GlobalRank> required_acks;
     ViewUpdateAckRoute ack_route = BootstrapAckRoute{};
@@ -218,7 +221,6 @@ struct PublishRankStateSnapshot {
 
 struct ApplyViewToBackend {
     GroupId group_id = 0;
-    GroupDescriptor descriptor;
     GroupView view;
 };
 
@@ -261,8 +263,9 @@ class CoordinatorRpcService {
                                RegisterRequest req) = 0;
     virtual void heartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                            HeartbeatRequest req) = 0;
-    virtual void declareGroup(coro_rpc::context<DeclareGroupResponse> ctx,
-                              DeclareGroupRequest req) = 0;
+    virtual void joinGroup(coro_rpc::context<JoinGroupResponse> ctx,
+                              JoinGroupRequest req) = 0;
+    virtual void leaveGroup(LeaveGroupRequest req) = 0;
     virtual void proposeViewUpdate(
         coro_rpc::context<ProposeViewUpdateResponse> ctx,
         ProposeViewUpdateRequest req) = 0;

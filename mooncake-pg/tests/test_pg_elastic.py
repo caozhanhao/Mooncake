@@ -590,20 +590,28 @@ def _fault_detection_worker(
         failed_ranks.cpu().tolist() == [0] * ctx.world_size
     ), f"rank {ctx.rank}: pre-failure failed_ranks={failed_ranks.cpu().tolist()}"
 
+    print("AAA", ctx.rank)
     if ctx.rank == BROKEN_RANK:
         # Step 2: Broken rank exits after first collective
         ctx.record_result({"role": "broken"})
         broken_exited.set()
         os._exit(0)
 
+    print("BBB", ctx.rank)
     # Step 3: Survivors wait for broken rank to exit
     broken_exited.wait()
+
+    print("111 ", ctx.rank)
 
     # Step 4: Survivors run collective without broken rank
     # This should not hang - verifies fault detection works
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
+    print("222 ", ctx.rank)
     work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
+    print("333 ", ctx.rank)
     work.wait()
+
+    print("CCC", ctx.rank)
 
     # Verify failedRanks shows broken rank as 1
     failed_ranks = pg.get_failed_ranks(work)
@@ -614,14 +622,19 @@ def _fault_detection_worker(
         f"expected {expected_failed_ranks}"
     )
 
+    print("DDD", ctx.rank)
+
     # Verify activeRanks also deactivates broken rank (auto_deactivate=True default)
     active_ranks = pg.get_active_ranks(dist.group.WORLD)
     expected_active_ranks = [1] * ctx.world_size
     expected_active_ranks[BROKEN_RANK] = 0
+    print(f"got: {active_ranks.cpu().tolist()}, expected: {expected_active_ranks}")
     assert active_ranks.cpu().tolist() == expected_active_ranks, (
         f"rank {ctx.rank}: post-failure active_ranks={active_ranks.cpu().tolist()}, "
         f"expected {expected_active_ranks}"
     )
+
+    print("EEE", ctx.rank)
 
     ctx.record_result({"role": "survivor"})
 

@@ -16,7 +16,7 @@ namespace mooncake {
 struct TransferGroupMeta;
 class MooncakeWorker;
 
-// Per-operation failedRanks buffer (non-copyable, movable)
+// Per-operation failedRanks / attemptedRanks buffer (non-copyable, movable)
 // CPU: owning tensor.
 // CUDA: pinned mapped memory (tensor owns the allocation via custom deleter;
 //       dev_ptr is the device-visible alias of the same buffer).
@@ -24,9 +24,20 @@ struct FailedRanks {
     at::Tensor tensor;
     int* dev_ptr = nullptr;  // CUDA only: device pointer for GPU kernel.
 
+    // CUDA only: bitmap of ranks that were attempted in this op.  Used by the
+    // control plane to distinguish "peer failed" from "peer not attempted".
+    at::Tensor attempted_tensor;
+    int* attempted_dev_ptr = nullptr;
+
     FailedRanks() = default;
     FailedRanks(at::Tensor tensor_in, int* dev_ptr_in)
         : tensor(std::move(tensor_in)), dev_ptr(dev_ptr_in) {}
+    FailedRanks(at::Tensor tensor_in, int* dev_ptr_in,
+                at::Tensor attempted_tensor_in, int* attempted_dev_ptr_in)
+        : tensor(std::move(tensor_in)),
+          dev_ptr(dev_ptr_in),
+          attempted_tensor(std::move(attempted_tensor_in)),
+          attempted_dev_ptr(attempted_dev_ptr_in) {}
 
     FailedRanks(const FailedRanks&) = delete;
     FailedRanks& operator=(const FailedRanks&) = delete;
@@ -36,6 +47,7 @@ struct FailedRanks {
     ~FailedRanks() = default;
 
     int* data() { return tensor.data_ptr<int>(); }
+    int* attemptedData() { return attempted_tensor.data_ptr<int>(); }
 
     static FailedRanks allocate(int n, bool isCpu);
 };

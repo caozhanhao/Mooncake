@@ -16,6 +16,16 @@ namespace mooncake {
 // Process-level context -- definition in mooncake_backend.h.
 static MooncakeProcessContext g_ctx;
 
+MooncakeProcessContext::MooncakeProcessContext() = default;
+
+MooncakeProcessContext::~MooncakeProcessContext() {
+    // Shutdown AgentHost first so any queued leaveGroup RPCs are drained
+    // before RpcClient is torn down.
+    if (agent_host) agent_host->shutdown();
+    // Shutdown CoordinatorHost second so rank 0 fails pending proposals.
+    if (coordinator_host) coordinator_host->shutdown();
+}
+
 static std::once_flag g_init_control_plane_once;
 
 #ifdef USE_MACA
@@ -72,8 +82,9 @@ c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeBackend(
         backendOptions) {
     int rank = distBackendOpts.group_rank;
     auto& host = initControlPlane(distBackendOpts.store, rank, kMaxNumRanks);
-    return c10::make_intrusive<MooncakeBackend>(
+    auto backend = c10::make_intrusive<MooncakeBackend>(
         std::move(distBackendOpts), std::move(backendOptions), host, g_ctx);
+    return backend;
 }
 
 c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeCpuBackend(
@@ -82,9 +93,10 @@ c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeCpuBackend(
         backendOptions) {
     int rank = distBackendOpts.group_rank;
     auto& host = initControlPlane(distBackendOpts.store, rank, kMaxNumRanks);
-    return c10::make_intrusive<MooncakeBackend>(std::move(distBackendOpts),
-                                                std::move(backendOptions), host,
-                                                g_ctx, true);
+    auto backend = c10::make_intrusive<MooncakeBackend>(
+        std::move(distBackendOpts), std::move(backendOptions), host, g_ctx,
+        true);
+    return backend;
 }
 
 __attribute__((constructor)) static void MooncakeBackendConstructor() {

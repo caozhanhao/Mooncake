@@ -12,6 +12,7 @@
 #include "memory_location.h"
 #include "mooncake_worker.cuh"
 #include "pg_utils.h"
+#include "control_plane/agent_host.h"
 #include "control_plane/link_manager.h"
 
 namespace mooncake {
@@ -54,6 +55,12 @@ MooncakeBackend::MooncakeBackend(
     TORCH_CHECK(rank >= 0 && rank < max_group_size, "rank out of valid range");
 
     max_group_size_ = max_group_size;
+    LOG(INFO)
+        << "[BACKEND] constructor BEGIN rank=" << rank << " size=" << size
+        << " this=" << this << " use_count="
+        << c10::intrusive_ptr<MooncakeBackend>::unsafe_reclaim_from_nonowning(
+               this)
+               .use_count();
     const auto& globalRanks = distBackendOpts.global_ranks_in_group;
 
     // Memory location for device specific buffers
@@ -80,7 +87,7 @@ MooncakeBackend::MooncakeBackend(
     localServerName_ = ctx_.engine->getLocalIpAndPort();
 
     // Build rank_order from global_ranks_in_group.
-    // This is used for the GroupDeclaration and for meta_->rank_order.
+    // Build the initial rank_order for the group view and meta_.
     std::vector<GlobalRank> initial_rank_order;
     initial_rank_order.reserve(size);
     if (globalRanks.size() == static_cast<size_t>(size)) {
@@ -92,10 +99,6 @@ MooncakeBackend::MooncakeBackend(
         for (int i = 0; i < size; ++i) {
             initial_rank_order.push_back(static_cast<GlobalRank>(i));
         }
-    }
-    // Fill remaining slots for future joiners.
-    for (int i = size; i < max_group_size_; ++i) {
-        initial_rank_order.push_back(static_cast<GlobalRank>(i));
     }
 
     {
@@ -284,53 +287,36 @@ MooncakeBackend::MooncakeBackend(
     {
         meta_->group_id = static_cast<int32_t>(ctx_.next_group_id);
 
-        // Build GroupDeclaration.
-        GroupDeclaration declaration;
-        declaration.descriptor.group_id = meta_->group_id;
-        declaration.descriptor.rank_order = std::move(initial_rank_order);
-        declaration.auto_deactivate =
+        // Build initial group view (founding members = rank_order entries).
+        GroupView initial_group;
+        initial_group.group_id = meta_->group_id;
+        initial_group.rank_order = std::move(initial_rank_order);
+        initial_group.members.resize(ctx_.max_world_size);
+        for (GlobalRank r : initial_group.rank_order) {
+            initial_group.members[r].status = GroupMemberStatus::kActive;
+        }
+        bool auto_deactivate =
             options_ ? options_->autoDeactivateOnFailure_ : true;
 
-        // Build initial_view: founding members are active.
-        // Other ranks' endpoints arrive via publishEndpoint.
-        declaration.initial_view.group_id = meta_->group_id;
-        declaration.initial_view.epoch =
-            0;  // Coordinator sets real epoch on activation
-        declaration.initial_view.members.resize(ctx_.max_world_size);
-        for (int i = 0; i < size; ++i) {
-            declaration.initial_view
-                .members[declaration.descriptor.rank_order[i]]
-                .active = true;
-        }
-        declaration.initial_view.members[meta_->globalRank].endpoint_info =
-            local_ep;
-        declaration.initial_view.members[meta_->globalRank].endpoint_epoch =
-            kInitialEndpointEpoch;
-
-        // Bootstrap: wait for Agent registration before declaring the group.
-        // The Coordinator rejects declareGroup if the agent is still OFFLINE.
-        LOG(INFO) << "MooncakeBackend: waiting for Agent registration rank="
-                  << rank;
+        // Bootstrap: wait for Agent registration before joining the group.
+        // The Coordinator rejects joinGroup if the agent is still OFFLINE.
         if (!agent_.waitUntilRegistered(std::chrono::seconds(30))) {
             throw std::runtime_error(
                 "MooncakeBackend: Agent registration timed out");
         }
-        LOG(INFO) << "MooncakeBackend: Agent registration done rank=" << rank;
 
-        // Declare group to Coordinator (synchronous - blocks until the
-        // Coordinator has processed declareGroup).
-        agent_.registerGroup(declaration, this);
+        // Join group (synchronous - blocks until the
+        // Coordinator has processed joinGroup).
+        agent_.joinGroup(
+            initial_group, auto_deactivate,
+            c10::weak_intrusive_ptr<MooncakeBackend>(
+                c10::intrusive_ptr<
+                    MooncakeBackend>::unsafe_reclaim_from_nonowning(this)));
+        agent_.publishLocalEndpoint(buildEndpointMetadata());
 
-        // Publish local endpoint (synchronous - group exists on Coordinator
-        // because registerGroup returned).
-        agent_.publishLocalEndpoint(GroupEndpointPublication{
-            .group_id = meta_->group_id,
-            .endpoint_epoch = kInitialEndpointEpoch,
-            .endpoint_info = local_ep,
-        });
         auto view = agent_.waitUntilGroupReady(meta_->group_id,
                                                std::chrono::seconds(30));
-        applyViewChange(declaration.descriptor, view);
+        applyViewChange(view);
     }
     // Register a lightweight Backend shim so that PyTorch's P2P dispatch path
     // (batch_isend_irecv → _get_backend → getBackend) can find a registered
@@ -344,9 +330,24 @@ MooncakeBackend::MooncakeBackend(
 
     // Increment backend index
     ++ctx_.next_group_id;
+    LOG(INFO)
+        << "[BACKEND] constructor END rank=" << meta_->globalRank
+        << " this=" << this << " use_count="
+        << c10::intrusive_ptr<MooncakeBackend>::unsafe_reclaim_from_nonowning(
+               this)
+               .use_count();
 }
 
-MooncakeBackend::~MooncakeBackend() { shutdown(); }
+MooncakeBackend::~MooncakeBackend() {
+    LOG(INFO)
+        << "[BACKEND] destructor rank="
+        << (meta_ ? std::to_string(meta_->globalRank) : "?") << " this=" << this
+        << " use_count="
+        << c10::intrusive_ptr<MooncakeBackend>::unsafe_reclaim_from_nonowning(
+               this)
+               .use_count();
+    shutdown();
+}
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 
@@ -955,6 +956,19 @@ void MooncakeBackend::shutdown() {
         meta_->activeRanks = nullptr;
         meta_->activeRanksDevice = nullptr;
     }
+
+    // Prevent zombie P2PProxy workers from dereferencing this backend after
+    // destruction.  Must happen after drainTasks so in-flight failures can
+    // still be reported during shutdown.
+    if (meta_) {
+        meta_->backend = nullptr;
+    }
+
+    // Notify the Coordinator that this rank has left the group.
+    // Fire-and-forget: do not block on other ranks.
+    if (meta_) {
+        agent_.leaveGroup(meta_->group_id);
+    }
 }
 
 void MooncakeBackend::syncActiveRanksTensor() {
@@ -1045,8 +1059,19 @@ void MooncakeBackend::joinGroup() {
                  << "groups are auto-registered by Agent during construction.";
 }
 
-void MooncakeBackend::applyViewChange(const GroupDescriptor& descriptor,
-                                      const GroupView& view) {
+void MooncakeBackend::applyViewChange(const GroupView& view) {
+    LOG(INFO) << "[BACKEND] applyViewChange rank="
+              << (meta_ ? std::to_string(meta_->globalRank) : "?")
+              << " group=" << view.group_id << " epoch=" << view.epoch
+              << " status=" << static_cast<int>(view.status)
+              << " members=";
+    for (size_t i = 0; i < view.members.size(); ++i) {
+        LOG(INFO) << "[BACKEND]   rank=" << i
+                  << " status=" << static_cast<int>(view.members[i].status)
+                  << " active=" << view.members[i].isActive()
+                  << " endpoint_epoch=" << view.members[i].endpoint_epoch;
+    }
+
     // Sync rank_order for P2P proxy InGroupRank -> GlobalRank mapping.
     if (meta_) {
         if (meta_->epoch != view.epoch) {
@@ -1058,9 +1083,9 @@ void MooncakeBackend::applyViewChange(const GroupDescriptor& descriptor,
             meta_->taskCount = 0;
             meta_->epoch = view.epoch;
         }
-        for (size_t i = 0; i < descriptor.rank_order.size() && i < kMaxNumRanks;
+        for (size_t i = 0; i < view.rank_order.size() && i < kMaxNumRanks;
              ++i) {
-            meta_->rank_order[i] = descriptor.rank_order[i];
+            meta_->rank_order[i] = view.rank_order[i];
         }
     }
 
@@ -1069,8 +1094,8 @@ void MooncakeBackend::applyViewChange(const GroupDescriptor& descriptor,
         for (int i = 0;
              i < static_cast<int>(view.members.size()) && i < meta_->size;
              ++i) {
-            meta_->activeRanks[i] = view.members[i].active;
-            if (view.members[i].active &&
+            meta_->activeRanks[i] = view.members[i].isActive();
+            if (view.members[i].isActive() &&
                 view.members[i].endpoint_epoch != kInvalidEpoch) {
                 meta_->segmentInfos[i] = view.members[i].endpoint_info;
                 auto handle =
@@ -1088,12 +1113,17 @@ void MooncakeBackend::applyViewChange(const GroupDescriptor& descriptor,
                 }
             }
         }
+
+        // Keep the Python-visible activeRanksTensor in sync with the view
+        // so that pg.get_active_ranks() reflects membership changes (e.g.
+        // auto-deactivation of a failed rank) immediately.
+        syncActiveRanksTensor();
     }
 
     // Recalculate activeSize from the view (count of active members).
     int new_active_size = 0;
     for (const auto& member : view.members) {
-        if (member.active) ++new_active_size;
+        if (member.isActive()) ++new_active_size;
     }
     meta_->activeSize = new_active_size;
 }
@@ -1116,7 +1146,7 @@ void MooncakeBackend::markViewStale() {
 GroupEndpointPublication MooncakeBackend::buildEndpointMetadata() const {
     GroupEndpointPublication ep;
     ep.group_id = meta_->group_id;
-    ep.endpoint_epoch = kInitialEndpointEpoch;
+    ep.endpoint_epoch = next_endpoint_epoch_++;
     ep.endpoint_info = meta_->segmentInfos[meta_->globalRank];
     // agent_session_epoch is NOT set here - the Host fills it in the
     // enclosing PublishEndpointRequest before sending the RPC.

@@ -85,8 +85,8 @@ async_simple::coro::Lazy<void> sendCoroutine(
         co_await std::move(send_lazy);
     } catch (const std::exception& e) {
         if (!state->shutdown.load(std::memory_order_acquire)) {
-            LOG(ERROR) << "RpcClient: fire-and-forget RPC to " << addr
-                       << " failed: " << e.what();
+            VLOG(1) << "RpcClient: fire-and-forget RPC to " << addr
+                    << " failed: " << e.what();
         }
     }
 }
@@ -102,7 +102,7 @@ async_simple::coro::Lazy<void> callAsyncCoroutine(
     auto client = co_await getOrCreateClientAsync(state, addr);
     if (!client) {
         if (!state->shutdown.load(std::memory_order_acquire)) {
-            LOG(ERROR) << "callAsyncCoroutine: failed to connect to " << addr;
+            VLOG(1) << "callAsyncCoroutine: failed to connect to " << addr;
         }
         cb(ResponseType{});
         co_return;
@@ -115,14 +115,14 @@ async_simple::coro::Lazy<void> callAsyncCoroutine(
             cb(std::move(res.value().result()));
         } else {
             if (!state->shutdown.load(std::memory_order_acquire)) {
-                LOG(ERROR) << "RpcClient: async rpc to " << addr
-                           << " failed: " << res.error().msg;
+                VLOG(1) << "RpcClient: async rpc to " << addr
+                        << " failed: " << res.error().msg;
             }
             cb(ResponseType{});
         }
     } catch (const std::exception& e) {
         if (!state->shutdown.load(std::memory_order_acquire)) {
-            LOG(ERROR) << "RpcClient: async rpc caught exception: " << e.what();
+            VLOG(1) << "RpcClient: async rpc caught exception: " << e.what();
         }
         cb(ResponseType{});
     }
