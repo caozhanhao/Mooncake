@@ -88,16 +88,15 @@ MooncakeBackend::MooncakeBackend(
 
     // Build rank_order from global_ranks_in_group.
     // Build the initial rank_order for the group view and meta_.
-    std::vector<GlobalRank> initial_rank_order;
+    IndexedVector<GlobalRank, InGroupRankTag> initial_rank_order;
     initial_rank_order.reserve(size);
     if (globalRanks.size() == static_cast<size_t>(size)) {
         for (int i = 0; i < size; ++i) {
-            initial_rank_order.push_back(
-                static_cast<GlobalRank>(globalRanks[i]));
+            initial_rank_order.push_back(GlobalRank{globalRanks[i]});
         }
     } else {
         for (int i = 0; i < size; ++i) {
-            initial_rank_order.push_back(static_cast<GlobalRank>(i));
+            initial_rank_order.push_back(GlobalRank{i});
         }
     }
 
@@ -108,14 +107,16 @@ MooncakeBackend::MooncakeBackend(
             gr += std::to_string(globalRanks[i]);
         }
         std::string ro;
-        for (size_t i = 0; i < initial_rank_order.size(); ++i) {
-            if (i) ro += ",";
-            ro += std::to_string(initial_rank_order[i]);
+        for (InGroupRank i{0};
+             i < static_cast<int32_t>(initial_rank_order.size()); ++i) {
+            if (i != 0) ro += ",";
+            ro += initial_rank_order[i].toString();
         }
         LOG(INFO) << "MooncakeBackend: rank=" << rank << " size=" << size
                   << " globalRanks=[" << gr << "]"
                   << " initial_rank_order=[" << ro << "]"
-                  << " globalRank=" << initial_rank_order[rank];
+                  << " globalRank="
+                  << initial_rank_order[InGroupRank{rank}].toString();
     }
 
     // Register buffers
@@ -239,9 +240,9 @@ MooncakeBackend::MooncakeBackend(
         meta_->segmentIDs[i] = static_cast<TransferMetadata::SegmentID>(-1);
     }
     meta_->rank = rank;
-    meta_->globalRank = initial_rank_order[rank];
-    for (int i = 0; i < max_group_size_; ++i) {
-        meta_->rank_order[i] = initial_rank_order[i];
+    meta_->globalRank = initial_rank_order[InGroupRank{rank}].value;
+    for (InGroupRank i{0}; i < max_group_size_; ++i) {
+        meta_->rank_order[i.value] = initial_rank_order[i].value;
     }
     meta_->size = max_group_size_;  // slot capacity
     meta_->activeSize = size;
@@ -252,15 +253,18 @@ MooncakeBackend::MooncakeBackend(
     p2p_proxy_->bindMeta(meta_);
 
     if (isCpu) {
-        meta_->activeRanks = new bool[kMaxNumRanks]{};
+        meta_->activeRanks = new bool[max_group_size_]{};
     } else {
-        cudaHostAlloc(&meta_->activeRanks, kMaxNumRanks * sizeof(bool),
+        cudaHostAlloc(&meta_->activeRanks, max_group_size_ * sizeof(bool),
                       cudaHostAllocMapped);
         cudaHostGetDevicePointer(&meta_->activeRanksDevice, meta_->activeRanks,
                                  0);
     }
-    for (size_t i = 0; i < kMaxNumRanks; ++i) {
-        meta_->activeRanks[i] = (i < static_cast<size_t>(size));
+    // activeRanks is indexed by InGroupRank (size max_group_size_).  Mark each
+    // in-group slot that participates in the initial group as active.
+    std::fill(meta_->activeRanks, meta_->activeRanks + max_group_size_, false);
+    for (InGroupRank i{0}; i < size; ++i) {
+        meta_->activeRanks[i.value] = true;
     }
     meta_->activeRanksTensor = at::ones(
         {max_group_size_},
@@ -293,7 +297,7 @@ MooncakeBackend::MooncakeBackend(
         initial_group.rank_order = std::move(initial_rank_order);
         initial_group.members.resize(ctx_.max_world_size);
         for (GlobalRank r : initial_group.rank_order) {
-            initial_group.members[r].status = GroupMemberStatus::kActive;
+            initial_group.member(r).status = GroupMemberStatus::kActive;
         }
         bool auto_deactivate =
             options_ ? options_->autoDeactivateOnFailure_ : true;
@@ -309,9 +313,7 @@ MooncakeBackend::MooncakeBackend(
         // Coordinator has processed joinGroup).
         agent_.joinGroup(
             initial_group, auto_deactivate,
-            c10::weak_intrusive_ptr<MooncakeBackend>(
-                c10::intrusive_ptr<
-                    MooncakeBackend>::unsafe_reclaim_from_nonowning(this)));
+            c10::intrusive_ptr<MooncakeBackend>::reclaim_copy(this));
         agent_.publishLocalEndpoint(buildEndpointMetadata());
 
         auto view = agent_.waitUntilGroupReady(meta_->group_id,
@@ -972,16 +974,18 @@ void MooncakeBackend::shutdown() {
 }
 
 void MooncakeBackend::syncActiveRanksTensor() {
-    // Read from meta_->activeRanks (synced by control plane via
-    // applyViewChange).
-    std::vector<int32_t> active_ranks(meta_->size);
+    // activeRanks is indexed by InGroupRank, length = max_group_size_.
+    // The Python-visible tensor must also be max_group_size_ so that it stays
+    // consistent with the shape produced by the constructor and so that the
+    // indices align correctly with the in-group rank space.
+    std::vector<int32_t> active_ranks(max_group_size_, 0);
     for (int i = 0; i < meta_->size; ++i) {
         active_ranks[i] = meta_->activeRanks[i] ? 1 : 0;
     }
 
     auto cpu_tensor = torch::tensor(active_ranks, torch::dtype(torch::kInt32));
     if (!meta_->activeRanksTensor.defined() ||
-        meta_->activeRanksTensor.size(0) != meta_->size) {
+        meta_->activeRanksTensor.size(0) != max_group_size_) {
         meta_->activeRanksTensor =
             cpu_tensor.to(isCpu_ ? torch::kCPU : torch::kCUDA);
         return;
@@ -1007,8 +1011,7 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
     output.reserve(ranks.size());
     for (const int rank : ranks) {
         TORCH_CHECK(rank >= 0 && rank < kMaxNumRanks, "Rank out of range");
-        output.push_back(
-            ctx_.link_manager.isRankReady(static_cast<GlobalRank>(rank)));
+        output.push_back(ctx_.link_manager.isRankReady(GlobalRank{rank}));
     }
     return output;
 }
@@ -1026,7 +1029,7 @@ ProposeViewUpdateResponse MooncakeBackend::activateRank(
     std::vector<GlobalRank> global_ranks;
     global_ranks.reserve(ranks.size());
     for (int r : ranks) {
-        global_ranks.push_back(static_cast<GlobalRank>(r));
+        global_ranks.push_back(GlobalRank{r});
     }
     auto resp = agent_.proposeActivate(meta_->group_id, global_ranks);
     if (resp.status == ViewUpdateStatus::Rejected) {
@@ -1041,7 +1044,7 @@ ProposeViewUpdateResponse MooncakeBackend::deactivateRank(
     std::vector<GlobalRank> global_ranks;
     global_ranks.reserve(ranks.size());
     for (int r : ranks) {
-        global_ranks.push_back(static_cast<GlobalRank>(r));
+        global_ranks.push_back(GlobalRank{r});
     }
     auto resp = agent_.proposeDeactivate(meta_->group_id, global_ranks);
     if (resp.status == ViewUpdateStatus::Rejected) {
@@ -1063,13 +1066,13 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
     LOG(INFO) << "[BACKEND] applyViewChange rank="
               << (meta_ ? std::to_string(meta_->globalRank) : "?")
               << " group=" << view.group_id << " epoch=" << view.epoch
-              << " status=" << static_cast<int>(view.status)
-              << " members=";
-    for (size_t i = 0; i < view.members.size(); ++i) {
-        LOG(INFO) << "[BACKEND]   rank=" << i
-                  << " status=" << static_cast<int>(view.members[i].status)
-                  << " active=" << view.members[i].isActive()
-                  << " endpoint_epoch=" << view.members[i].endpoint_epoch;
+              << " status=" << static_cast<int>(view.status) << " members=";
+    for (GlobalRank gr : view.members.indices()) {
+        const auto& member = view.member(gr);
+        LOG(INFO) << "[BACKEND]   rank=" << gr
+                  << " status=" << static_cast<int>(member.status)
+                  << " active=" << member.isActive()
+                  << " endpoint_epoch=" << member.endpoint_epoch;
     }
 
     // Sync rank_order for P2P proxy InGroupRank -> GlobalRank mapping.
@@ -1083,31 +1086,33 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
             meta_->taskCount = 0;
             meta_->epoch = view.epoch;
         }
-        for (size_t i = 0; i < view.rank_order.size() && i < kMaxNumRanks;
-             ++i) {
-            meta_->rank_order[i] = view.rank_order[i];
+        for (InGroupRank lr : view.rank_order.indices()) {
+            if (lr >= kMaxNumRanks) break;
+            meta_->rank_order[lr.value] = view.globalRank(lr).value;
         }
     }
 
     // Sync TransferGroupMeta for data plane access (worker thread, P2P proxy).
+    // activeRanks is indexed by InGroupRank (size max_group_size_);
+    // segmentInfos / segmentIDs are indexed by GlobalRank.
     if (meta_ && meta_->activeRanks) {
-        for (int i = 0;
-             i < static_cast<int>(view.members.size()) && i < meta_->size;
-             ++i) {
-            meta_->activeRanks[i] = view.members[i].isActive();
-            if (view.members[i].isActive() &&
-                view.members[i].endpoint_epoch != kInvalidEpoch) {
-                meta_->segmentInfos[i] = view.members[i].endpoint_info;
-                auto handle =
-                    ctx_.link_manager.resolvePeer(static_cast<GlobalRank>(i));
+        std::fill(meta_->activeRanks, meta_->activeRanks + meta_->size, false);
+        for (InGroupRank lr : view.rank_order.indices()) {
+            if (lr >= meta_->size) break;
+            const auto gr = view.globalRank(lr);
+            const auto& member = view.member(gr);
+            meta_->activeRanks[lr.value] = member.isActive();
+            if (member.isActive() && member.endpoint_epoch != kInvalidEpoch) {
+                meta_->segmentInfos[gr.value] = member.endpoint_info;
+                auto handle = ctx_.link_manager.resolvePeer(gr);
                 if (handle) {
-                    meta_->segmentIDs[i] = handle->target_id;
+                    meta_->segmentIDs[gr.value] = handle->target_id;
                 } else {
                     // FIXME: Should not happen unless TE link is down after
                     // warmup
                     LOG(ERROR)
                         << "MooncakeBackend: applyViewChange rank="
-                        << meta_->globalRank << " TE link to peer=" << i
+                        << meta_->globalRank << " TE link to peer=" << gr
                         << " not ready yet; segmentID will be refreshed on "
                            "LinkUp";
                 }
@@ -1130,12 +1135,12 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
 
 void MooncakeBackend::onPeerLinkReset(GlobalRank peer) {
     if (p2p_proxy_) {
-        p2p_proxy_->resetPeerState(peer);
+        p2p_proxy_->resetPeerState(peer.value);
     }
 }
 
 void MooncakeBackend::markViewStale() {
-    // Mark all peers as inactive so worker threads stop using them.
+    // Mark all in-group slots as inactive so worker threads stop using them.
     if (meta_ && meta_->activeRanks) {
         for (int i = 0; i < meta_->size; ++i) {
             meta_->activeRanks[i] = false;

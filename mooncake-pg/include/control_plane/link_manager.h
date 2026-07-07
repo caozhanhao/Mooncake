@@ -1,7 +1,6 @@
 #ifndef MOONCAKE_PG_LINK_MANAGER_H
 #define MOONCAKE_PG_LINK_MANAGER_H
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -82,7 +81,7 @@ class LinkManager {
 
     // Publish the Coordinator-authoritative RankState snapshot for all peers.
     // Called by AgentHost from the executor thread.
-    void setRankStates(const std::vector<uint8_t>& states);
+    void setRankStates(const IndexedVector<uint8_t, GlobalRankTag>& states);
 
     // Check whether the TE link to peer is up.  Returns a handle with the
     // remote SegmentID on success.  Does NOT check RankState or endpoint
@@ -103,6 +102,10 @@ class LinkManager {
     LinkManager& operator=(const LinkManager&) = delete;
 
    private:
+    bool rankInRange(GlobalRank peer) const {
+        return peer >= 0 && peer < max_world_size_;
+    }
+
     // Resource state (mutex-protected)
 
     enum class PeerLinkState : uint8_t {
@@ -133,7 +136,7 @@ class LinkManager {
             std::chrono::milliseconds(10000);
     };
 
-    std::array<PeerLink, kMaxNumRanks> peers_;
+    IndexedVector<PeerLink, GlobalRankTag> peers_{kMaxNumRanks};
     mutable std::mutex peers_mutex_;
 
     // Worker read model (atomic, lock-free)
@@ -148,7 +151,7 @@ class LinkManager {
             target_id{};  // remote segment handle
     };
 
-    std::array<PeerReadState, kMaxNumRanks> read_state_;
+    IndexedVector<PeerReadState, GlobalRankTag> read_state_{kMaxNumRanks};
 
     // Poller infrastructure
 

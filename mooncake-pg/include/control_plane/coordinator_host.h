@@ -66,13 +66,15 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
                    HeartbeatRequest req) override;
 
     void joinGroup(coro_rpc::context<JoinGroupResponse> ctx,
-                      JoinGroupRequest req) override;
+                   JoinGroupRequest req) override;
 
     void proposeViewUpdate(coro_rpc::context<ProposeViewUpdateResponse> ctx,
                            ProposeViewUpdateRequest req) override;
 
     void publishEndpoint(coro_rpc::context<PublishEndpointResponse> ctx,
                          PublishEndpointRequest req) override;
+
+    void reportLinkStateChange(LinkStateChangeReport req) override;
 
     void reportTransferObservation(TransferObservationReport req) override;
 
@@ -100,7 +102,7 @@ class CoordinatorHost {
                        HeartbeatRequest req);
 
     void postJoinGroup(coro_rpc::context<JoinGroupResponse> ctx,
-                          JoinGroupRequest req);
+                       JoinGroupRequest req);
 
     void postLeaveGroup(LeaveGroupRequest req);
 
@@ -116,6 +118,8 @@ class CoordinatorHost {
                              PublishEndpointRequest req);
 
     void postTransferObservation(TransferObservationReport req);
+
+    void postLinkStateChange(LinkStateChangeReport req);
 
    private:
     CentralizedCoordinatorStateMachine state_machine_;

@@ -1,7 +1,6 @@
 #ifndef MOONCAKE_PG_AGENT_H
 #define MOONCAKE_PG_AGENT_H
 
-#include <array>
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
@@ -69,20 +68,15 @@ class AgentStateMachine {
     };
     std::unordered_map<GroupId, GroupEntry> groups_;
 
-    std::array<RankState, kMaxNumRanks> global_rank_states_{};
-
-    // Physical link state from LinkManager events (LinkUp/LinkDown).
-    std::array<bool, kMaxNumRanks> link_connected_{};
-
-    // Last peer reachability status reported to the Coordinator.
-    std::array<bool, kMaxNumRanks> last_reported_peer_status_{};
-
-    // Snapshot of Coordinator-authoritative rank states, published to
-    // LinkManager for worker-facing isRankReady() queries.
-    std::array<uint8_t, kMaxNumRanks> rank_state_snapshot_{};
-
-    std::array<std::optional<RankConnectionMetadata>, kMaxNumRanks>
-        rank_connections_;
+    // Per-GlobalRank state caches.  IndexedVector prevents accidental indexing
+    // with InGroupRank or a raw int.
+    IndexedVector<RankState, GlobalRankTag> global_rank_states_{kMaxNumRanks};
+    IndexedVector<uint8_t, GlobalRankTag> link_connected_{kMaxNumRanks};
+    IndexedVector<uint8_t, GlobalRankTag> last_reported_peer_status_{
+        kMaxNumRanks};
+    IndexedVector<uint8_t, GlobalRankTag> rank_state_snapshot_{kMaxNumRanks};
+    IndexedVector<std::optional<RankConnectionMetadata>, GlobalRankTag>
+        rank_connections_{kMaxNumRanks};
 
     CoordinatorConnection coordinator_connection_ =
         CoordinatorConnection::Disconnected;

@@ -338,18 +338,20 @@ void P2PProxy::handleFailedSendOp(SendOpContext& op_ctx) {
     op_ctx.failed_ranks_[op_ctx.peer_rank_] = 1;
     // Reset P2P session state (epoch, lanes).
     resetPeerState(op_ctx.peer_rank_);
-    // Report failure to control plane.
+    // observation bit-vectors are indexed by GlobalRank.
+    int32_t peer_global = meta_->rank_order[op_ctx.peer_rank_];
     if (meta_->backend) {
-        std::vector<uint8_t> attempted(kMaxNumRanks, 0);
-        std::vector<uint8_t> failed(kMaxNumRanks, 0);
-        attempted[op_ctx.peer_rank_] = 1;
-        failed[op_ctx.peer_rank_] = 1;
+        IndexedVector<uint8_t, GlobalRankTag> attempted(kMaxNumRanks, 0);
+        IndexedVector<uint8_t, GlobalRankTag> failed(kMaxNumRanks, 0);
+        attempted[GlobalRank{peer_global}] = 1;
+        failed[GlobalRank{peer_global}] = 1;
         meta_->backend->getAgent().pushTransferObservation(
             meta_->group_id, std::move(attempted), std::move(failed), {});
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P SendOp to peer "
-               << op_ctx.peer_rank_ << " failed.";
+               << op_ctx.peer_rank_ << " (global=" << peer_global
+               << ") failed.";
 }
 
 void P2PProxy::handleFailedRecvOp(RecvOpContext& op_ctx) {
@@ -357,18 +359,20 @@ void P2PProxy::handleFailedRecvOp(RecvOpContext& op_ctx) {
     op_ctx.failed_ranks_[op_ctx.peer_rank_] = 1;
     // Reset P2P session state (epoch, lanes).
     resetPeerState(op_ctx.peer_rank_);
-    // Report failure to control plane.
+    // observation bit-vectors are indexed by GlobalRank.
+    int32_t peer_global = meta_->rank_order[op_ctx.peer_rank_];
     if (meta_->backend) {
-        std::vector<uint8_t> attempted(kMaxNumRanks, 0);
-        std::vector<uint8_t> failed(kMaxNumRanks, 0);
-        attempted[op_ctx.peer_rank_] = 1;
-        failed[op_ctx.peer_rank_] = 1;
+        IndexedVector<uint8_t, GlobalRankTag> attempted(kMaxNumRanks, 0);
+        IndexedVector<uint8_t, GlobalRankTag> failed(kMaxNumRanks, 0);
+        attempted[GlobalRank{peer_global}] = 1;
+        failed[GlobalRank{peer_global}] = 1;
         meta_->backend->getAgent().pushTransferObservation(
             meta_->group_id, std::move(attempted), std::move(failed), {});
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P RecvOp from peer "
-               << op_ctx.peer_rank_ << " failed.";
+               << op_ctx.peer_rank_ << " (global=" << peer_global
+               << ") failed.";
 }
 
 void P2PProxy::releaseSendTaskResources(SendTransferTask& task) const {

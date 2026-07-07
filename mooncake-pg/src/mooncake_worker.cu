@@ -63,6 +63,7 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
         bool valid = false;
         acc_t acc = 0;
         for (size_t rank = 0; rank < numRanks; ++rank) {
+            // activeRanks is indexed by InGroupRank, just like the loop rank.
             bool shouldInclude =
                 activeRanks[rank] && (!failedRanks || failedRanks[rank] == 0);
             if (shouldInclude) {

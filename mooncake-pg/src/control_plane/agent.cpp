@@ -1,5 +1,6 @@
 #include "control_plane/agent.h"
 
+#include <algorithm>
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -12,10 +13,11 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     CHECK_LE(max_world_size_, kMaxNumRanks)
         << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
         << kMaxNumRanks << ")";
-    global_rank_states_.fill(RankState::OFFLINE);
-    link_connected_.fill(false);
-    last_reported_peer_status_.fill(false);
-    rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::OFFLINE));
+    global_rank_states_.assign(kMaxNumRanks, RankState::OFFLINE);
+    link_connected_.assign(kMaxNumRanks, false);
+    last_reported_peer_status_.assign(kMaxNumRanks, false);
+    rank_state_snapshot_.assign(kMaxNumRanks,
+                                static_cast<uint8_t>(RankState::OFFLINE));
 }
 
 // Group lifecycle
@@ -92,7 +94,16 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
     const ViewUpdatePush& push) {
     AgentApplyResult effects;
     auto it = groups_.find(push.group_id);
-    if (it == groups_.end()) return effects;
+    if (it == groups_.end()) {
+        LOG(WARNING) << "[AGENT] handleViewUpdate group=" << push.group_id
+                     << " NOT FOUND in groups_ (epoch=" << push.view.epoch
+                     << ")";
+        return effects;
+    }
+
+    LOG(INFO) << "[AGENT] handleViewUpdate rank=" << rank_
+              << " group=" << push.group_id << " epoch=" << push.view.epoch
+              << " #effects=1";
 
     it->second.view = push.view;
 
@@ -121,8 +132,7 @@ AgentApplyResult AgentStateMachine::handleLinkStateChanged(GlobalRank peer,
         // finished establishing.
         for (const auto& [group_id, entry] : groups_) {
             if (entry.view.status == GroupStatus::Ready) {
-                effects.push_back(
-                    ApplyViewToBackend{group_id, entry.view});
+                effects.push_back(ApplyViewToBackend{group_id, entry.view});
             }
         }
     }
@@ -132,10 +142,6 @@ AgentApplyResult AgentStateMachine::handleLinkStateChanged(GlobalRank peer,
 HeartbeatRequest AgentStateMachine::buildHeartbeat() const {
     HeartbeatRequest req;
     req.rank = rank_;
-    req.link_status.resize(max_world_size_, 0);
-    for (int i = 0; i < max_world_size_; ++i)
-        req.link_status[i] = link_connected_[i] ? 1 : 0;
-    req.link_status[rank_] = 1;
     return req;
 }
 
@@ -154,11 +160,10 @@ AgentApplyResult AgentStateMachine::applyRegisterResponse(
                      << resp.all_rank_states.size() << ", expected "
                      << max_world_size_ << "); truncating.";
     }
-    for (int i = 0; i < max_world_size_ &&
-                    i < static_cast<int>(resp.all_rank_states.size());
-         ++i) {
-        global_rank_states_[i] =
-            static_cast<RankState>(resp.all_rank_states[i]);
+    int available_states = static_cast<int>(resp.all_rank_states.size());
+    for (GlobalRank r :
+         globalRankRange(std::min(max_world_size_, available_states))) {
+        global_rank_states_[r] = resp.all_rank_states[r];
     }
 
     // Populate groups (view includes rank_order and member state).
@@ -187,17 +192,19 @@ AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
     AgentApplyResult effects;
 
     rank_state_ = RankState::OFFLINE;
-    global_rank_states_.fill(RankState::OFFLINE);
-    link_connected_.fill(false);
-    last_reported_peer_status_.fill(false);
-    rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::OFFLINE));
+    global_rank_states_.assign(kMaxNumRanks, RankState::OFFLINE);
+    link_connected_.assign(kMaxNumRanks, false);
+    last_reported_peer_status_.assign(kMaxNumRanks, false);
+    rank_state_snapshot_.assign(kMaxNumRanks,
+                                static_cast<uint8_t>(RankState::OFFLINE));
     for (auto& conn : rank_connections_) conn.reset();
 
     effects.push_back(DisconnectAllLinks{});
     effects.push_back(ClearAllPeerMetadata{});
-    effects.push_back(PublishRankStateSnapshot{
-        std::vector<uint8_t>(rank_state_snapshot_.begin(),
-                             rank_state_snapshot_.begin() + max_world_size_)});
+    PublishRankStateSnapshot snapshot;
+    snapshot.states.assign(rank_state_snapshot_.begin(),
+                           rank_state_snapshot_.begin() + max_world_size_);
+    effects.push_back(std::move(snapshot));
 
     return effects;
 }
@@ -207,17 +214,20 @@ AgentApplyResult AgentStateMachine::markOffline() {
 
     rank_state_ = RankState::OFFLINE;
     coordinator_connection_ = CoordinatorConnection::Disconnected;
-    global_rank_states_.fill(RankState::OFFLINE);
-    link_connected_.fill(false);
-    last_reported_peer_status_.fill(false);
-    rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::OFFLINE));
+    global_rank_states_.assign(kMaxNumRanks, RankState::OFFLINE);
+    link_connected_.assign(kMaxNumRanks, false);
+    last_reported_peer_status_.assign(kMaxNumRanks, false);
+    rank_state_snapshot_.assign(kMaxNumRanks,
+                                static_cast<uint8_t>(RankState::OFFLINE));
     for (auto& conn : rank_connections_) conn.reset();
 
     effects.push_back(DisconnectAllLinks{});
     effects.push_back(ClearAllPeerMetadata{});
-    effects.push_back(PublishRankStateSnapshot{
-        std::vector<uint8_t>(rank_state_snapshot_.begin(),
-                             rank_state_snapshot_.begin() + max_world_size_)});
+    PublishRankStateSnapshot offline_snapshot;
+    offline_snapshot.states.assign(
+        rank_state_snapshot_.begin(),
+        rank_state_snapshot_.begin() + max_world_size_);
+    effects.push_back(std::move(offline_snapshot));
 
     for (auto& [group_id, entry] : groups_) {
         effects.push_back(MarkBackendViewStale{group_id});
@@ -228,11 +238,10 @@ AgentApplyResult AgentStateMachine::markOffline() {
 
 // processTransferObservation  - report when observation differs from last
 //
-// When a transfer observation for peer j differs from
-// last_reported_peer_status_, include it in an immediate
-// reportTransferObservation RPC and update the cache. This covers both failure
-// (true->false) and recovery (false->true) transitions. Unchanged observations
-// piggyback on the next heartbeat.
+// Input bit-vectors are indexed by GlobalRank (producers translate through
+// rank_order before reporting).  We compare each attempted peer against
+// last_reported_peer_status_ and emit a TransferObservationReport when
+// anything changed.
 AgentApplyResult AgentStateMachine::processTransferObservation(
     const TransferObservationEvent& event) {
     AgentApplyResult effects;
@@ -245,47 +254,47 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
 
     bool has_changed = false;
 
-    for (int j = 0; j < max_world_size_; ++j) {
-        if (static_cast<size_t>(j) >= event.attempted_ranks.size()) continue;
-        if (!event.attempted_ranks[j]) continue;
+    // Bit-vectors are GlobalRank-indexed.  Iterate over the input size and
+    // ignore entries beyond our current max_world_size_.
+    for (GlobalRank peer : event.attempted_ranks.indices()) {
+        if (peer >= max_world_size_) continue;
+        if (!event.attempted_ranks[peer]) continue;
 
-        bool succeeded =
-            static_cast<size_t>(j) < event.succeeded_ranks.size() &&
-            event.succeeded_ranks[j];
-        bool failed = static_cast<size_t>(j) < event.failed_ranks.size() &&
-                      event.failed_ranks[j];
+        bool succeeded = event.succeeded_ranks[peer];
+        bool failed = event.failed_ranks[peer];
 
         // Determine current observation: failed takes precedence.
         bool current = succeeded && !failed;
 
-        if (current != last_reported_peer_status_[j]) {
-            last_reported_peer_status_[j] = current;
+        if (current != last_reported_peer_status_[peer]) {
+            last_reported_peer_status_[peer] = current;
             // Lazy-init the vectors on first change.
             if (!has_changed) {
                 req.attempted_ranks.assign(max_world_size_, 0);
                 req.failed_ranks.assign(max_world_size_, 0);
                 req.succeeded_ranks.assign(max_world_size_, 0);
             }
-            req.attempted_ranks[j] = 1;
-            req.succeeded_ranks[j] = current ? 1 : 0;
-            req.failed_ranks[j] = current ? 0 : 1;
+            req.attempted_ranks[peer] = 1;
+            req.succeeded_ranks[peer] = current ? 1 : 0;
+            req.failed_ranks[peer] = current ? 0 : 1;
             has_changed = true;
         }
     }
 
     if (has_changed) {
         effects.push_back(SendTransferObservation{std::move(req)});
-        LOG(INFO) << "[AGENT] processTransferObservation has_changed rank=" << rank_
-                  << " attempted=";
-        for (int j = 0; j < max_world_size_; ++j) {
-            if (req.attempted_ranks[j]) {
-                LOG(INFO) << "[AGENT]   peer=" << j
-                          << " succeeded=" << (int)req.succeeded_ranks[j]
-                          << " failed=" << (int)req.failed_ranks[j];
+        LOG(INFO) << "[AGENT] processTransferObservation has_changed rank="
+                  << rank_ << " attempted=";
+        for (GlobalRank peer : req.attempted_ranks.indices()) {
+            if (req.attempted_ranks[peer]) {
+                LOG(INFO) << "[AGENT]   peer=" << peer
+                          << " succeeded=" << (int)req.succeeded_ranks[peer]
+                          << " failed=" << (int)req.failed_ranks[peer];
             }
         }
     } else {
-        LOG(INFO) << "[AGENT] processTransferObservation no_change rank=" << rank_;
+        LOG(INFO) << "[AGENT] processTransferObservation no_change rank="
+                  << rank_;
     }
 
     return effects;
@@ -293,10 +302,10 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
 
 void AgentStateMachine::syncRankStateSnapshot(AgentApplyResult& effects) {
     bool snapshot_changed = false;
-    for (int j = 0; j < max_world_size_; ++j) {
-        uint8_t new_val = static_cast<uint8_t>(global_rank_states_[j]);
-        if (rank_state_snapshot_[j] != new_val) {
-            rank_state_snapshot_[j] = new_val;
+    for (GlobalRank r{0}; r < max_world_size_; ++r) {
+        uint8_t new_val = static_cast<uint8_t>(global_rank_states_[r]);
+        if (rank_state_snapshot_[r] != new_val) {
+            rank_state_snapshot_[r] = new_val;
             snapshot_changed = true;
         }
     }
@@ -305,9 +314,10 @@ void AgentStateMachine::syncRankStateSnapshot(AgentApplyResult& effects) {
     rank_state_ = global_rank_states_[rank_];
 
     if (snapshot_changed) {
-        effects.push_back(PublishRankStateSnapshot{std::vector<uint8_t>(
-            rank_state_snapshot_.begin(),
-            rank_state_snapshot_.begin() + max_world_size_)});
+        PublishRankStateSnapshot snapshot;
+        snapshot.states.assign(rank_state_snapshot_.begin(),
+                               rank_state_snapshot_.begin() + max_world_size_);
+        effects.push_back(std::move(snapshot));
     }
 }
 

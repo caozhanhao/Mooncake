@@ -57,8 +57,8 @@ static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
             g_ctx.engine_initialized = true;
         }
         if (!g_ctx.link_manager.isInitialized()) {
-            g_ctx.link_manager.init(static_cast<GlobalRank>(rank),
-                                    max_world_size, g_ctx.engine);
+            g_ctx.link_manager.init(GlobalRank{rank}, max_world_size,
+                                    g_ctx.engine);
         }
 
         // Rank 0 hosts the Coordinator in-process.
@@ -68,9 +68,9 @@ static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
             g_ctx.coordinator_host->start();
         }
 
-        g_ctx.agent_host = std::make_unique<AgentHost>(
-            store, g_ctx.host_ip, static_cast<GlobalRank>(rank), max_world_size,
-            g_ctx.link_manager);
+        g_ctx.agent_host =
+            std::make_unique<AgentHost>(store, g_ctx.host_ip, GlobalRank{rank},
+                                        max_world_size, g_ctx.link_manager);
         g_ctx.agent_host->start();
     });
     return *g_ctx.agent_host;

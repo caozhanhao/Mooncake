@@ -108,6 +108,10 @@ void MooncakeWorker::startWorker() {
                     }
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
+                        // j is InGroupRank; data-plane arrays are
+                        // GlobalRank-indexed.
+                        int32_t peer_global = group->rank_order[j];
+
                         if (!group->activeRanks[j]) {
                             continue;
                         }
@@ -126,7 +130,7 @@ void MooncakeWorker::startWorker() {
                         // Use cached segment ID from TransferGroupMeta.
                         // Control plane syncs this via applyViewChange.
                         TransferMetadata::SegmentID target_id =
-                            group->segmentIDs[j];
+                            group->segmentIDs[peer_global];
 
                         uint64_t source = group->segmentInfos[group->globalRank]
                                               .send_buffer[task.bufferOffset];
@@ -149,7 +153,7 @@ void MooncakeWorker::startWorker() {
                                 break;
                         }
                         uint64_t target_offset =
-                            group->segmentInfos[j]
+                            group->segmentInfos[peer_global]
                                 .recv_buffer[task.bufferOffset];
 
                         switch ((c10d::OpType)task.opType) {
@@ -197,6 +201,7 @@ void MooncakeWorker::startWorker() {
                         auto diff = std::chrono::duration_cast<
                             std::chrono::microseconds>(now - activeTime[i]);
                         for (int j = 0; j < group->size; ++j) {
+                            int32_t peer_global = group->rank_order[j];
                             if (!group->activeRanks[j]) {
                                 continue;
                             }
@@ -212,12 +217,12 @@ void MooncakeWorker::startWorker() {
                                 bool peer_dead = false;
                                 if (status.s == TransferStatusEnum::FAILED) {
                                     peer_dead = true;
-                                } else if (j != group->globalRank &&
+                                } else if (j != group->rank &&
                                            diff.count() >
                                                *group->collectiveTimeoutUs) {
                                     peer_dead =
                                         group->engine->probePeerAliveByID(
-                                            group->segmentIDs[j]) !=
+                                            group->segmentIDs[peer_global]) !=
                                         PeerLiveness::Alive;
                                 }
                                 if (peer_dead) {
@@ -257,6 +262,7 @@ void MooncakeWorker::startWorker() {
                     }
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
+                        int32_t peer_global = group->rank_order[j];
                         if (!group->activeRanks[j]) {
                             continue;
                         }
@@ -266,7 +272,7 @@ void MooncakeWorker::startWorker() {
 
                         // Use cached segment ID from TransferGroupMeta.
                         TransferMetadata::SegmentID target_id =
-                            group->segmentIDs[j];
+                            group->segmentIDs[peer_global];
 
                         *source_ptr = 1;
                         rankToTaskId[i][j] = entries.size();
@@ -275,7 +281,7 @@ void MooncakeWorker::startWorker() {
                             .source = (void*)source_ptr,
                             .target_id = target_id,
                             .target_offset =
-                                group->segmentInfos[j]
+                                group->segmentInfos[peer_global]
                                     .recv_sync[task.bufferOffset] +
                                 group->globalRank * sizeof(int32_t),
                             .length = sizeof(int32_t),
@@ -300,6 +306,7 @@ void MooncakeWorker::startWorker() {
 
                     TransferStatus status;
                     for (int j = 0; j < group->size; ++j) {
+                        int32_t peer_global = group->rank_order[j];
                         if (!group->activeRanks[j]) {
                             continue;
                         }
@@ -311,17 +318,18 @@ void MooncakeWorker::startWorker() {
                         }
                         group->engine->getTransferStatus(
                             task.batchID, rankToTaskId[i][j], status);
-                        if (signal_ptr[j] != 1 ||
+                        if (signal_ptr[peer_global] != 1 ||
                             status.s != TransferStatusEnum::COMPLETED) {
                             bool peer_dead = false;
                             if (status.s == TransferStatusEnum::FAILED) {
                                 peer_dead = true;
-                            } else if (j != group->globalRank &&
+                            } else if (j != group->rank &&
                                        diff.count() >
                                            *group->collectiveTimeoutUs) {
-                                peer_dead = group->engine->probePeerAliveByID(
-                                                group->segmentIDs[j]) !=
-                                            PeerLiveness::Alive;
+                                peer_dead =
+                                    group->engine->probePeerAliveByID(
+                                        group->segmentIDs[peer_global]) !=
+                                    PeerLiveness::Alive;
                             }
                             if (peer_dead) {
                                 task.failedRanksHost[j] = 1;
@@ -341,7 +349,9 @@ void MooncakeWorker::startWorker() {
                     }
                     if (task_done) {
                         for (int j = 0; j < group->size; ++j) {
-                            signal_ptr[j] = 0;
+                            int32_t peer_global = group->rank_order[j];
+                            if (!group->activeRanks[j]) continue;
+                            signal_ptr[peer_global] = 0;
                         }
 
                         // Push transfer observation via backend's Agent.
@@ -354,15 +364,23 @@ void MooncakeWorker::startWorker() {
                                 }
                             }
                             if (has_any_attempted) {
-                                std::vector<uint8_t> attempted(kMaxNumRanks, 0);
-                                std::vector<uint8_t> failed(kMaxNumRanks, 0);
-                                std::vector<uint8_t> succeeded(kMaxNumRanks, 0);
+                                IndexedVector<uint8_t, GlobalRankTag> attempted(
+                                    kMaxNumRanks, 0);
+                                IndexedVector<uint8_t, GlobalRankTag> failed(
+                                    kMaxNumRanks, 0);
+                                IndexedVector<uint8_t, GlobalRankTag> succeeded(
+                                    kMaxNumRanks, 0);
                                 for (int j = 0; j < group->size; ++j) {
-                                    attempted[j] =
+                                    int32_t peer_global = group->rank_order[j];
+                                    attempted[GlobalRank{peer_global}] =
                                         task.attemptedRanksHost[j] ? 1 : 0;
-                                    failed[j] = task.failedRanksHost[j] ? 1 : 0;
-                                    succeeded[j] =
-                                        (attempted[j] && !failed[j]) ? 1 : 0;
+                                    failed[GlobalRank{peer_global}] =
+                                        task.failedRanksHost[j] ? 1 : 0;
+                                    succeeded[GlobalRank{peer_global}] =
+                                        (attempted[GlobalRank{peer_global}] &&
+                                         !failed[GlobalRank{peer_global}])
+                                            ? 1
+                                            : 0;
                                 }
                                 group->backend->getAgent()
                                     .pushTransferObservation(
@@ -376,7 +394,8 @@ void MooncakeWorker::startWorker() {
                                 for (int j = 0; j < group->size; ++j) {
                                     LOG(INFO)
                                         << "[WORKER]   peer=" << j
-                                        << " attempted="
+                                        << " global_peer="
+                                        << group->rank_order[j] << " attempted="
                                         << (int)task.attemptedRanksHost[j]
                                         << " failed="
                                         << (int)task.failedRanksHost[j];

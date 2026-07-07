@@ -38,7 +38,7 @@ struct RankConnectionMetadata {
 struct RegisterResponse {
     bool success = false;
     std::string error_msg;
-    std::vector<uint8_t> all_rank_states;
+    IndexedVector<RankState, GlobalRankTag> all_rank_states;
     std::vector<GroupView> groups;
     std::vector<RankConnectionMetadata> rank_connections;
 };
@@ -46,7 +46,6 @@ struct RegisterResponse {
 struct HeartbeatRequest {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
-    std::vector<uint8_t> link_status;
 };
 
 struct HeartbeatResponse {
@@ -117,9 +116,19 @@ struct TransferObservationReport {
     GroupId group_id = 0;
     GlobalRank reporter_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
-    std::vector<uint8_t> attempted_ranks;
-    std::vector<uint8_t> failed_ranks;
-    std::vector<uint8_t> succeeded_ranks;
+    IndexedVector<uint8_t, GlobalRankTag> attempted_ranks;
+    IndexedVector<uint8_t, GlobalRankTag> failed_ranks;
+    IndexedVector<uint8_t, GlobalRankTag> succeeded_ranks;
+};
+
+// Agent -> Coordinator: per-peer link state change, triggered by LinkManager
+// LinkUp/LinkDown events.  This is event-driven (not periodic) so it cannot
+// overwrite transfer-observation data with a stale snapshot.
+struct LinkStateChangeReport {
+    GlobalRank reporter_rank = kInvalidGlobalRank;
+    GlobalRank peer = kInvalidGlobalRank;
+    bool is_up = false;
+    uint64_t agent_session_epoch = 0;
 };
 
 // Coordinator -> Agent RPC messages
@@ -216,7 +225,7 @@ struct DisconnectAllLinks {};
 struct ClearAllPeerMetadata {};
 
 struct PublishRankStateSnapshot {
-    std::vector<uint8_t> states;
+    IndexedVector<uint8_t, GlobalRankTag> states;
 };
 
 struct ApplyViewToBackend {
@@ -264,13 +273,14 @@ class CoordinatorRpcService {
     virtual void heartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                            HeartbeatRequest req) = 0;
     virtual void joinGroup(coro_rpc::context<JoinGroupResponse> ctx,
-                              JoinGroupRequest req) = 0;
+                           JoinGroupRequest req) = 0;
     virtual void leaveGroup(LeaveGroupRequest req) = 0;
     virtual void proposeViewUpdate(
         coro_rpc::context<ProposeViewUpdateResponse> ctx,
         ProposeViewUpdateRequest req) = 0;
     virtual void publishEndpoint(coro_rpc::context<PublishEndpointResponse> ctx,
                                  PublishEndpointRequest req) = 0;
+    virtual void reportLinkStateChange(LinkStateChangeReport req) = 0;
     virtual void reportTransferObservation(TransferObservationReport req) = 0;
 };
 

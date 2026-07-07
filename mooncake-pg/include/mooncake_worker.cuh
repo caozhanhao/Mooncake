@@ -33,20 +33,29 @@ static constexpr size_t kBufferSize = 1u << 24;
 class MooncakeBackend;
 
 struct TransferGroupMeta {
-    int rank;               // InGroupRank (PyTorch ProcessGroup rank)
-    GlobalRank globalRank;  // GlobalRank (index into segmentInfos[])
-    GlobalRank rank_order[kMaxNumRanks];  // InGroupRank -> GlobalRank mapping
-    int size;        // capacity: number of slots allocated (incl. inactive)
-    int activeSize;  // visible group size: number of ranks that participate
+    int rank;  // InGroupRank (PyTorch ProcessGroup rank)
+    int32_t
+        globalRank;  // GlobalRank (index into segmentInfos[] / segmentIDs[])
+    // rank_order maps InGroupRank (0 .. size-1) to GlobalRank.
+    int32_t rank_order[kMaxNumRanks];
+    int size;  // capacity: number of in-group slots allocated (incl. inactive)
+    int activeSize;  // visible group size: number of in-group slots that
+                     // participate
     int taskCount;
     GroupId group_id = 0;
     uint64_t epoch = 0;  // GroupView epoch, synced by control plane
+    // activeRanks is indexed by InGroupRank (size = this->size).
     bool* activeRanks;
     bool* activeRanksDevice;
 #if !defined(__MUSA__)
-    at::Tensor activeRanksTensor;
+    at::Tensor
+        activeRanksTensor;  // length = this->size, ordered by InGroupRank
 #endif
     TransferEngine* engine;
+    // segmentIDs and segmentInfos are indexed by GlobalRank (size
+    // kMaxNumRanks). Collective code that iterates over in-group slots must
+    // translate InGroupRank -> GlobalRank via rank_order before indexing these
+    // arrays. The P2P proxy uses its own peer_rank_ -> GlobalRank translation.
     TransferMetadata::SegmentID
         segmentIDs[kMaxNumRanks];  // synced by control plane
     GroupEndpointInfo segmentInfos[kMaxNumRanks];
@@ -67,8 +76,8 @@ __global__
     uint64_t submitSequence = 0;
     BatchID batchID;
     void* transferGroupMeta;
-    int* failedRanksHost = nullptr;
-    int* attemptedRanksHost = nullptr;  // per-op attempted bitmap
+    int* failedRanksHost = nullptr;     // per-op bitmap indexed by InGroupRank
+    int* attemptedRanksHost = nullptr;  // per-op bitmap indexed by InGroupRank
 };
 
 #if !defined(__MUSA__)

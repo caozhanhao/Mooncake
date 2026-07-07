@@ -176,9 +176,8 @@ GroupView AgentHost::waitUntilGroupReady(GroupId group_id,
 
 // Agent interface: Group management
 
-void AgentHost::doJoinGroup(
-    GroupView group, bool auto_deactivate,
-    c10::weak_intrusive_ptr<MooncakeBackend> backend) {
+void AgentHost::doJoinGroup(GroupView group, bool auto_deactivate,
+                            c10::intrusive_ptr<MooncakeBackend> backend) {
     auto group_id = group.group_id;
     backends_.insert_or_assign(group_id, std::move(backend));
     agent_.joinGroup(group, auto_deactivate);
@@ -209,11 +208,9 @@ void AgentHost::doJoinGroup(
     }
 }
 
-void AgentHost::joinGroup(
-    const GroupView& group, bool auto_deactivate,
-    c10::weak_intrusive_ptr<MooncakeBackend> backend) {
-    executor_.postAndWait([this, group = group,
-                           auto_deactivate,
+void AgentHost::joinGroup(const GroupView& group, bool auto_deactivate,
+                          c10::intrusive_ptr<MooncakeBackend> backend) {
+    executor_.postAndWait([this, group = group, auto_deactivate,
                            backend = std::move(backend)]() mutable {
         doJoinGroup(std::move(group), auto_deactivate, std::move(backend));
     });
@@ -287,10 +284,10 @@ ProposeViewUpdateResponse AgentHost::proposeDeactivate(
 
 // Agent interface: Transfer observation (thread-safe)
 
-void AgentHost::pushTransferObservation(GroupId group_id,
-                                        std::vector<uint8_t> attempted_ranks,
-                                        std::vector<uint8_t> failed_ranks,
-                                        std::vector<uint8_t> succeeded_ranks) {
+void AgentHost::pushTransferObservation(
+    GroupId group_id, IndexedVector<uint8_t, GlobalRankTag> attempted_ranks,
+    IndexedVector<uint8_t, GlobalRankTag> failed_ranks,
+    IndexedVector<uint8_t, GlobalRankTag> succeeded_ranks) {
     observation_queue_.enqueue(TransferObservationEvent{
         group_id, std::move(attempted_ranks), std::move(failed_ranks),
         std::move(succeeded_ranks)});
@@ -352,12 +349,28 @@ void AgentHost::postTELinkEvent(TELinkEvent event) {
             } else {
                 LOG(WARNING) << "AgentHost: LinkUp event for peer "
                              << event.peer << " without target_id; ignoring.";
+                return;
             }
         } else {
             // LinkDown: LinkManager already called publishLinkDown in
             // tearDownPeerLink.  P2P reset is modeled as a
             // ResetPeerP2PState effect from handleLinkStateChanged.
             runEffects(agent_.handleLinkStateChanged(event.peer, false));
+        }
+
+        // Report the link state change event to the Coordinator so it can
+        // update the authoritative link_status.  This is event-driven (only
+        // fires on actual LinkUp/LinkDown transitions), avoiding the
+        // periodic-overwrite problem that heartbeat-based link_status had.
+        if (rpc_client_ && !coordinator_addr_.empty()) {
+            rpc_client_->send<&CoordinatorRpcService::reportLinkStateChange>(
+                coordinator_addr_,
+                LinkStateChangeReport{
+                    .reporter_rank = rank_,
+                    .peer = event.peer,
+                    .is_up = (event.kind == TELinkEvent::Kind::LinkUp),
+                    .agent_session_epoch = agent_.getAgentSessionEpoch(),
+                });
         }
     });
 }
@@ -488,14 +501,14 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                     link_manager_.publishLinkDown(e.peer);
                 },
                 [this](const DisconnectAllLinks&) {
-                    for (int i = 0; i < max_world_size_; ++i) {
+                    for (GlobalRank i{0}; i < max_world_size_; ++i) {
                         if (i != rank_) {
                             link_manager_.disconnect(i);
                         }
                     }
                 },
                 [this](const ClearAllPeerMetadata&) {
-                    for (int i = 0; i < max_world_size_; ++i) {
+                    for (GlobalRank i{0}; i < max_world_size_; ++i) {
                         if (i != rank_) {
                             link_manager_.publishLinkDown(i);
                         }

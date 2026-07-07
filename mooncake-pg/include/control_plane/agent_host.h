@@ -75,9 +75,8 @@ class AgentInterface {
     virtual GroupView waitUntilGroupReady(
         GroupId group_id, std::chrono::milliseconds timeout) = 0;
 
-    virtual void joinGroup(
-        const GroupView& group, bool auto_deactivate,
-        c10::weak_intrusive_ptr<MooncakeBackend> backend) = 0;
+    virtual void joinGroup(const GroupView& group, bool auto_deactivate,
+                           c10::intrusive_ptr<MooncakeBackend> backend) = 0;
 
     virtual void leaveGroup(GroupId group_id) = 0;
 
@@ -94,9 +93,9 @@ class AgentInterface {
         GroupId group_id, const std::vector<GlobalRank>& ranks) = 0;
 
     virtual void pushTransferObservation(
-        GroupId group_id, std::vector<uint8_t> attempted_ranks,
-        std::vector<uint8_t> failed_ranks,
-        std::vector<uint8_t> succeeded_ranks) = 0;
+        GroupId group_id, IndexedVector<uint8_t, GlobalRankTag> attempted_ranks,
+        IndexedVector<uint8_t, GlobalRankTag> failed_ranks,
+        IndexedVector<uint8_t, GlobalRankTag> succeeded_ranks) = 0;
 };
 
 class AgentHost;
@@ -134,9 +133,8 @@ class AgentHost : public AgentInterface {
     GroupView waitUntilGroupReady(GroupId group_id,
                                   std::chrono::milliseconds timeout) override;
 
-    void joinGroup(
-        const GroupView& group, bool auto_deactivate,
-        c10::weak_intrusive_ptr<MooncakeBackend> backend) override;
+    void joinGroup(const GroupView& group, bool auto_deactivate,
+                   c10::intrusive_ptr<MooncakeBackend> backend) override;
     void leaveGroup(GroupId group_id) override;
     uint64_t getAgentSessionEpoch() override {
         return agent_.getAgentSessionEpoch();
@@ -150,10 +148,10 @@ class AgentHost : public AgentInterface {
     ProposeViewUpdateResponse proposeDeactivate(
         GroupId group_id, const std::vector<GlobalRank>& ranks) override;
 
-    void pushTransferObservation(GroupId group_id,
-                                 std::vector<uint8_t> attempted_ranks,
-                                 std::vector<uint8_t> failed_ranks,
-                                 std::vector<uint8_t> succeeded_ranks) override;
+    void pushTransferObservation(
+        GroupId group_id, IndexedVector<uint8_t, GlobalRankTag> attempted_ranks,
+        IndexedVector<uint8_t, GlobalRankTag> failed_ranks,
+        IndexedVector<uint8_t, GlobalRankTag> succeeded_ranks) override;
 
     void postPeerJoined(PeerJoinedPush push);
     void postRankStateUpdate(RankStateUpdatePush push);
@@ -194,8 +192,11 @@ class AgentHost : public AgentInterface {
 
     // Backend registry: for view application and link reset fanout.
     // Accessed only from the executor thread.
-    std::unordered_map<GroupId, c10::weak_intrusive_ptr<MooncakeBackend>>
-        backends_;
+    // Store strong (intrusive_ptr) references so the Backend stays reachable
+    // even when its only other strong reference is held by the PyTorch
+    // ProcessGroup system.  Weak references (weak_intrusive_ptr) cannot be
+    // locked when created via unsafe_reclaim_from_nonowning.
+    std::unordered_map<GroupId, c10::intrusive_ptr<MooncakeBackend>> backends_;
 
     // Transfer observation queue: worker thread -> executor.
     ThreadSafeQueue<TransferObservationEvent> observation_queue_;
@@ -204,14 +205,14 @@ class AgentHost : public AgentInterface {
     void tick();
 
     void doJoinGroup(GroupView group, bool auto_deactivate,
-                         c10::weak_intrusive_ptr<MooncakeBackend> backend);
+                     c10::intrusive_ptr<MooncakeBackend> backend);
     void doPublishLocalEndpoint(GroupEndpointPublication endpoint);
 
     void runEffects(const AgentApplyResult& effects);
     template <typename F>
     void forEachBackend(F&& func) {
         for (auto it = backends_.begin(); it != backends_.end();) {
-            auto backend = it->second.lock();
+            auto backend = it->second;
             if (!backend) {
                 it = backends_.erase(it);
                 continue;
@@ -224,12 +225,10 @@ class AgentHost : public AgentInterface {
     void forGivenBackend(GroupId group_id, F&& func) {
         auto it = backends_.find(group_id);
         if (it != backends_.end()) {
-            auto backend = it->second.lock();
-            if (!backend) {
-                backends_.erase(it);
-                return;
+            auto backend = it->second;
+            if (backend) {
+                func(backend);
             }
-            func(backend);
         }
     }
 };

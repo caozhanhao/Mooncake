@@ -237,6 +237,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
                               bufferToTensor, bufferOffset, realSize,
                               future]() {
             if (meta->activeRanksTensor.device().is_cpu()) {
+                // activeRanks is InGroupRank-indexed, same order as the tensor.
                 for (int i = 0; i < meta->size; ++i) {
                     meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
                 }

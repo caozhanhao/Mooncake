@@ -624,6 +624,9 @@ def _fault_detection_worker(
 
     print("DDD", ctx.rank)
 
+    time.sleep(5)
+    print("sleep")
+
     # Verify activeRanks also deactivates broken rank (auto_deactivate=True default)
     active_ranks = pg.get_active_ranks(dist.group.WORLD)
     expected_active_ranks = [1] * ctx.world_size

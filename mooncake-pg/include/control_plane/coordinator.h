@@ -1,7 +1,6 @@
 #ifndef MOONCAKE_PG_COORDINATOR_H
 #define MOONCAKE_PG_COORDINATOR_H
 
-#include <array>
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -53,6 +52,9 @@ class CoordinatorStateMachine {
     virtual CoordinatorApplyResult<void> handleTransferObservation(
         const TransferObservationReport& req) = 0;
 
+    virtual CoordinatorApplyResult<void> handleLinkStateChange(
+        const LinkStateChangeReport& req) = 0;
+
     virtual CoordinatorApplyResult<void> checkTimeouts() = 0;
 };
 
@@ -85,6 +87,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     CoordinatorApplyResult<void> handleTransferObservation(
         const TransferObservationReport& req) override;
 
+    CoordinatorApplyResult<void> handleLinkStateChange(
+        const LinkStateChangeReport& req) override;
+
     CoordinatorApplyResult<void> checkTimeouts() override;
 
     CoordinatorApplyResult<void> handleLeaveGroup(
@@ -112,11 +117,13 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         std::string te_server_name;
         uint64_t agent_session_epoch = 0;
         std::chrono::steady_clock::time_point last_heartbeat;
-        std::vector<uint8_t> link_status;
+        IndexedVector<uint8_t, GlobalRankTag> link_status;
         uint64_t warmup_recv_addr = 0;
     };
 
-    std::array<RankInfo, kMaxNumRanks> ranks_;
+    // Per-GlobalRank coordinator state.  IndexedVector prevents accidentally
+    // indexing with InGroupRank or a raw int.
+    IndexedVector<RankInfo, GlobalRankTag> ranks_{kMaxNumRanks};
 
     std::unordered_map<GroupId, GroupView> group_views_;
     std::unordered_map<GroupId, bool> group_auto_deactivate_;
@@ -171,7 +178,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                           const GroupView& old_view) const;
 
     bool joinGroup(const GroupView& group, bool auto_deactivate,
-                      JoinGroupResponse& response);
+                   JoinGroupResponse& response);
 
     std::vector<GlobalRank> computeRequiredViewAcks(const GroupView& old_view,
                                                     const GroupView& new_view,

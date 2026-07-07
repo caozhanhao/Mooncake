@@ -41,6 +41,11 @@ void CoordinatorRpcServiceImpl::publishEndpoint(
     host_.postPublishEndpoint(std::move(ctx), std::move(req));
 }
 
+void CoordinatorRpcServiceImpl::reportLinkStateChange(
+    LinkStateChangeReport req) {
+    host_.postLinkStateChange(std::move(req));
+}
+
 void CoordinatorRpcServiceImpl::reportTransferObservation(
     TransferObservationReport req) {
     host_.postTransferObservation(std::move(req));
@@ -69,6 +74,7 @@ void CoordinatorHost::start() {
         &CoordinatorRpcService::proposeViewUpdate,
         &CoordinatorRpcService::publishEndpoint,
         &CoordinatorRpcService::leaveGroup,
+        &CoordinatorRpcService::reportLinkStateChange,
         &CoordinatorRpcService::reportTransferObservation>(rpc_impl_.get());
 
     rpc_server_->start();
@@ -119,8 +125,8 @@ void CoordinatorHost::postHeartbeat(coro_rpc::context<HeartbeatResponse> ctx,
         });
 }
 
-void CoordinatorHost::postJoinGroup(
-    coro_rpc::context<JoinGroupResponse> ctx, JoinGroupRequest req) {
+void CoordinatorHost::postJoinGroup(coro_rpc::context<JoinGroupResponse> ctx,
+                                    JoinGroupRequest req) {
     executor_.post(
         [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
             auto result = state_machine_.handleJoinGroup(req);
@@ -183,6 +189,13 @@ void CoordinatorHost::postTransferObservation(TransferObservationReport req) {
     });
 }
 
+void CoordinatorHost::postLinkStateChange(LinkStateChangeReport req) {
+    executor_.post([this, req = std::move(req)]() {
+        auto result = state_machine_.handleLinkStateChange(req);
+        runEffects(result.effects);
+    });
+}
+
 void CoordinatorHost::runEffects(
     const std::vector<CoordinatorEffect>& effects) {
     for (const auto& effect : effects) {
@@ -190,7 +203,7 @@ void CoordinatorHost::runEffects(
             overloaded{
                 [this](const PushEffect<RankStateUpdatePush>& e) {
                     if (e.target.kind == EffectTarget::Kind::BroadcastOnline) {
-                        for (int i = 0; i < max_world_size_; ++i) {
+                        for (GlobalRank i{0}; i < max_world_size_; ++i) {
                             if (state_machine_.getRankState(i) !=
                                 RankState::OFFLINE) {
                                 pushToAgent(i, e.push);
@@ -209,7 +222,7 @@ void CoordinatorHost::runEffects(
                     }
                 },
                 [this](const PushEffect<PeerJoinedPush>& e) {
-                    for (int i = 0; i < max_world_size_; ++i) {
+                    for (GlobalRank i{0}; i < max_world_size_; ++i) {
                         if (i != e.push.rank && state_machine_.getRankState(
                                                     i) != RankState::OFFLINE) {
                             pushToAgent(i, e.push);
@@ -239,8 +252,8 @@ void CoordinatorHost::pushViewUpdate(const ViewUpdateEffect& effect) {
     auto group_id = effect.view.group_id;
     auto ack_route = effect.ack_route;  // capture for ACK routing
 
-    for (int i = 0; i < max_world_size_; ++i) {
-        const auto& member = effect.view.members[i];
+    for (GlobalRank i : globalRankRange(max_world_size_)) {
+        const auto& member = effect.view.member(i);
         if (member.status == GroupMemberStatus::kNone ||
             member.status == GroupMemberStatus::kLeft) {
             continue;

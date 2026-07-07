@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <numeric>
 #include <set>
+#include <sstream>
 
 #include <glog/logging.h>
 
@@ -17,10 +18,11 @@ CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
     CHECK_LE(max_world_size_, kMaxNumRanks)
         << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
         << kMaxNumRanks << ")";
-    for (int i = 0; i < kMaxNumRanks; ++i) {
-        ranks_[i].link_status.assign(max_world_size_, 0);
-        if (i < max_world_size_) {
-            ranks_[i].link_status[i] = 1;
+    ranks_.assign(kMaxNumRanks, RankInfo{});
+    for (GlobalRank r{0}; r < GlobalRank{kMaxNumRanks}; ++r) {
+        ranks_[r].link_status.assign(max_world_size_, 0);
+        if (r < max_world_size_) {
+            ranks_[r].link_status[r] = 1;
         }
     }
 }
@@ -105,15 +107,9 @@ CentralizedCoordinatorStateMachine::handleHeartbeat(
     }
 
     info.last_heartbeat = std::chrono::steady_clock::now();
-    info.link_status = req.link_status;
-    if (info.link_status.size() < static_cast<size_t>(max_world_size_)) {
-        info.link_status.resize(max_world_size_, 0);
-    }
-    info.link_status[req.rank] = 1;
 
     result.response.acknowledge = true;
     result.response.require_reregister = false;
-    updateRankHealth(result.effects);
     return result;
 }
 
@@ -219,7 +215,7 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
 
         // Check activatable before applying changes.
         for (GlobalRank rank : req.requested_ranks) {
-            if (!view.members[rank].isActive()) changed = true;
+            if (!view.member(rank).isActive()) changed = true;
         }
 
         if (changed &&
@@ -235,13 +231,13 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
 
         // Apply.
         for (GlobalRank rank : req.requested_ranks) {
-            view.members[rank].status = GroupMemberStatus::kActive;
+            view.member(rank).status = GroupMemberStatus::kActive;
         }
     } else {
         // deactivate
         for (GlobalRank rank : req.requested_ranks) {
-            if (view.members[rank].isActive()) {
-                view.members[rank].status = GroupMemberStatus::kInactive;
+            if (view.member(rank).isActive()) {
+                view.member(rank).status = GroupMemberStatus::kInactive;
                 changed = true;
             }
         }
@@ -262,9 +258,7 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     if (required_acks.empty()) {
         // Best-effort: broadcast + reply immediately.
         result.effects.push_back(
-            ViewUpdateEffect{view,
-                             {},
-                             ProposalAckRoute{propose_id}});
+            ViewUpdateEffect{view, {}, ProposalAckRoute{propose_id}});
         result.effects.push_back(ReplyViewUpdateEffect{
             propose_id, {ViewUpdateStatus::Applied, view.epoch, {}, ""}});
     } else {
@@ -277,9 +271,8 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
                                            required_acks.end()),
             std::chrono::steady_clock::now() + kProposeTimeout,
         };
-        result.effects.push_back(
-            ViewUpdateEffect{view,
-                             required_acks, ProposalAckRoute{propose_id}});
+        result.effects.push_back(ViewUpdateEffect{
+            view, required_acks, ProposalAckRoute{propose_id}});
     }
 
     return result;
@@ -335,7 +328,7 @@ CentralizedCoordinatorStateMachine::checkTimeouts() {
     auto now = std::chrono::steady_clock::now();
 
     // Heartbeat timeout
-    for (int rank = 0; rank < max_world_size_; ++rank) {
+    for (GlobalRank rank{0}; rank < max_world_size_; ++rank) {
         auto& info = ranks_[rank];
         if (info.state == RankState::OFFLINE) continue;
         if (now - info.last_heartbeat > kHeartbeatTimeout) {
@@ -394,7 +387,7 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
         }
 
         auto& view = it->second;
-        auto& member = view.members[req.rank];
+        auto& member = view.member(req.rank);
         member.agent_session_epoch = req.agent_session_epoch;
         member.endpoint_epoch = ep.endpoint_epoch;
         member.endpoint_info = ep.endpoint_info;
@@ -404,9 +397,7 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
                 // Group already activated -> push best-effort view update.
                 view.epoch++;
                 result.effects.push_back(
-                    ViewUpdateEffect{view,
-                                     {},
-                                     BootstrapAckRoute{}});
+                    ViewUpdateEffect{view, {}, BootstrapAckRoute{}});
             }
         }
     }
@@ -433,26 +424,63 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
         reporter.link_status.resize(max_world_size_, 0);
     }
 
-    auto bitAt = [](const std::vector<uint8_t>& bits, int idx) -> bool {
-        return idx >= 0 && static_cast<size_t>(idx) < bits.size() &&
-               bits[idx] != 0;
-    };
-
-    for (int j = 0; j < max_world_size_; ++j) {
-        if (!bitAt(req.attempted_ranks, j)) continue;
-        if (bitAt(req.succeeded_ranks, j)) reporter.link_status[j] = 1;
-        if (bitAt(req.failed_ranks, j)) reporter.link_status[j] = 0;
+    for (GlobalRank peer : globalRankRange(max_world_size_)) {
+        if (!req.attempted_ranks[peer]) continue;
+        if (req.succeeded_ranks[peer]) reporter.link_status[peer] = 1;
+        if (req.failed_ranks[peer]) {
+            reporter.link_status[peer] = 0;
+            // When a transfer observation reports peer P as failed, P is
+            // likely dead.  Clear P's entire link_status to prevent stale
+            // data from P (collected before it died) from keeping P in the
+            // max-clique healthy set.  P keeps self=1 so it can recover if
+            // it comes back.
+            if (rankInValidRange(peer) &&
+                ranks_[peer].state != RankState::OFFLINE) {
+                ranks_[peer].link_status.assign(max_world_size_, 0);
+                ranks_[peer].link_status[peer] = 1;
+                LOG(INFO) << "[COORD] handleTransferObservation cleared "
+                          << "link_status for failed peer=" << peer;
+            }
+        }
     }
 
-    LOG(INFO) << "[COORD] handleTransferObservation reporter=" << req.reporter_rank
-              << " link_status=";
-    for (int j = 0; j < max_world_size_; ++j) {
-        LOG(INFO) << "[COORD]   peer=" << j << " status=" << (int)reporter.link_status[j];
+    LOG(INFO) << "[COORD] handleTransferObservation reporter="
+              << req.reporter_rank << " link_status=";
+    for (GlobalRank peer{0}; peer < max_world_size_; ++peer) {
+        LOG(INFO) << "[COORD]   peer=" << peer
+                  << " status=" << (int)reporter.link_status[peer];
     }
 
     // Recompute authoritative health
     updateRankHealth(result.effects);
 
+    return result;
+}
+
+// handleLinkStateChange - per-peer link state change from LinkManager events
+
+CoordinatorApplyResult<void>
+CentralizedCoordinatorStateMachine::handleLinkStateChange(
+    const LinkStateChangeReport& req) {
+    CoordinatorApplyResult<void> result;
+    if (!rankInValidRange(req.reporter_rank)) return result;
+    if (!rankInValidRange(req.peer)) return result;
+    auto& reporter = ranks_[req.reporter_rank];
+
+    if (reporter.agent_session_epoch != req.agent_session_epoch)
+        return result;  // stale reporter
+
+    if (reporter.link_status.size() != static_cast<size_t>(max_world_size_)) {
+        reporter.link_status.resize(max_world_size_, 0);
+    }
+
+    reporter.link_status[req.peer] = req.is_up ? 1 : 0;
+    reporter.link_status[req.reporter_rank] = 1;  // self is always connected
+
+    LOG(INFO) << "[COORD] handleLinkStateChange reporter=" << req.reporter_rank
+              << " peer=" << req.peer << " is_up=" << req.is_up;
+
+    updateRankHealth(result.effects);
     return result;
 }
 
@@ -485,7 +513,7 @@ CentralizedCoordinatorStateMachine::handleLeaveGroup(
     }
 
     auto& view = it->second;
-    auto& member = view.members[req.rank];
+    auto& member = view.member(req.rank);
     if (member.hasLeft()) {
         LOG(INFO) << "[COORD] leaveGroup rank=" << req.rank
                   << " group=" << req.group_id << " ignored: already left";
@@ -517,20 +545,18 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
 
     // Clear this rank's connectivity from all peers.
     for (auto& peer : ranks_) {
-        if (peer.link_status.size() > static_cast<size_t>(rank))
-            peer.link_status[rank] = 0;
+        if (peer.link_status.hasIndex(rank)) peer.link_status[rank] = 0;
     }
 
     // Mark the failed rank as inactive in every group it still belongs to.
     std::vector<GroupId> groups_to_erase;
     for (auto& [group_id, view] : group_views_) {
         if (!rankInValidRange(rank)) continue;
-        auto& member = view.members[rank];
+        auto& member = view.member(rank);
         if (member.status == GroupMemberStatus::kActive) {
             member.status = GroupMemberStatus::kInactive;
             view.epoch++;
-            effects.push_back(ViewUpdateEffect{
-                view, {}, BootstrapAckRoute{}});
+            effects.push_back(ViewUpdateEffect{view, {}, BootstrapAckRoute{}});
         }
         if (canEraseGroup(view)) {
             groups_to_erase.push_back(group_id);
@@ -558,9 +584,9 @@ bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
     if (ranks_[a].state == RankState::OFFLINE ||
         ranks_[b].state == RankState::OFFLINE)
         return false;
-    return ranks_[a].link_status.size() > static_cast<size_t>(b) &&
-           ranks_[b].link_status.size() > static_cast<size_t>(a) &&
-           ranks_[a].link_status[b] != 0 && ranks_[b].link_status[a] != 0;
+    return ranks_[a].link_status.hasIndex(b) &&
+           ranks_[b].link_status.hasIndex(a) && ranks_[a].link_status[b] != 0 &&
+           ranks_[b].link_status[a] != 0;
 }
 
 // Find the largest all-to-all mutually connected set of ranks.
@@ -573,7 +599,7 @@ bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
 std::vector<GlobalRank> CentralizedCoordinatorStateMachine::findHealthySet()
     const {
     std::vector<GlobalRank> candidates;
-    for (int i = 0; i < max_world_size_; ++i) {
+    for (GlobalRank i{0}; i < max_world_size_; ++i) {
         if (ranks_[i].state != RankState::OFFLINE) {
             candidates.push_back(i);
         }
@@ -653,8 +679,28 @@ void CentralizedCoordinatorStateMachine::updateRankHealth(
     std::vector<CoordinatorEffect>& effects) {
     auto healthy_set = findHealthySet();
 
+    // Debug: show all rank link_status and healthy_set
+    {
+        std::ostringstream oss;
+        oss << "[COORD] updateRankHealth healthy_set={";
+        for (size_t i = 0; i < healthy_set.size(); ++i) {
+            if (i > 0) oss << ",";
+            oss << healthy_set[i];
+        }
+        oss << "} link_status_per_rank=";
+        for (GlobalRank r{0}; r < 4 && r < max_world_size_; ++r) {
+            oss << " rank" << r << "=[";
+            for (GlobalRank p{0}; p < 4 && p < max_world_size_; ++p) {
+                if (p > 0) oss << ",";
+                oss << (int)ranks_[r].link_status[p];
+            }
+            oss << "]";
+        }
+        LOG(INFO) << oss.str();
+    }
+
     // 1. Update per-rank HEALTHY / SYNCED state.
-    for (int i = 0; i < max_world_size_; ++i) {
+    for (GlobalRank i{0}; i < max_world_size_; ++i) {
         if (ranks_[i].state == RankState::OFFLINE) continue;
 
         bool in_healthy = std::find(healthy_set.begin(), healthy_set.end(),
@@ -677,12 +723,12 @@ void CentralizedCoordinatorStateMachine::updateRankHealth(
         if (!group_auto_deactivate_[group_id]) continue;
         if (view.status != GroupStatus::Ready) continue;
         bool changed = false;
-        for (int i = 0; i < max_world_size_; ++i) {
-            if (!view.members[i].isActive()) continue;
+        for (GlobalRank i{0}; i < max_world_size_; ++i) {
+            if (!view.member(i).isActive()) continue;
             bool in_healthy = std::find(healthy_set.begin(), healthy_set.end(),
                                         i) != healthy_set.end();
             if (!in_healthy) {
-                view.members[i].status = GroupMemberStatus::kInactive;
+                view.member(i).status = GroupMemberStatus::kInactive;
                 changed = true;
                 LOG(INFO) << "[COORD] auto_deactivate group=" << group_id
                           << " rank=" << i;
@@ -690,10 +736,9 @@ void CentralizedCoordinatorStateMachine::updateRankHealth(
         }
         if (changed) {
             view.epoch++;
-            effects.push_back(ViewUpdateEffect{
-                view, {}, BootstrapAckRoute{}});
-            LOG(INFO) << "[COORD] auto_deactivate view update group=" << group_id
-                      << " epoch=" << view.epoch;
+            effects.push_back(ViewUpdateEffect{view, {}, BootstrapAckRoute{}});
+            LOG(INFO) << "[COORD] auto_deactivate view update group="
+                      << group_id << " epoch=" << view.epoch;
         }
     }
 
@@ -712,13 +757,13 @@ bool CentralizedCoordinatorStateMachine::isActivatableSet(
     const GroupView& old_view) const {
     // Build the future active set: old active ∪ new ranks.
     std::vector<GlobalRank> future_active;
-    for (int i = 0; i < max_world_size_; ++i) {
-        if (old_view.members[i].isActive()) {
+    for (GlobalRank i{0}; i < max_world_size_; ++i) {
+        if (old_view.member(i).isActive()) {
             future_active.push_back(i);
         }
     }
     for (GlobalRank r : new_ranks) {
-        if (!old_view.members[r].isActive()) {
+        if (!old_view.member(r).isActive()) {
             future_active.push_back(r);
         }
     }
@@ -746,7 +791,7 @@ bool CentralizedCoordinatorStateMachine::isRankActivatable(
     auto group = group_views_.find(group_id);
     if (group == group_views_.end()) return false;
 
-    const auto& member = group->second.members[rank];
+    const auto& member = group->second.member(rank);
     return (member.status == GroupMemberStatus::kActive ||
             member.status == GroupMemberStatus::kInactive) &&
            member.endpoint_epoch != kInvalidEpoch &&
@@ -769,8 +814,8 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
             // Collect all active ranks.
             std::vector<GlobalRank> peer_ranks;
             bool has_any_active = false;
-            for (int i = 0; i < max_world_size_; ++i) {
-                if (!view.members[i].isActive()) continue;
+            for (GlobalRank i{0}; i < max_world_size_; ++i) {
+                if (!view.member(i).isActive()) continue;
                 has_any_active = true;
                 peer_ranks.push_back(i);
             }
@@ -795,8 +840,8 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                     std::unordered_set<GlobalRank>(acks_needed.begin(),
                                                    acks_needed.end());
 
-                effects.push_back(ViewUpdateEffect{view, acks_needed,
-                                                   BootstrapAckRoute{}});
+                effects.push_back(
+                    ViewUpdateEffect{view, acks_needed, BootstrapAckRoute{}});
                 LOG(INFO) << "[COORD] group=" << group_id
                           << " transitioned to BootstrapSyncing epoch="
                           << view.epoch;
@@ -814,9 +859,8 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                 view.status = GroupStatus::Ready;
                 view.epoch++;
                 pending_bootstrap_acks_.erase(it);
-                effects.push_back(ViewUpdateEffect{view,
-                                                   {},
-                                                   BootstrapAckRoute{}});
+                effects.push_back(
+                    ViewUpdateEffect{view, {}, BootstrapAckRoute{}});
                 LOG(INFO) << "[COORD] group=" << group_id
                           << " transitioned to Ready epoch=" << view.epoch;
             }
@@ -827,8 +871,7 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
 // Private: joinGroup
 
 bool CentralizedCoordinatorStateMachine::joinGroup(
-    const GroupView& group, bool auto_deactivate,
-    JoinGroupResponse& response) {
+    const GroupView& group, bool auto_deactivate, JoinGroupResponse& response) {
     GroupId group_id = group.group_id;
 
     // Validate rank_order elements.
@@ -860,7 +903,7 @@ bool CentralizedCoordinatorStateMachine::joinGroup(
         view.rank_order = group.rank_order;
         view.members.resize(max_world_size_);
         for (GlobalRank r : group.rank_order) {
-            view.members[r].status = GroupMemberStatus::kActive;
+            view.member(r).status = GroupMemberStatus::kActive;
         }
         view.status = GroupStatus::Bootstrapping;
         group_views_[group_id] = std::move(view);
@@ -880,7 +923,7 @@ bool CentralizedCoordinatorStateMachine::joinGroup(
         return false;
     }
 
-    for (size_t i = 0; i < new_order.size(); ++i) {
+    for (InGroupRank i : new_order.indices()) {
         if (new_order[i] != existing_order[i]) {
             response.success = false;
             response.reject_reason =
@@ -936,10 +979,10 @@ CentralizedCoordinatorStateMachine::computeRequiredViewAcks(
     // This ensures newly-activated ranks have received the view, and
     // deactivated ranks know they're removed.
     std::set<GlobalRank> required;
-    for (int i = 0; i < max_world_size_; ++i) {
+    for (GlobalRank i{0}; i < max_world_size_; ++i) {
         if (i == proposer) continue;
         if (ranks_[i].state == RankState::OFFLINE) continue;
-        if (old_view.members[i].isActive() || new_view.members[i].isActive()) {
+        if (old_view.member(i).isActive() || new_view.member(i).isActive()) {
             required.insert(i);
         }
     }
@@ -954,8 +997,8 @@ RegisterResponse CentralizedCoordinatorStateMachine::buildRegisterResponse(
 
     // All rank states.
     resp.all_rank_states.resize(max_world_size_);
-    for (int i = 0; i < max_world_size_; ++i) {
-        resp.all_rank_states[i] = static_cast<uint8_t>(ranks_[i].state);
+    for (GlobalRank i : globalRankRange(max_world_size_)) {
+        resp.all_rank_states[i] = ranks_[i].state;
     }
 
     // All groups (view includes rank_order and member state).
@@ -964,7 +1007,7 @@ RegisterResponse CentralizedCoordinatorStateMachine::buildRegisterResponse(
     }
 
     // All rank connection metadata (for LinkManager).
-    for (int i = 0; i < max_world_size_; ++i) {
+    for (GlobalRank i : globalRankRange(max_world_size_)) {
         if (i == for_rank) continue;
         if (ranks_[i].state == RankState::OFFLINE) continue;
 

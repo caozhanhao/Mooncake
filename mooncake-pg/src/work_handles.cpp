@@ -15,18 +15,16 @@ FailedRanks FailedRanks::allocate(int n, bool isCpu) {
     auto alloc_mapped = [n](at::Tensor& tensor, int*& host_ptr, int*& dev_ptr) {
         cudaError_t err =
             cudaHostAlloc(&host_ptr, n * sizeof(int), cudaHostAllocMapped);
-        TORCH_CHECK(err == cudaSuccess, "cudaHostAlloc failed: ",
-                    cudaGetErrorString(err));
+        TORCH_CHECK(err == cudaSuccess,
+                    "cudaHostAlloc failed: ", cudaGetErrorString(err));
         err = cudaHostGetDevicePointer(reinterpret_cast<void**>(&dev_ptr),
                                        host_ptr, 0);
-        TORCH_CHECK(err == cudaSuccess,
-                    "cudaHostGetDevicePointer failed: ",
+        TORCH_CHECK(err == cudaSuccess, "cudaHostGetDevicePointer failed: ",
                     cudaGetErrorString(err));
         std::memset(host_ptr, 0, n * sizeof(int));
         auto deleter = [](void* ptr) { cudaFreeHost(ptr); };
-        tensor = torch::from_blob(
-            host_ptr, {n}, deleter,
-            torch::TensorOptions().dtype(torch::kInt32));
+        tensor = torch::from_blob(host_ptr, {n}, deleter,
+                                  torch::TensorOptions().dtype(torch::kInt32));
     };
 
     at::Tensor failed_tensor;
