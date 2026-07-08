@@ -1010,25 +1010,29 @@ bool CentralizedCoordinatorStateMachine::joinGroup(
         return true;
     }
 
-    // Group already exists -> validate rank_order prefix.
+    // Group already exists -> validate that the new rank_order is compatible
+    // with the existing one.  The first backend to declare the group sets the
+    // initial rank_order; later backends must agree on all overlapping
+    // positions.  rank_order extension and member activation are handled
+    // exclusively through proposeViewUpdate (activate_rank / recover_ranks).
     const auto& existing_order = group_views_[group_id].rank_order;
     const auto& new_order = group.rank_order;
 
-    if (new_order.size() > existing_order.size()) {
-        response.success = false;
-        response.reject_reason =
-            "new rank_order is longer than existing (must be a prefix)";
-        return false;
-    }
-
-    for (InGroupRank i : new_order.indices()) {
+    auto common_len = std::min(existing_order.size(), new_order.size());
+    for (InGroupRank i{0}; i < static_cast<int32_t>(common_len); ++i) {
         if (new_order[i] != existing_order[i]) {
             response.success = false;
             response.reject_reason =
-                "new rank_order is not a prefix of existing rank_order";
+                "rank_order mismatch at position " + std::to_string(i.value);
             return false;
         }
     }
+
+    // Note: if new_order is longer than existing_order, the extra ranks are
+    // not activated here.  They must be activated via a subsequent
+    // proposeViewUpdate (activate_rank / recover_ranks) from an existing
+    // active member.  Until then, the extension backend operates in local-only
+    // mode (its own rank is masked out of collectives by activeRanks).
 
     response.success = true;
     return true;
@@ -1064,7 +1068,6 @@ void CentralizedCoordinatorStateMachine::eraseGroup(
         }
     }
 
-    group_views_.erase(group_id);
     group_views_.erase(group_id);
     group_auto_deactivate_.erase(group_id);
 }

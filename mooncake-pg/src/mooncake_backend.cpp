@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <memory>
+#include "control_plane/types.h"
 #include "memory_location.h"
 #include "mooncake_worker.cuh"
 #include "pg_utils.h"
@@ -1017,10 +1018,6 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
 }
 
 void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
-    // Deprecated: replaced by Agent::proposeActivate.  This is a no-op
-    // stub kept for API compatibility - it now just calls activateRank.
-    LOG(WARNING) << "MooncakeBackend::recoverRanks is deprecated; "
-                 << "calling activateRank instead.";
     activateRank(ranks);
 }
 
@@ -1055,11 +1052,14 @@ ProposeViewUpdateResponse MooncakeBackend::deactivateRank(
 }
 
 void MooncakeBackend::joinGroup() {
-    // Deprecated: in the Coordinator-based path, the Agent handles all
-    // registration and group-join logic at construction time.  This is
-    // a no-op stub kept for API compatibility.
-    LOG(WARNING) << "MooncakeBackend::joinGroup is deprecated; "
-                 << "groups are auto-registered by Agent during construction.";
+    TORCH_CHECK(options_ && options_->isExtension_,
+                "joinGroup is only valid for extension backends.");
+
+    // Block until the Coordinator activates this rank in the group.
+    agent_.waitUntilRankActive(meta_->group_id, GlobalRank{meta_->globalRank},
+                               std::chrono::seconds(30));
+    LOG(INFO) << "[BACKEND] joinGroup rank=" << meta_->globalRank
+              << " group=" << meta_->group_id << " activated";
 }
 
 void MooncakeBackend::applyViewChange(const GroupView& view) {

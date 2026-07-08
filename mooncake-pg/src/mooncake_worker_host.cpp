@@ -204,10 +204,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         processNextChunk;
 
     int* failedRanksPtr = failed_ranks.data();
+    int* attemptedRanksPtr = failed_ranks.attemptedData();
 
     *processNextChunk = [this, weakProcessNextChunk, state, opType, tensorSize,
                          chunkSize, broadcastRoot, meta, tensorToBuffer,
-                         bufferToTensor, future, failedRanksPtr]() {
+                         bufferToTensor, future, failedRanksPtr,
+                         attemptedRanksPtr]() {
         auto processNextChunk = weakProcessNextChunk.lock();
 
         if (state->currentPos >= tensorSize) {
@@ -227,6 +229,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         tasks_[taskId].bufferOffset = bufferOffset;
         tasks_[taskId].transferGroupMeta = meta.get();
         tasks_[taskId].failedRanksHost = failedRanksPtr;
+        tasks_[taskId].attemptedRanksHost = attemptedRanksPtr;
         tensorToBuffer((void*)meta->segmentInfos[meta->globalRank]
                            .send_buffer[bufferOffset],
                        state->currentPos, realSize);

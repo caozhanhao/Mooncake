@@ -68,8 +68,7 @@ class AgentStateMachine {
     };
     std::unordered_map<GroupId, GroupEntry> groups_;
 
-    // Per-GlobalRank state caches.  IndexedVector prevents accidental indexing
-    // with InGroupRank or a raw int.
+    // Per-GlobalRank state caches.
     IndexedVector<RankState, GlobalRankTag> global_rank_states_{kMaxNumRanks};
     IndexedVector<uint8_t, GlobalRankTag> link_connected_{kMaxNumRanks};
     IndexedVector<uint8_t, GlobalRankTag> last_reported_peer_status_{

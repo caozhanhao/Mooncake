@@ -32,10 +32,10 @@ class MooncakeBackend;
 // Each rank runs one AgentHost.  It owns the AgentStateMachine (pure state
 // machine) and drives it via a SerializedExecutor.
 //
-//   MooncakeBackend                  AgentHost
+//     MooncakeBackend                         AgentHost
 //   +-----------------+              +---------------------------+
 //   | proposeActivate |-> (sync) --->| call Coordinator RPC      |
-//   | joinGroup   |-> post() --->| agent_.joinGroup()    |
+//   | joinGroup       |-> post() --->| agent_.joinGroup()        |
 //   | pushObservation |-> enqueue -->| observation_queue_        |
 //   +-----------------+              +---------------------------+
 //                                            |
@@ -65,7 +65,7 @@ class MooncakeBackend;
 // The Agent never makes autonomous decisions about health or membership.
 // It strictly follows the Coordinator's authoritative broadcasts.
 
-// AgentInterface  - control-plane service interface exposed to MooncakeBackend.
+// AgentInterface - control-plane service interface exposed to MooncakeBackend.
 class AgentInterface {
    public:
     virtual ~AgentInterface() = default;
@@ -74,6 +74,9 @@ class AgentInterface {
 
     virtual GroupView waitUntilGroupReady(
         GroupId group_id, std::chrono::milliseconds timeout) = 0;
+
+    virtual void waitUntilRankActive(GroupId group_id, GlobalRank rank,
+                                     std::chrono::milliseconds timeout) = 0;
 
     virtual void joinGroup(const GroupView& group, bool auto_deactivate,
                            c10::intrusive_ptr<MooncakeBackend> backend) = 0;
@@ -132,6 +135,8 @@ class AgentHost : public AgentInterface {
     bool waitUntilRegistered(std::chrono::milliseconds timeout) override;
     GroupView waitUntilGroupReady(GroupId group_id,
                                   std::chrono::milliseconds timeout) override;
+    void waitUntilRankActive(GroupId group_id, GlobalRank rank,
+                             std::chrono::milliseconds timeout) override;
 
     void joinGroup(const GroupView& group, bool auto_deactivate,
                    c10::intrusive_ptr<MooncakeBackend> backend) override;
@@ -190,12 +195,17 @@ class AgentHost : public AgentInterface {
                        std::vector<std::shared_ptr<std::promise<GroupView>>>>
         group_ready_promises_;
 
-    // Backend registry: for view application and link reset fanout.
+    // rank_active_promises_[group_id][rank] is fulfilled when a ViewUpdate
+    // push activates `rank` in `group_id`.  Used by extension/replacement
+    // ranks to block in joinGroup() until recover_ranks activates them.
+    std::unordered_map<
+        GroupId,
+        std::unordered_map<GlobalRank,
+                           std::vector<std::shared_ptr<std::promise<void>>>>>
+        rank_active_promises_;
+
+    // Backend registry: for view application and link reset.
     // Accessed only from the executor thread.
-    // Store strong (intrusive_ptr) references so the Backend stays reachable
-    // even when its only other strong reference is held by the PyTorch
-    // ProcessGroup system.  Weak references (weak_intrusive_ptr) cannot be
-    // locked when created via unsafe_reclaim_from_nonowning.
     std::unordered_map<GroupId, c10::intrusive_ptr<MooncakeBackend>> backends_;
 
     // Transfer observation queue: worker thread -> executor.
@@ -211,24 +221,15 @@ class AgentHost : public AgentInterface {
     void runEffects(const AgentApplyResult& effects);
     template <typename F>
     void forEachBackend(F&& func) {
-        for (auto it = backends_.begin(); it != backends_.end();) {
-            auto backend = it->second;
-            if (!backend) {
-                it = backends_.erase(it);
-                continue;
-            }
+        for (auto& [group_id, backend] : backends_) {
             func(backend);
-            ++it;
         }
     }
     template <typename F>
-    void forGivenBackend(GroupId group_id, F&& func) {
+    void withBackend(GroupId group_id, F&& func) {
         auto it = backends_.find(group_id);
         if (it != backends_.end()) {
-            auto backend = it->second;
-            if (backend) {
-                func(backend);
-            }
+            func(it->second);
         }
     }
 };

@@ -174,6 +174,40 @@ GroupView AgentHost::waitUntilGroupReady(GroupId group_id,
     return future.get();
 }
 
+void AgentHost::waitUntilRankActive(GroupId group_id, GlobalRank rank,
+                                    std::chrono::milliseconds timeout) {
+    auto promise = std::make_shared<std::promise<void>>();
+    auto future = promise->get_future();
+
+    executor_.post([this, group_id, rank, promise]() {
+        auto view = agent_.getGroupView(group_id);
+        if (view.member(rank).isActive()) {
+            promise->set_value();
+        } else {
+            rank_active_promises_[group_id][rank].push_back(promise);
+        }
+    });
+
+    if (future.wait_for(timeout) != std::future_status::ready) {
+        executor_.post([this, group_id, rank, promise]() {
+            auto it = rank_active_promises_.find(group_id);
+            if (it != rank_active_promises_.end()) {
+                auto rit = it->second.find(rank);
+                if (rit != it->second.end()) {
+                    auto& vec = rit->second;
+                    vec.erase(std::remove(vec.begin(), vec.end(), promise),
+                              vec.end());
+                    if (vec.empty()) it->second.erase(rit);
+                }
+                if (it->second.empty()) rank_active_promises_.erase(it);
+            }
+        });
+        throw std::runtime_error("waitUntilRankActive timed out for rank " +
+                                 std::to_string(rank.value) + " in group " +
+                                 std::to_string(group_id));
+    }
+}
+
 // Agent interface: Group management
 
 void AgentHost::doJoinGroup(GroupView group, bool auto_deactivate,
@@ -314,8 +348,22 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
     LOG(INFO) << "[AGENT] postViewUpdate rank=" << rank_
               << " group=" << group_id << " epoch=" << epoch
               << " status=" << static_cast<int>(push.view.status);
+
     executor_.post([this, ctx = std::move(ctx), push = std::move(push),
                     group_id, epoch]() mutable {
+        // Snapshot ranks that transition from inactive -> active in this
+        // update. Must be done on the executor thread because it reads
+        // agent_.groups_, which is only safe to access from the executor.
+        auto old_view = agent_.getGroupView(group_id);
+        std::vector<GlobalRank> newly_activated;
+        for (InGroupRank i : push.view.rank_order.indices()) {
+            GlobalRank gr = push.view.globalRank(i);
+            if (!old_view.member(gr).isActive() &&
+                push.view.member(gr).isActive()) {
+                newly_activated.push_back(gr);
+            }
+        }
+
         runEffects(agent_.handleViewUpdate(push));
 
         // Wake up waitUntilGroupReady callers when group reaches Ready status.
@@ -326,6 +374,21 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                     p->set_value(push.view);
                 }
                 group_ready_promises_.erase(it);
+            }
+        }
+
+        // Wake up waitUntilRankActive callers for newly activated ranks.
+        for (GlobalRank gr : newly_activated) {
+            auto it = rank_active_promises_.find(group_id);
+            if (it != rank_active_promises_.end()) {
+                auto rit = it->second.find(gr);
+                if (rit != it->second.end()) {
+                    for (auto& p : rit->second) {
+                        p->set_value();
+                    }
+                    it->second.erase(rit);
+                }
+                if (it->second.empty()) rank_active_promises_.erase(it);
             }
         }
 
@@ -450,7 +513,6 @@ void AgentHost::tick() {
     if (agent_.getCoordinatorConnection() ==
         AgentStateMachine::CoordinatorConnection::Disconnected) {
         if (rpc_client_->tryReconnect(coordinator_addr_)) {
-            agent_.setCoordinatorRegistering();
             startRegisterRpc();
         }
         return;
@@ -520,12 +582,12 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                     link_manager_.setRankStates(e.states);
                 },
                 [this](const ApplyViewToBackend& e) {
-                    forGivenBackend(e.group_id, [&](auto backend) {
+                    withBackend(e.group_id, [&](auto backend) {
                         backend->applyViewChange(e.view);
                     });
                 },
                 [this](const MarkBackendViewStale& e) {
-                    forGivenBackend(e.group_id, [&](auto backend) {
+                    withBackend(e.group_id, [&](auto backend) {
                         backend->markViewStale();
                     });
                 },
