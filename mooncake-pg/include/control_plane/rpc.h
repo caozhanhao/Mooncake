@@ -116,6 +116,7 @@ struct TransferObservationReport {
     GroupId group_id = 0;
     GlobalRank reporter_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
+    uint64_t epoch = 0;  // GroupView::epoch observed by the reporter
     IndexedVector<uint8_t, GlobalRankTag> attempted_ranks;
     IndexedVector<uint8_t, GlobalRankTag> failed_ranks;
     IndexedVector<uint8_t, GlobalRankTag> succeeded_ranks;

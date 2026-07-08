@@ -202,13 +202,14 @@ void MooncakeWorker::startWorker() {
                             std::chrono::microseconds>(now - activeTime[i]);
                         for (int j = 0; j < group->size; ++j) {
                             int32_t peer_global = group->rank_order[j];
-                            if (!group->activeRanks[j]) {
-                                continue;
-                            }
                             if (task.failedRanksHost[j]) {
                                 continue;
                             }
-                            if (rankToTaskId[i][j] == kInvalidTaskId) {
+                            // Use the per-op attempted bitmap as the source of
+                            // truth. A peer that was attempted in the data
+                            // phase must be accounted for even if the
+                            // coordinator later deactivates it.
+                            if (!task.attemptedRanksHost[j]) {
                                 continue;
                             }
                             group->engine->getTransferStatus(
@@ -263,7 +264,11 @@ void MooncakeWorker::startWorker() {
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
                         int32_t peer_global = group->rank_order[j];
-                        if (!group->activeRanks[j]) {
+                        // Send the completion signal to every peer that was
+                        // attempted in the data phase, regardless of whether
+                        // the coordinator has since deactivated it. Otherwise a
+                        // late deactivation can hide a failed peer.
+                        if (!task.attemptedRanksHost[j]) {
                             continue;
                         }
                         if (task.failedRanksHost[j]) {
@@ -307,13 +312,24 @@ void MooncakeWorker::startWorker() {
                     TransferStatus status;
                     for (int j = 0; j < group->size; ++j) {
                         int32_t peer_global = group->rank_order[j];
-                        if (!group->activeRanks[j]) {
-                            continue;
-                        }
                         if (task.failedRanksHost[j]) {
                             continue;
                         }
+                        // Only consider peers that were attempted in this op.
+                        if (!task.attemptedRanksHost[j]) {
+                            continue;
+                        }
                         if (rankToTaskId[i][j] == kInvalidTaskId) {
+                            // The peer was attempted in the data-transfer
+                            // phase, but got deactivated before we could send
+                            // the sync signal. Treat it as a failure so the
+                            // control plane can reconcile the group view.
+                            task.failedRanksHost[j] = 1;
+                            LOG(ERROR) << "Rank " << group->globalRank
+                                       << " sync to peer " << j
+                                       << " skipped (peer deactivated before "
+                                          "signal send)"
+                                       << " for op " << (int)task.opType;
                             continue;
                         }
                         group->engine->getTransferStatus(
@@ -350,7 +366,7 @@ void MooncakeWorker::startWorker() {
                     if (task_done) {
                         for (int j = 0; j < group->size; ++j) {
                             int32_t peer_global = group->rank_order[j];
-                            if (!group->activeRanks[j]) continue;
+                            if (!task.attemptedRanksHost[j]) continue;
                             signal_ptr[peer_global] = 0;
                         }
 

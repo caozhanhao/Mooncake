@@ -12,8 +12,9 @@ namespace mooncake {
 // Constructor
 
 CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
-    int max_world_size)
-    : max_world_size_(max_world_size) {
+    int max_world_size, std::chrono::microseconds fault_reconciliation_window)
+    : max_world_size_(max_world_size),
+      fault_reconciliation_window_(fault_reconciliation_window) {
     CHECK_GT(max_world_size_, 0);
     CHECK_LE(max_world_size_, kMaxNumRanks)
         << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
@@ -320,7 +321,8 @@ CentralizedCoordinatorStateMachine::handleBootstrapAck(GroupId group_id,
     return result;
 }
 
-// checkTimeouts  - heartbeat timeout + proposal ACK timeout
+// checkTimeouts  - heartbeat timeout + proposal ACK timeout + fault
+// reconciliation window
 
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::checkTimeouts() {
@@ -353,6 +355,37 @@ CentralizedCoordinatorStateMachine::checkTimeouts() {
         } else {
             ++it;
         }
+    }
+
+    // Fault reconciliation window.  link_status was updated immediately when
+    // each report arrived; now that the window has closed we recompute health,
+    // prune unhealthy members from all auto_deactivate groups, and seal the
+    // epoch for groups that participated in the window so late reports cannot
+    // reopen a decision for the sealed view.
+    if (reconciliation_ctx_.active && now >= reconciliation_ctx_.deadline) {
+        reconciliation_ctx_.active = false;
+        auto groups_to_seal = std::move(reconciliation_ctx_.groups_in_window);
+        reconciliation_ctx_.groups_in_window.clear();
+
+        updateRankStates(result.effects);
+        applyAutoDeactivate(result.effects);
+
+        for (const auto& [group_id, entry_epoch] : groups_to_seal) {
+            auto it = group_views_.find(group_id);
+            if (it == group_views_.end()) continue;
+            GroupView& view = it->second;
+            // If the group's epoch has already moved on (e.g. a concurrent
+            // manual activate/deactivate proposal), do not seal again.
+            if (view.epoch != entry_epoch) continue;
+
+            view.epoch++;
+            result.effects.push_back(
+                ViewUpdateEffect{view, {}, BootstrapAckRoute{}});
+            LOG(INFO) << "[COORD] sealed group=" << group_id
+                      << " epoch=" << view.epoch;
+        }
+
+        checkGroupTransitions(result.effects);
     }
 
     return result;
@@ -408,6 +441,14 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
 }
 
 // transferObservation  - update link_status from data-plane evidence
+//
+// The link_status is updated immediately so subsequent reports and link-state
+// events see the latest connectivity snapshot.  However, the coordinator does
+// NOT recompute the authoritative healthy set here.  Instead it opens (or
+// extends) a fault_reconciliation_window; the membership decision is deferred
+// until the window closes.  This gives multiple survivors time to report the
+// same failure and prevents a single fast reporter from causing a premature
+// auto-deactivation that hides the failure from slower survivors.
 
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleTransferObservation(
@@ -418,6 +459,58 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
 
     if (reporter.agent_session_epoch != req.agent_session_epoch) {
         return result;  // stale reporter
+    }
+
+    // Determine authoritative epoch for the reported group.
+    uint64_t current_epoch = kInvalidEpoch;
+    auto view_it = group_views_.find(req.group_id);
+    if (view_it != group_views_.end()) {
+        current_epoch = view_it->second.epoch;
+    }
+
+    // Drop reports from an epoch that has already been sealed.  This prevents
+    // late observations from reopening a decision for an old group view.
+    if (req.epoch != kInvalidEpoch && req.epoch < current_epoch) {
+        LOG(INFO) << "[COORD] handleTransferObservation dropped stale report"
+                  << " reporter=" << req.reporter_rank
+                  << " group=" << req.group_id << " report_epoch=" << req.epoch
+                  << " current_epoch=" << current_epoch;
+        return result;
+    }
+
+    // Open or extend the fault reconciliation window.  The actual membership
+    // decision is deferred until checkTimeouts() closes the window.  A single
+    // global deadline batches all groups that observe the same physical fault,
+    // but each group records its own entry epoch so that multi-group scenarios
+    // do not suffer from epoch skew.
+    if (!reconciliation_ctx_.active) {
+        reconciliation_ctx_.active = true;
+        reconciliation_ctx_.deadline =
+            std::chrono::steady_clock::now() + fault_reconciliation_window_;
+        reconciliation_ctx_.groups_in_window.clear();
+    }
+
+    // Record the group and the epoch at which it entered the window.  A group's
+    // authoritative epoch must remain constant for the lifetime of the window.
+    // If a concurrent manual proposal advances the epoch while the window is
+    // still open, we adopt the newer epoch so the window can still seal the
+    // current authoritative view.  Reports older than the recorded entry epoch
+    // are dropped as they belong to a view that has already been superseded.
+    auto it = reconciliation_ctx_.groups_in_window.find(req.group_id);
+    if (it == reconciliation_ctx_.groups_in_window.end()) {
+        reconciliation_ctx_.groups_in_window[req.group_id] = req.epoch;
+    } else if (req.epoch > it->second) {
+        LOG(INFO) << "[COORD] handleTransferObservation adopted newer epoch"
+                  << " group=" << req.group_id
+                  << " old_window_epoch=" << it->second
+                  << " new_window_epoch=" << req.epoch;
+        it->second = req.epoch;
+    } else if (req.epoch < it->second) {
+        LOG(INFO) << "[COORD] handleTransferObservation dropped obsolete report"
+                  << " reporter=" << req.reporter_rank
+                  << " group=" << req.group_id << " report_epoch=" << req.epoch
+                  << " window_epoch=" << it->second;
+        return result;
     }
 
     if (reporter.link_status.size() != static_cast<size_t>(max_world_size_)) {
@@ -445,14 +538,12 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
     }
 
     LOG(INFO) << "[COORD] handleTransferObservation reporter="
-              << req.reporter_rank << " link_status=";
+              << req.reporter_rank << " group=" << req.group_id
+              << " epoch=" << req.epoch << " link_status=";
     for (GlobalRank peer{0}; peer < max_world_size_; ++peer) {
         LOG(INFO) << "[COORD]   peer=" << peer
                   << " status=" << (int)reporter.link_status[peer];
     }
-
-    // Recompute authoritative health
-    updateRankHealth(result.effects);
 
     return result;
 }
@@ -480,7 +571,9 @@ CentralizedCoordinatorStateMachine::handleLinkStateChange(
     LOG(INFO) << "[COORD] handleLinkStateChange reporter=" << req.reporter_rank
               << " peer=" << req.peer << " is_up=" << req.is_up;
 
-    updateRankHealth(result.effects);
+    updateRankStates(result.effects);
+    applyAutoDeactivate(result.effects);
+    checkGroupTransitions(result.effects);
     return result;
 }
 
@@ -567,7 +660,9 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
     }
 
     effects.push_back(makeRankStateEffect(rank));
-    updateRankHealth(effects);
+    updateRankStates(effects);
+    applyAutoDeactivate(effects);
+    checkGroupTransitions(effects);
 }
 
 void CentralizedCoordinatorStateMachine::transitionToSynced(
@@ -675,14 +770,14 @@ std::vector<GlobalRank> CentralizedCoordinatorStateMachine::findHealthySet()
     return best;
 }
 
-void CentralizedCoordinatorStateMachine::updateRankHealth(
+void CentralizedCoordinatorStateMachine::updateRankStates(
     std::vector<CoordinatorEffect>& effects) {
     auto healthy_set = findHealthySet();
 
     // Debug: show all rank link_status and healthy_set
     {
         std::ostringstream oss;
-        oss << "[COORD] updateRankHealth healthy_set={";
+        oss << "[COORD] updateRankStates healthy_set={";
         for (size_t i = 0; i < healthy_set.size(); ++i) {
             if (i > 0) oss << ",";
             oss << healthy_set[i];
@@ -699,7 +794,7 @@ void CentralizedCoordinatorStateMachine::updateRankHealth(
         LOG(INFO) << oss.str();
     }
 
-    // 1. Update per-rank HEALTHY / SYNCED state.
+    // Update per-rank HEALTHY / SYNCED state.
     for (GlobalRank i{0}; i < max_world_size_; ++i) {
         if (ranks_[i].state == RankState::OFFLINE) continue;
 
@@ -714,11 +809,16 @@ void CentralizedCoordinatorStateMachine::updateRankHealth(
             effects.push_back(makeRankStateEffect(i));
         }
     }
+}
 
-    // 2. For auto_deactivate groups, remove unhealthy ranks from the active
-    //    set. However, during bootstrap / BootstrapSyncing we do NOT do this:
-    //    we wait for full mutual connectivity and let waitUntilGroupReady()
-    //    time out if a peer is truly dead.
+void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
+    std::vector<CoordinatorEffect>& effects) {
+    auto healthy_set = findHealthySet();
+
+    // For auto_deactivate groups, remove unhealthy ranks from the active set.
+    // However, during bootstrap / BootstrapSyncing we do NOT do this: we wait
+    // for full mutual connectivity and let waitUntilGroupReady() time out if a
+    // peer is truly dead.
     for (auto& [group_id, view] : group_views_) {
         if (!group_auto_deactivate_[group_id]) continue;
         if (view.status != GroupStatus::Ready) continue;
@@ -741,8 +841,6 @@ void CentralizedCoordinatorStateMachine::updateRankHealth(
                       << group_id << " epoch=" << view.epoch;
         }
     }
-
-    checkGroupTransitions(effects);
 }
 
 // Private: activatable predicates

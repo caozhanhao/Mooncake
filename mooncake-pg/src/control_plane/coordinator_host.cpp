@@ -1,5 +1,6 @@
 #include "control_plane/coordinator_host.h"
 
+#include <chrono>
 #include <glog/logging.h>
 
 #include "control_plane/rpc.h"
@@ -54,8 +55,10 @@ void CoordinatorRpcServiceImpl::reportTransferObservation(
 // CoordinatorHost
 
 CoordinatorHost::CoordinatorHost(c10::intrusive_ptr<c10d::Store> store,
-                                 const std::string& host_ip, int max_world_size)
-    : state_machine_(max_world_size),
+                                 const std::string& host_ip, int max_world_size,
+                                 int64_t fault_reconciliation_window_us)
+    : state_machine_(max_world_size,
+                     std::chrono::microseconds(fault_reconciliation_window_us)),
       executor_("CoordinatorHost"),
       store_(std::move(store)),
       host_ip_(host_ip),

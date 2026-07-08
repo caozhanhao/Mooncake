@@ -439,6 +439,8 @@ void AgentHost::tick() {
         for (auto& effect : effects) {
             if (auto* e = std::get_if<SendTransferObservation>(&effect)) {
                 e->request.agent_session_epoch = agent_.getAgentSessionEpoch();
+                e->request.epoch =
+                    agent_.getGroupView(e->request.group_id).epoch;
             }
         }
         runEffects(effects);

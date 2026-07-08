@@ -34,6 +34,7 @@ struct MooncakeProcessContext {
     size_t collective_timeout_us =
         100000;                        // 100 ms (kDefaultCollectiveTimeoutUs)
     int64_t p2p_timeout_us = 3000000;  // 3 s (kDefaultP2PTimeoutUs)
+    int64_t fault_reconciliation_window_us = 50000;  // 50 ms
 
     // === Runtime ===
     // Eagerly created so set_device_filter works before init_process_group.

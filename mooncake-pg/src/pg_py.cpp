@@ -5,6 +5,8 @@
 #include <torch/python.h>
 #include <torch/torch.h>
 
+#include <cstdlib>
+#include <glog/logging.h>
 #include <mutex>
 
 #include "control_plane/agent_host.h"
@@ -16,7 +18,19 @@ namespace mooncake {
 // Process-level context -- definition in mooncake_backend.h.
 static MooncakeProcessContext g_ctx;
 
-MooncakeProcessContext::MooncakeProcessContext() = default;
+MooncakeProcessContext::MooncakeProcessContext() {
+    if (const char* val =
+            std::getenv("MOONCAKE_PG_FAULT_RECONCILIATION_WINDOW_US")) {
+        try {
+            fault_reconciliation_window_us = std::stoll(val);
+        } catch (...) {
+            LOG(WARNING)
+                << "Invalid MOONCAKE_PG_FAULT_RECONCILIATION_WINDOW_US: " << val
+                << ", using default " << fault_reconciliation_window_us
+                << " us";
+        }
+    }
+}
 
 MooncakeProcessContext::~MooncakeProcessContext() {
     // Shutdown AgentHost first so any queued leaveGroup RPCs are drained
@@ -64,7 +78,8 @@ static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
         // Rank 0 hosts the Coordinator in-process.
         if (rank == 0) {
             g_ctx.coordinator_host = std::make_unique<CoordinatorHost>(
-                store, g_ctx.host_ip, max_world_size);
+                store, g_ctx.host_ip, max_world_size,
+                g_ctx.fault_reconciliation_window_us);
             g_ctx.coordinator_host->start();
         }
 
@@ -227,6 +242,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "set_p2p_timeout_us", [](int64_t us) { g_ctx.p2p_timeout_us = us; },
         py::arg("us"), "Set the default P2P transfer timeout (microseconds).");
+    m.def(
+        "set_fault_reconciliation_window_us",
+        [](int64_t us) { g_ctx.fault_reconciliation_window_us = us; },
+        py::arg("us"),
+        "Set the coordinator fault reconciliation window (microseconds).");
     m.def("set_device_filter", [](std::vector<std::string> filters) {
         if (g_ctx.engine) g_ctx.engine->setWhitelistFilters(std::move(filters));
     });

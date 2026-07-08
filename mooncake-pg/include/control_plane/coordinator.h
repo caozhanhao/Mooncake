@@ -62,7 +62,10 @@ class CoordinatorStateMachine {
 // Coordinator state machine.
 class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
    public:
-    explicit CentralizedCoordinatorStateMachine(int max_world_size);
+    explicit CentralizedCoordinatorStateMachine(
+        int max_world_size,
+        std::chrono::microseconds fault_reconciliation_window =
+            std::chrono::microseconds(50000));
 
     CoordinatorApplyResult<RegisterResponse> handleRegister(
         const RegisterRequest& req) override;
@@ -147,6 +150,23 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     std::unordered_map<GroupId, std::unordered_set<GlobalRank>>
         pending_bootstrap_acks_;
 
+    // Fault reconciliation window.  Transfer observations update link_status
+    // immediately, but the coordinator defers the membership decision until
+    // the window closes.  Because link_status is global (per-rank), a single
+    // global deadline is sufficient.  groups_in_window records, for each group
+    // that reported during this window, the GroupView epoch at which it entered
+    // the window; this is used to seal only those groups and to avoid sealing
+    // a group whose view epoch has already moved on (e.g. a concurrent manual
+    // activate/deactivate proposal).
+    struct FaultReconciliationContext {
+        bool active = false;
+        std::chrono::steady_clock::time_point deadline;
+        // group_id -> epoch at which the group entered the window.
+        std::unordered_map<GroupId, uint64_t> groups_in_window;
+    };
+    FaultReconciliationContext reconciliation_ctx_;
+    std::chrono::microseconds fault_reconciliation_window_;
+
     static constexpr auto kProposeTimeout = std::chrono::seconds(2);
     static constexpr auto kHeartbeatTimeout = std::chrono::seconds(5);
 
@@ -154,7 +174,15 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                              std::vector<CoordinatorEffect>& effects);
     void transitionToSynced(GlobalRank rank,
                             std::vector<CoordinatorEffect>& effects);
-    void updateRankHealth(std::vector<CoordinatorEffect>& effects);
+
+    // Recompute the authoritative healthy set (max clique) and update
+    // ranks_[].state between HEALTHY and SYNCED.  Emits rank-state effects.
+    void updateRankStates(std::vector<CoordinatorEffect>& effects);
+
+    // For every auto_deactivate + Ready group, mark active ranks that are not
+    // in the current healthy set as inactive.  Increments view epoch and emits
+    // a ViewUpdate when at least one rank is pruned.
+    void applyAutoDeactivate(std::vector<CoordinatorEffect>& effects);
 
     // Bootstrap state machine driver.  Advances groups through:
     //   Bootstrapping -> BootstrapSyncing (when all active ranks are HEALTHY
