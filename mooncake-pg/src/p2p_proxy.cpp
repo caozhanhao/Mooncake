@@ -335,18 +335,19 @@ void P2PProxy::cleanupFailedRecvOp(RecvOpContext& op_ctx) {
 
 void P2PProxy::handleFailedSendOp(SendOpContext& op_ctx) {
     cleanupFailedSendOp(op_ctx);
-    op_ctx.failed_ranks_[op_ctx.peer_rank_] = 1;
+    op_ctx.failed_ranks_hint_[op_ctx.peer_rank_] = 1;
     // Reset P2P session state (epoch, lanes).
     resetPeerState(op_ctx.peer_rank_);
     // observation bit-vectors are indexed by GlobalRank.
     int32_t peer_global = meta_->rank_order[op_ctx.peer_rank_];
     if (meta_->backend) {
-        IndexedVector<uint8_t, GlobalRankTag> attempted(kMaxNumRanks, 0);
-        IndexedVector<uint8_t, GlobalRankTag> failed(kMaxNumRanks, 0);
-        attempted[GlobalRank{peer_global}] = 1;
-        failed[GlobalRank{peer_global}] = 1;
+        std::vector<uint8_t> attempted(kMaxNumRanks, 0);
+        std::vector<uint8_t> failed(kMaxNumRanks, 0);
+        attempted[peer_global] = 1;
+        failed[peer_global] = 1;
         meta_->backend->getAgent().pushTransferObservation(
-            meta_->group_id, std::move(attempted), std::move(failed), {});
+            meta_->group_id, std::move(attempted), std::move(failed), {},
+            false);
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P SendOp to peer "
@@ -356,18 +357,19 @@ void P2PProxy::handleFailedSendOp(SendOpContext& op_ctx) {
 
 void P2PProxy::handleFailedRecvOp(RecvOpContext& op_ctx) {
     cleanupFailedRecvOp(op_ctx);
-    op_ctx.failed_ranks_[op_ctx.peer_rank_] = 1;
+    op_ctx.failed_ranks_hint_[op_ctx.peer_rank_] = 1;
     // Reset P2P session state (epoch, lanes).
     resetPeerState(op_ctx.peer_rank_);
     // observation bit-vectors are indexed by GlobalRank.
     int32_t peer_global = meta_->rank_order[op_ctx.peer_rank_];
     if (meta_->backend) {
-        IndexedVector<uint8_t, GlobalRankTag> attempted(kMaxNumRanks, 0);
-        IndexedVector<uint8_t, GlobalRankTag> failed(kMaxNumRanks, 0);
-        attempted[GlobalRank{peer_global}] = 1;
-        failed[GlobalRank{peer_global}] = 1;
+        std::vector<uint8_t> attempted(kMaxNumRanks, 0);
+        std::vector<uint8_t> failed(kMaxNumRanks, 0);
+        attempted[peer_global] = 1;
+        failed[peer_global] = 1;
         meta_->backend->getAgent().pushTransferObservation(
-            meta_->group_id, std::move(attempted), std::move(failed), {});
+            meta_->group_id, std::move(attempted), std::move(failed), {},
+            false);
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P RecvOp from peer "
@@ -538,7 +540,7 @@ P2PProxy::SendOpContext::SendOpContext(SendOp&& op_in)
       tensor_(std::move(op_in.tensor_)),
       peer_rank_(op_in.peer_rank_),
       cuda_stream_(op_in.cuda_stream_),
-      failed_ranks_(op_in.failed_ranks_) {
+      failed_ranks_hint_(op_in.failed_ranks_hint_) {
     total_bytes_ =
         tensor_.numel() * static_cast<uint64_t>(tensor_.element_size());
     last_update_time_ = std::chrono::steady_clock::now();
@@ -563,7 +565,7 @@ P2PProxy::RecvOpContext::RecvOpContext(RecvOp&& op_in)
       original_tensor_(std::move(op_in.original_tensor_)),
       peer_rank_(op_in.peer_rank_),
       cuda_stream_(op_in.cuda_stream_),
-      failed_ranks_(op_in.failed_ranks_) {
+      failed_ranks_hint_(op_in.failed_ranks_hint_) {
     total_bytes_ =
         tensor_.numel() * static_cast<uint64_t>(tensor_.element_size());
 }
@@ -580,14 +582,14 @@ AckSlot* P2PProxy::getLocalAckLane(int peer_rank) const {
 
 uint64_t P2PProxy::getRemoteCreditSlot(int peer_rank, uint32_t sequence) const {
     const uint64_t slot_index = sequence % kP2PControlRingSize;
-    return meta_->segmentInfos[meta_->rank_order[peer_rank]].p2p_credit_region +
+    return meta_->segmentInfos[peer_rank].p2p_credit_region +
            (static_cast<uint64_t>(rank_) * kP2PControlRingSize + slot_index) *
                sizeof(CreditSlot);
 }
 
 uint64_t P2PProxy::getRemoteAckSlot(int peer_rank, uint32_t sequence) const {
     const uint64_t slot_index = sequence % kP2PControlRingSize;
-    return meta_->segmentInfos[meta_->rank_order[peer_rank]].p2p_ack_region +
+    return meta_->segmentInfos[peer_rank].p2p_ack_region +
            (static_cast<uint64_t>(rank_) * kP2PControlRingSize + slot_index) *
                sizeof(AckSlot);
 }
@@ -649,15 +651,13 @@ bool P2PProxy::tryIssueRecvTask(RecvOpContext& op_ctx, RecvPeerLane& lane) {
         curr_epoch, seq, reinterpret_cast<uint64_t>(local_addr), chunk_len);
     const BatchID batch_id = engine_->allocateBatchID(1);
     engine_->submitTransfer(
-        batch_id,
-        {TransferRequest{
-            .opcode = TransferRequest::WRITE,
-            .source = static_cast<void*>(credit_staging_buf),
-            .target_id =
-                meta_->segmentIDs[meta_->rank_order[op_ctx.peer_rank_]],
-            .target_offset = remote_credit_offset,
-            .length = sizeof(CreditSlot),
-        }});
+        batch_id, {TransferRequest{
+                      .opcode = TransferRequest::WRITE,
+                      .source = static_cast<void*>(credit_staging_buf),
+                      .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
+                      .target_offset = remote_credit_offset,
+                      .length = sizeof(CreditSlot),
+                  }});
     task.credit_batch_id_ = batch_id;
     task.last_update_time_ = std::chrono::steady_clock::now();
 
@@ -905,15 +905,13 @@ bool P2PProxy::stepSendWriteRemote(SendOpContext& op_ctx,
     if (!task.transfer_batch_id_.has_value()) {
         const BatchID batch_id = engine_->allocateBatchID(1);
         engine_->submitTransfer(
-            batch_id,
-            {TransferRequest{
-                .opcode = TransferRequest::WRITE,
-                .source = task.staging_addr_,
-                .target_id =
-                    meta_->segmentIDs[meta_->rank_order[op_ctx.peer_rank_]],
-                .target_offset = task.remote_addr_,
-                .length = task.chunk_len_,
-            }});
+            batch_id, {TransferRequest{
+                          .opcode = TransferRequest::WRITE,
+                          .source = task.staging_addr_,
+                          .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
+                          .target_offset = task.remote_addr_,
+                          .length = task.chunk_len_,
+                      }});
         task.transfer_batch_id_ = batch_id;
         task.last_update_time_ = std::chrono::steady_clock::now();
         did_work = true;
@@ -955,16 +953,14 @@ bool P2PProxy::stepSendAck(SendOpContext& op_ctx, SendTransferTask& task) {
 
         const BatchID batch_id = engine_->allocateBatchID(1);
         engine_->submitTransfer(
-            batch_id,
-            {TransferRequest{
-                .opcode = TransferRequest::WRITE,
-                .source = static_cast<void*>(ack_staging_buf),
-                .target_id =
-                    meta_->segmentIDs[meta_->rank_order[op_ctx.peer_rank_]],
-                .target_offset =
-                    getRemoteAckSlot(op_ctx.peer_rank_, task.sequence_),
-                .length = sizeof(AckSlot),
-            }});
+            batch_id, {TransferRequest{
+                          .opcode = TransferRequest::WRITE,
+                          .source = static_cast<void*>(ack_staging_buf),
+                          .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
+                          .target_offset = getRemoteAckSlot(op_ctx.peer_rank_,
+                                                            task.sequence_),
+                          .length = sizeof(AckSlot),
+                      }});
         task.ack_batch_id_ = batch_id;
         task.last_update_time_ = std::chrono::steady_clock::now();
         did_work = true;

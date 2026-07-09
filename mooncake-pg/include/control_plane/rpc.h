@@ -38,7 +38,7 @@ struct RankConnectionMetadata {
 struct RegisterResponse {
     bool success = false;
     std::string error_msg;
-    IndexedVector<RankState, GlobalRankTag> all_rank_states;
+    std::vector<RankState> all_rank_states;
     std::vector<GroupView> groups;
     std::vector<RankConnectionMetadata> rank_connections;
 };
@@ -116,10 +116,11 @@ struct TransferObservationReport {
     GroupId group_id = 0;
     GlobalRank reporter_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
-    uint64_t epoch = 0;  // GroupView::epoch observed by the reporter
-    IndexedVector<uint8_t, GlobalRankTag> attempted_ranks;
-    IndexedVector<uint8_t, GlobalRankTag> failed_ranks;
-    IndexedVector<uint8_t, GlobalRankTag> succeeded_ranks;
+    uint64_t epoch = 0;          // GroupView::epoch observed by the reporter
+    bool local_success = false;  // from TransferObservationEvent
+    std::vector<uint8_t> attempted_ranks;
+    std::vector<uint8_t> failed_ranks_hint;
+    std::vector<uint8_t> succeeded_ranks;
 };
 
 // Agent -> Coordinator: per-peer link state change, triggered by LinkManager
@@ -226,7 +227,7 @@ struct DisconnectAllLinks {};
 struct ClearAllPeerMetadata {};
 
 struct PublishRankStateSnapshot {
-    IndexedVector<uint8_t, GlobalRankTag> states;
+    std::vector<uint8_t> states;
 };
 
 struct ApplyViewToBackend {

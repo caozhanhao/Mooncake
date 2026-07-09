@@ -7,7 +7,7 @@
 
 namespace mooncake {
 
-FailedRanks FailedRanks::allocate(int n, bool isCpu) {
+FailedRanksHint FailedRanksHint::allocate(int n, bool isCpu) {
     if (isCpu) {
         return {torch::zeros({n}, torch::kInt32), nullptr,
                 torch::zeros({n}, torch::kInt32), nullptr};
@@ -38,6 +38,25 @@ FailedRanks FailedRanks::allocate(int n, bool isCpu) {
     alloc_mapped(attempted_tensor, attempted_host, attempted_dev);
 
     return {failed_tensor, failed_dev, attempted_tensor, attempted_dev};
+}
+
+bool MooncakeWorkCpu::wait(std::chrono::milliseconds timeout) {
+    future_->wait();
+    bool ok = future_->completed() && !future_->hasError();
+    if (ok) {
+        bool all_ok = true;
+        int* data = failedRanksHint_.data();
+        for (int i = 0; i < meta_->size; ++i) {
+            if (data[i] != 0) {
+                all_ok = false;
+                break;
+            }
+        }
+        failedRanksHint_.local_success = all_ok;
+    } else {
+        failedRanksHint_.local_success = false;
+    }
+    return ok;
 }
 
 bool MooncakeWorkCuda::wait(std::chrono::milliseconds timeout) {
@@ -114,6 +133,18 @@ bool MooncakeWorkCuda::wait(std::chrono::milliseconds timeout) {
     //    is completed (but will not block the CPU)."
     auto current_stream = at::cuda::getCurrentCUDAStream();
     event_->block(current_stream);
+
+    // Compute local_success: true iff no peer failed in this operation.
+    bool all_ok = true;
+    int* data = failedRanksHint_.data();
+    for (int i = 0; i < meta_->size; ++i) {
+        if (data[i] != 0) {
+            all_ok = false;
+            break;
+        }
+    }
+    failedRanksHint_.local_success = all_ok;
+
     return true;
 }
 
@@ -140,14 +171,18 @@ bool MooncakeBarrierWorkCuda::wait(std::chrono::milliseconds timeout) {
     return waiter.wait_for(timeout, [this] { return event_->query(); });
 }
 
-at::Tensor MooncakeWorkCuda::getFailedRanks() const {
-    // Ensure the worker thread has completed the task and set failedRanksHost
-    // before returning the tensor.
+at::Tensor MooncakeWorkCuda::getFailedRanksHint() const {
+    // Ensure the worker thread has completed the task and set
+    // failedRanksHintHost before returning the tensor.
     if (event_ && at::cuda::currentStreamCaptureStatus() ==
                       c10::cuda::CaptureStatus::None) {
         event_->synchronize();
     }
-    return failedRanks_.tensor;
+    return failedRanksHint_.tensor;
+}
+
+bool MooncakeWorkCuda::getLocalSuccess() const {
+    return failedRanksHint_.local_success;
 }
 
 bool MooncakeP2PWork::isCompleted() {

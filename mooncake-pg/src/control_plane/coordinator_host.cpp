@@ -255,7 +255,7 @@ void CoordinatorHost::pushViewUpdate(const ViewUpdateEffect& effect) {
     auto group_id = effect.view.group_id;
     auto ack_route = effect.ack_route;  // capture for ACK routing
 
-    for (GlobalRank i : globalRankRange(max_world_size_)) {
+    for (int32_t i = 0; i < max_world_size_; ++i) {
         const auto& member = effect.view.member(i);
         if (member.status == GroupMemberStatus::kNone ||
             member.status == GroupMemberStatus::kLeft) {

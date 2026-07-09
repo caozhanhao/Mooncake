@@ -120,13 +120,12 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         std::string te_server_name;
         uint64_t agent_session_epoch = 0;
         std::chrono::steady_clock::time_point last_heartbeat;
-        IndexedVector<uint8_t, GlobalRankTag> link_status;
+        std::vector<uint8_t> link_status;
         uint64_t warmup_recv_addr = 0;
     };
 
-    // Per-GlobalRank coordinator state.  IndexedVector prevents accidentally
-    // indexing with InGroupRank or a raw int.
-    IndexedVector<RankInfo, GlobalRankTag> ranks_{kMaxNumRanks};
+    // Per-GlobalRank coordinator state.
+    std::vector<RankInfo> ranks_{static_cast<size_t>(kMaxNumRanks)};
 
     std::unordered_map<GroupId, GroupView> group_views_;
     std::unordered_map<GroupId, bool> group_auto_deactivate_;
@@ -195,10 +194,18 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     bool isMutuallyConnected(GlobalRank a, GlobalRank b) const;
     std::vector<GlobalRank> findHealthySet() const;
 
+    // Preserve existing HEALTHY ranks that are still mutually connected,
+    // then extend with new candidates that have full connectivity to all
+    // current members.  Unlike findHealthySet() (max clique), this never
+    // evicts a healthy rank just because a new clique becomes possible.
+    std::vector<GlobalRank> extendHealthySet() const;
+
     bool canEraseGroup(const GroupView& view) const;
     void eraseGroup(GroupId group_id, std::vector<CoordinatorEffect>& effects);
 
-    bool rankInValidRange(GlobalRank rank) const;
+    bool rankInValidRange(GlobalRank rank) const {
+        return 0 <= rank && rank < max_world_size_;
+    }
     bool isRankActivatable(GroupId group_id, GlobalRank rank,
                            const std::vector<GlobalRank>& peer_ranks) const;
     bool isActivatableSet(GroupId group_id,
@@ -206,7 +213,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                           const GroupView& old_view) const;
 
     bool joinGroup(const GroupView& group, bool auto_deactivate,
-                   JoinGroupResponse& response);
+                   JoinGroupResponse& response,
+                   std::vector<CoordinatorEffect>& effects);
 
     std::vector<GlobalRank> computeRequiredViewAcks(const GroupView& old_view,
                                                     const GroupView& new_view,

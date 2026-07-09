@@ -69,19 +69,21 @@ class AgentStateMachine {
     std::unordered_map<GroupId, GroupEntry> groups_;
 
     // Per-GlobalRank state caches.
-    IndexedVector<RankState, GlobalRankTag> global_rank_states_{kMaxNumRanks};
-    IndexedVector<uint8_t, GlobalRankTag> link_connected_{kMaxNumRanks};
-    IndexedVector<uint8_t, GlobalRankTag> last_reported_peer_status_{
-        kMaxNumRanks};
-    IndexedVector<uint8_t, GlobalRankTag> rank_state_snapshot_{kMaxNumRanks};
-    IndexedVector<std::optional<RankConnectionMetadata>, GlobalRankTag>
-        rank_connections_{kMaxNumRanks};
+    std::vector<RankState> global_rank_states_{
+        static_cast<size_t>(kMaxNumRanks)};
+    std::vector<uint8_t> link_connected_{static_cast<size_t>(kMaxNumRanks)};
+    std::vector<uint8_t> last_reported_peer_status_{
+        static_cast<size_t>(kMaxNumRanks)};
+    std::vector<uint8_t> rank_state_snapshot_{
+        static_cast<size_t>(kMaxNumRanks)};
+    std::vector<std::optional<RankConnectionMetadata>> rank_connections_{
+        static_cast<size_t>(kMaxNumRanks)};
 
     CoordinatorConnection coordinator_connection_ =
         CoordinatorConnection::Disconnected;
 
     bool rankInRange(GlobalRank rank) const {
-        return rank >= 0 && rank < max_world_size_;
+        return 0 <= rank && rank < max_world_size_;
     }
 
     void syncRankStateSnapshot(AgentApplyResult& effects);

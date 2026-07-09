@@ -81,7 +81,7 @@ class LinkManager {
 
     // Publish the Coordinator-authoritative RankState snapshot for all peers.
     // Called by AgentHost from the executor thread.
-    void setRankStates(const IndexedVector<uint8_t, GlobalRankTag>& states);
+    void setRankStates(const std::vector<uint8_t>& states);
 
     // Check whether the TE link to peer is up.  Returns a handle with the
     // remote SegmentID on success.  Does NOT check RankState or endpoint
@@ -103,7 +103,7 @@ class LinkManager {
 
    private:
     bool rankInRange(GlobalRank peer) const {
-        return peer >= 0 && peer < max_world_size_;
+        return 0 <= peer && peer < max_world_size_;
     }
 
     // Resource state (mutex-protected)
@@ -136,7 +136,7 @@ class LinkManager {
             std::chrono::milliseconds(10000);
     };
 
-    IndexedVector<PeerLink, GlobalRankTag> peers_{kMaxNumRanks};
+    std::vector<PeerLink> peers_{static_cast<size_t>(kMaxNumRanks)};
     mutable std::mutex peers_mutex_;
 
     // Worker read model (atomic, lock-free)
@@ -151,7 +151,7 @@ class LinkManager {
             target_id{};  // remote segment handle
     };
 
-    IndexedVector<PeerReadState, GlobalRankTag> read_state_{kMaxNumRanks};
+    std::vector<PeerReadState> read_state_{static_cast<size_t>(kMaxNumRanks)};
 
     // Poller infrastructure
 

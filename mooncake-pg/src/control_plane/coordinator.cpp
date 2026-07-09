@@ -140,7 +140,8 @@ CentralizedCoordinatorStateMachine::handleJoinGroup(
         return result;
     }
 
-    bool ok = joinGroup(req.group, req.auto_deactivate, result.response);
+    bool ok = joinGroup(req.group, req.auto_deactivate, result.response,
+                        result.effects);
     if (!ok) return result;
 
     result.response.success = true;
@@ -517,10 +518,10 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
         reporter.link_status.resize(max_world_size_, 0);
     }
 
-    for (GlobalRank peer : globalRankRange(max_world_size_)) {
+    for (int32_t peer = 0; peer < max_world_size_; ++peer) {
         if (!req.attempted_ranks[peer]) continue;
         if (req.succeeded_ranks[peer]) reporter.link_status[peer] = 1;
-        if (req.failed_ranks[peer]) {
+        if (req.failed_ranks_hint[peer]) {
             reporter.link_status[peer] = 0;
             // When a transfer observation reports peer P as failed, P is
             // likely dead.  Clear P's entire link_status to prevent stale
@@ -638,7 +639,8 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
 
     // Clear this rank's connectivity from all peers.
     for (auto& peer : ranks_) {
-        if (peer.link_status.hasIndex(rank)) peer.link_status[rank] = 0;
+        if (static_cast<size_t>(rank) < peer.link_status.size())
+            peer.link_status[rank] = 0;
     }
 
     // Mark the failed rank as inactive in every group it still belongs to.
@@ -679,9 +681,9 @@ bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
     if (ranks_[a].state == RankState::OFFLINE ||
         ranks_[b].state == RankState::OFFLINE)
         return false;
-    return ranks_[a].link_status.hasIndex(b) &&
-           ranks_[b].link_status.hasIndex(a) && ranks_[a].link_status[b] != 0 &&
-           ranks_[b].link_status[a] != 0;
+    return static_cast<size_t>(b) < ranks_[a].link_status.size() &&
+           static_cast<size_t>(a) < ranks_[b].link_status.size() &&
+           ranks_[a].link_status[b] != 0 && ranks_[b].link_status[a] != 0;
 }
 
 // Find the largest all-to-all mutually connected set of ranks.
@@ -845,11 +847,6 @@ void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
 
 // Private: activatable predicates
 
-bool CentralizedCoordinatorStateMachine::rankInValidRange(
-    GlobalRank rank) const {
-    return rank >= 0 && rank < max_world_size_;
-}
-
 bool CentralizedCoordinatorStateMachine::isActivatableSet(
     GroupId group_id, const std::vector<GlobalRank>& new_ranks,
     const GroupView& old_view) const {
@@ -969,7 +966,8 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
 // Private: joinGroup
 
 bool CentralizedCoordinatorStateMachine::joinGroup(
-    const GroupView& group, bool auto_deactivate, JoinGroupResponse& response) {
+    const GroupView& group, bool auto_deactivate, JoinGroupResponse& response,
+    std::vector<CoordinatorEffect>& effects) {
     GroupId group_id = group.group_id;
 
     // Validate rank_order elements.
@@ -1023,7 +1021,7 @@ bool CentralizedCoordinatorStateMachine::joinGroup(
         if (new_order[i] != existing_order[i]) {
             response.success = false;
             response.reject_reason =
-                "rank_order mismatch at position " + std::to_string(i.value);
+                "rank_order mismatch at position " + std::to_string(i);
             return false;
         }
     }
@@ -1098,7 +1096,7 @@ RegisterResponse CentralizedCoordinatorStateMachine::buildRegisterResponse(
 
     // All rank states.
     resp.all_rank_states.resize(max_world_size_);
-    for (GlobalRank i : globalRankRange(max_world_size_)) {
+    for (int32_t i = 0; i < max_world_size_; ++i) {
         resp.all_rank_states[i] = ranks_[i].state;
     }
 
@@ -1108,7 +1106,7 @@ RegisterResponse CentralizedCoordinatorStateMachine::buildRegisterResponse(
     }
 
     // All rank connection metadata (for LinkManager).
-    for (GlobalRank i : globalRankRange(max_world_size_)) {
+    for (int32_t i = 0; i < max_world_size_; ++i) {
         if (i == for_rank) continue;
         if (ranks_[i].state == RankState::OFFLINE) continue;
 

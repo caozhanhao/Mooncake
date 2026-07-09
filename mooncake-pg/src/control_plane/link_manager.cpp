@@ -205,10 +205,9 @@ void LinkManager::setEventCallback(EventCallback callback) {
     event_callback_ = std::move(callback);
 }
 
-void LinkManager::setRankStates(
-    const IndexedVector<uint8_t, GlobalRankTag>& states) {
-    for (GlobalRank i : states.indices()) {
-        if (i >= max_world_size_) break;
+void LinkManager::setRankStates(const std::vector<uint8_t>& states) {
+    for (size_t i = 0;
+         i < states.size() && i < static_cast<size_t>(max_world_size_); ++i) {
         read_state_[i].rank_state.store(states[i], std::memory_order_release);
     }
 }
@@ -275,7 +274,7 @@ void LinkManager::tearDownPeerLink(GlobalRank peer, bool stop_reconnect) {
 
     // Clear the warmup handshake signal so the next probe doesn't see a
     // stale completion flag from a prior connection cycle.
-    if (warmup_recv_region_) warmup_recv_region_[peer.value] = 0;
+    if (warmup_recv_region_) warmup_recv_region_[peer] = 0;
 
     link.state = PeerLinkState::IDLE;
     if (stop_reconnect) {
@@ -380,7 +379,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
                 // We initiate: write to peer's warmup recv region.
                 auto batch_id = engine_->allocateBatchID(1);
                 uint64_t target_offset =
-                    link.warmup_recv_addr + rank_.value * sizeof(int32_t);
+                    link.warmup_recv_addr + rank_ * sizeof(int32_t);
 
                 engine_->submitTransfer(batch_id,
                                         {TransferRequest{
@@ -426,8 +425,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
                     << " FAILED"
                     << " warmup_recv_addr=" << (void*)link.warmup_recv_addr
                     << " target_offset="
-                    << (void*)(link.warmup_recv_addr +
-                               rank_.value * sizeof(int32_t));
+                    << (void*)(link.warmup_recv_addr + rank_ * sizeof(int32_t));
                 engine_->freeBatchID(link.warmup_batch_id.value());
                 link.warmup_batch_id = std::nullopt;
                 engine_->closeSegment(link.target_id.value());
@@ -448,7 +446,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
             }
 
             if (*reinterpret_cast<volatile int32_t*>(
-                    &warmup_recv_region_[peer.value])) {
+                    &warmup_recv_region_[peer])) {
                 link.state = PeerLinkState::CONNECTED;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
                 publishLinkUp(peer, link.target_id.value());

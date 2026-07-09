@@ -95,10 +95,11 @@ class AgentInterface {
     virtual ProposeViewUpdateResponse proposeDeactivate(
         GroupId group_id, const std::vector<GlobalRank>& ranks) = 0;
 
-    virtual void pushTransferObservation(
-        GroupId group_id, IndexedVector<uint8_t, GlobalRankTag> attempted_ranks,
-        IndexedVector<uint8_t, GlobalRankTag> failed_ranks,
-        IndexedVector<uint8_t, GlobalRankTag> succeeded_ranks) = 0;
+    virtual void pushTransferObservation(GroupId group_id,
+                                         std::vector<uint8_t> attempted_ranks,
+                                         std::vector<uint8_t> failed_ranks_hint,
+                                         std::vector<uint8_t> succeeded_ranks,
+                                         bool local_success) = 0;
 };
 
 class AgentHost;
@@ -153,10 +154,11 @@ class AgentHost : public AgentInterface {
     ProposeViewUpdateResponse proposeDeactivate(
         GroupId group_id, const std::vector<GlobalRank>& ranks) override;
 
-    void pushTransferObservation(
-        GroupId group_id, IndexedVector<uint8_t, GlobalRankTag> attempted_ranks,
-        IndexedVector<uint8_t, GlobalRankTag> failed_ranks,
-        IndexedVector<uint8_t, GlobalRankTag> succeeded_ranks) override;
+    void pushTransferObservation(GroupId group_id,
+                                 std::vector<uint8_t> attempted_ranks,
+                                 std::vector<uint8_t> failed_ranks_hint,
+                                 std::vector<uint8_t> succeeded_ranks,
+                                 bool local_success) override;
 
     void postPeerJoined(PeerJoinedPush push);
     void postRankStateUpdate(RankStateUpdatePush push);

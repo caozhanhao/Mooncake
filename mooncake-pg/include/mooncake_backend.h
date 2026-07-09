@@ -267,9 +267,9 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     void recoverRanks(const std::vector<int>& ranks);
 
     // alias to recoverRanks
-    ProposeViewUpdateResponse activateRank(const std::vector<int>& ranks);
+    ProposeViewUpdateResponse activateRanks(const std::vector<int>& ranks);
 
-    ProposeViewUpdateResponse deactivateRank(const std::vector<int>& ranks);
+    ProposeViewUpdateResponse deactivateRanks(const std::vector<int>& ranks);
 
     void joinGroup();
 
@@ -277,6 +277,13 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // Called by AgentHost from the executor thread when a ViewUpdatePush
     // is received from the Coordinator.
     void applyViewChange(const GroupView& view);
+
+    /// Returns the current GroupView epoch (monotonically increasing).
+    /// Safe to call from any thread. Epoch starts at 0 (bootstrap) and
+    /// increments on membership changes, auto-deactivation, and recovery.
+    uint64_t getCurrentEpoch() const {
+        return meta_ ? meta_->epoch.load(std::memory_order_acquire) : 0;
+    }
 
     // Called by AgentHost when a TE link to `peer` goes down.
     // Resets the per-backend P2PProxy state for the affected peer.
@@ -292,14 +299,36 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // Called by AgentHost after (re-)registration to re-publish endpoints.
     GroupEndpointPublication buildEndpointMetadata() const;
 
+    // Throw if this rank is not yet active in the coordinator view. Collectives
+    // must not be issued before join_group()/recover_ranks() has activated us.
+    void ensureActive() const;
+
     const GroupEndpointInfo& getLocalEndpointInfo() const {
-        return meta_->segmentInfos[meta_->globalRank];
+        return meta_->segmentInfos[meta_->rank];
     }
     AgentInterface& getAgent() { return agent_; }
     MooncakeProcessContext& getProcessContext() { return ctx_; }
     const MooncakeProcessContext& getProcessContext() const { return ctx_; }
 
    private:
+    // Initialization helpers extracted from the constructor.
+    void initGroupParams(int rank, int size,
+                         const std::vector<GlobalRank>& globalRanks);
+    std::string determineMemoryLocation() const;
+    std::vector<GlobalRank> buildInitialRankOrder(
+        int size, const std::vector<GlobalRank>& globalRanks) const;
+    void logBackendInfo(
+        int rank, int size, const std::vector<GlobalRank>& globalRanks,
+        const std::vector<GlobalRank>& initial_rank_order) const;
+    void registerBuffers(const std::string& location);
+    void registerCpuSyncRegions();
+    void initWorkersAndProxy(int rank, int cuda_device_index);
+    void initGroupMeta(int rank, int size,
+                       const std::vector<GlobalRank>& initial_rank_order);
+    void storeLocalEndpointInfo();
+    void joinAndApplyInitialView(std::vector<GlobalRank> initial_rank_order);
+    void registerP2PShim();
+
     MooncakeProcessContext& ctx_;
     std::shared_ptr<MooncakeWorker> worker_;
     const c10::intrusive_ptr<MooncakeBackendOptions> options_;
@@ -313,7 +342,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     bool isShutdown_{false};
     int max_group_size_ =
         0;  // per-group capacity (max active members for this group)
-    std::string localServerName_;
     mutable uint64_t next_endpoint_epoch_ = kInitialEndpointEpoch;
 
     // P2P async infrastructure

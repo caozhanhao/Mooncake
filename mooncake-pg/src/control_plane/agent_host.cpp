@@ -203,7 +203,7 @@ void AgentHost::waitUntilRankActive(GroupId group_id, GlobalRank rank,
             }
         });
         throw std::runtime_error("waitUntilRankActive timed out for rank " +
-                                 std::to_string(rank.value) + " in group " +
+                                 std::to_string(rank) + " in group " +
                                  std::to_string(group_id));
     }
 }
@@ -318,10 +318,11 @@ ProposeViewUpdateResponse AgentHost::proposeDeactivate(
 
 // Agent interface: Transfer observation (thread-safe)
 
-void AgentHost::pushTransferObservation(
-    GroupId group_id, IndexedVector<uint8_t, GlobalRankTag> attempted_ranks,
-    IndexedVector<uint8_t, GlobalRankTag> failed_ranks,
-    IndexedVector<uint8_t, GlobalRankTag> succeeded_ranks) {
+void AgentHost::pushTransferObservation(GroupId group_id,
+                                        std::vector<uint8_t> attempted_ranks,
+                                        std::vector<uint8_t> failed_ranks,
+                                        std::vector<uint8_t> succeeded_ranks,
+                                        bool local_success) {
     observation_queue_.enqueue(TransferObservationEvent{
         group_id, std::move(attempted_ranks), std::move(failed_ranks),
         std::move(succeeded_ranks)});
@@ -356,8 +357,9 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
         // agent_.groups_, which is only safe to access from the executor.
         auto old_view = agent_.getGroupView(group_id);
         std::vector<GlobalRank> newly_activated;
-        for (InGroupRank i : push.view.rank_order.indices()) {
-            GlobalRank gr = push.view.globalRank(i);
+        for (size_t idx = 0; idx < push.view.rank_order.size(); ++idx) {
+            InGroupRank igr = static_cast<InGroupRank>(idx);
+            GlobalRank gr = push.view.globalRank(igr);
             if (!old_view.member(gr).isActive() &&
                 push.view.member(gr).isActive()) {
                 newly_activated.push_back(gr);

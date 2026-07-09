@@ -1,6 +1,8 @@
 #ifndef MOONCAKE_WORKER_CUH
 #define MOONCAKE_WORKER_CUH
 
+#include <atomic>
+
 #if !defined(__MUSA__)
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -33,18 +35,18 @@ static constexpr size_t kBufferSize = 1u << 24;
 class MooncakeBackend;
 
 struct TransferGroupMeta {
-    int rank;  // InGroupRank (PyTorch ProcessGroup rank)
-    int32_t
-        globalRank;  // GlobalRank (index into segmentInfos[] / segmentIDs[])
+    InGroupRank rank;
+    GlobalRank globalRank;
     // rank_order maps InGroupRank (0 .. size-1) to GlobalRank.
-    int32_t rank_order[kMaxNumRanks];
-    int size;  // capacity: number of in-group slots allocated (incl. inactive)
-    int activeSize;  // visible group size: number of in-group slots that
-                     // participate
+    GlobalRank rank_order[kMaxNumRanks];
+
+    int size;        // capacity: number of in-group slots allocated
+    int activeSize;  // Number of in-group slots that is active
     int taskCount;
+
     GroupId group_id = 0;
-    uint64_t epoch = 0;  // GroupView epoch, synced by control plane
-    // activeRanks is indexed by InGroupRank (size = this->size).
+    std::atomic<uint64_t> epoch{0};  // GroupView epoch, synced by control plane
+
     bool* activeRanks;
     bool* activeRanksDevice;
 #if !defined(__MUSA__)
@@ -52,10 +54,11 @@ struct TransferGroupMeta {
         activeRanksTensor;  // length = this->size, ordered by InGroupRank
 #endif
     TransferEngine* engine;
-    // segmentIDs and segmentInfos are indexed by GlobalRank (size
-    // kMaxNumRanks). Collective code that iterates over in-group slots must
-    // translate InGroupRank -> GlobalRank via rank_order before indexing these
-    // arrays. The P2P proxy uses its own peer_rank_ -> GlobalRank translation.
+    // segmentIDs and segmentInfos are indexed by InGroupRank (size
+    // kMaxNumRanks, but only slots 0 .. size-1 are valid). Collective code and
+    // the P2P proxy can index them directly by the local peer's in-group rank.
+    // The segment ID values themselves are global TransferEngine handles,
+    // resolved from the corresponding GlobalRank by the control plane.
     TransferMetadata::SegmentID
         segmentIDs[kMaxNumRanks];  // synced by control plane
     GroupEndpointInfo segmentInfos[kMaxNumRanks];
@@ -76,18 +79,19 @@ __global__
     uint64_t submitSequence = 0;
     BatchID batchID;
     void* transferGroupMeta;
-    int* failedRanksHost = nullptr;     // per-op bitmap indexed by InGroupRank
-    int* attemptedRanksHost = nullptr;  // per-op bitmap indexed by InGroupRank
+    int* failedRanksHintHost = nullptr;  // per-op bitmap indexed by InGroupRank
+    int* attemptedRanksHintHost =
+        nullptr;  // per-op bitmap indexed by InGroupRank
 };
 
 #if !defined(__MUSA__)
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                        int* failedRanks, cudaStream_t stream);
+                        int* failedRanksHint, cudaStream_t stream);
 
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
                      size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                     int* failedRanks);
+                     int* failedRanksHint);
 void preloadReduceKernels();
 
 class MooncakeWorker {
@@ -97,7 +101,8 @@ class MooncakeWorker {
 
     c10::intrusive_ptr<c10d::Work> putTaskCpu(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
-        const std::shared_ptr<TransferGroupMeta>& meta, FailedRanks failedRanks,
+        const std::shared_ptr<TransferGroupMeta>& meta,
+        FailedRanksHint failedRanksHint,
         const std::function<void(void* dst, size_t pos, size_t realSize)>&
             tensorToBuffer,
         const std::function<void(void* src, size_t pos, size_t realSize)>&
@@ -106,7 +111,8 @@ class MooncakeWorker {
     c10::intrusive_ptr<c10d::Work> putTaskCuda(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         const std::shared_ptr<TransferGroupMeta>& meta,
-        const at::cuda::CUDAStream& issue_stream, FailedRanks failedRanks,
+        const at::cuda::CUDAStream& issue_stream,
+        FailedRanksHint failedRanksHint,
         const std::function<void(void* dst, size_t pos, size_t realSize,
                                  const at::cuda::CUDAStream&)>& tensorToBuffer,
         const std::function<void(void* src, size_t pos, size_t realSize,

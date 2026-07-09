@@ -161,8 +161,7 @@ AgentApplyResult AgentStateMachine::applyRegisterResponse(
                      << max_world_size_ << "); truncating.";
     }
     int available_states = static_cast<int>(resp.all_rank_states.size());
-    for (GlobalRank r :
-         globalRankRange(std::min(max_world_size_, available_states))) {
+    for (int32_t r = 0; r < std::min(max_world_size_, available_states); ++r) {
         global_rank_states_[r] = resp.all_rank_states[r];
     }
 
@@ -256,12 +255,12 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
 
     // Bit-vectors are GlobalRank-indexed.  Iterate over the input size and
     // ignore entries beyond our current max_world_size_.
-    for (GlobalRank peer : event.attempted_ranks.indices()) {
+    for (size_t peer = 0; peer < event.attempted_ranks.size(); ++peer) {
         if (peer >= max_world_size_) continue;
         if (!event.attempted_ranks[peer]) continue;
 
         bool succeeded = event.succeeded_ranks[peer];
-        bool failed = event.failed_ranks[peer];
+        bool failed = event.failed_ranks_hint[peer];
 
         // Determine current observation: failed takes precedence.
         bool current = succeeded && !failed;
@@ -271,12 +270,12 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
             // Lazy-init the vectors on first change.
             if (!has_changed) {
                 req.attempted_ranks.assign(max_world_size_, 0);
-                req.failed_ranks.assign(max_world_size_, 0);
+                req.failed_ranks_hint.assign(max_world_size_, 0);
                 req.succeeded_ranks.assign(max_world_size_, 0);
             }
             req.attempted_ranks[peer] = 1;
             req.succeeded_ranks[peer] = current ? 1 : 0;
-            req.failed_ranks[peer] = current ? 0 : 1;
+            req.failed_ranks_hint[peer] = current ? 0 : 1;
             has_changed = true;
         }
     }
@@ -285,11 +284,11 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
         effects.push_back(SendTransferObservation{std::move(req)});
         LOG(INFO) << "[AGENT] processTransferObservation has_changed rank="
                   << rank_ << " attempted=";
-        for (GlobalRank peer : req.attempted_ranks.indices()) {
+        for (size_t peer = 0; peer < req.attempted_ranks.size(); ++peer) {
             if (req.attempted_ranks[peer]) {
                 LOG(INFO) << "[AGENT]   peer=" << peer
                           << " succeeded=" << (int)req.succeeded_ranks[peer]
-                          << " failed=" << (int)req.failed_ranks[peer];
+                          << " failed=" << (int)req.failed_ranks_hint[peer];
             }
         }
     } else {

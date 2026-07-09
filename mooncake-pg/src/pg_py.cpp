@@ -71,8 +71,7 @@ static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
             g_ctx.engine_initialized = true;
         }
         if (!g_ctx.link_manager.isInitialized()) {
-            g_ctx.link_manager.init(GlobalRank{rank}, max_world_size,
-                                    g_ctx.engine);
+            g_ctx.link_manager.init(rank, max_world_size, g_ctx.engine);
         }
 
         // Rank 0 hosts the Coordinator in-process.
@@ -83,9 +82,8 @@ static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
             g_ctx.coordinator_host->start();
         }
 
-        g_ctx.agent_host =
-            std::make_unique<AgentHost>(store, g_ctx.host_ip, GlobalRank{rank},
-                                        max_world_size, g_ctx.link_manager);
+        g_ctx.agent_host = std::make_unique<AgentHost>(
+            store, g_ctx.host_ip, rank, max_world_size, g_ctx.link_manager);
         g_ctx.agent_host->start();
     });
     return *g_ctx.agent_host;
@@ -179,7 +177,7 @@ void deactivateRank(c10::intrusive_ptr<c10d::ProcessGroup> backend,
                     const std::vector<int>& ranks) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    auto resp = mooncakeBackend->deactivateRank(ranks);
+    auto resp = mooncakeBackend->deactivateRanks(ranks);
     if (resp.status == ViewUpdateStatus::Rejected) {
         throw std::runtime_error("deactivate_rank rejected: " +
                                  resp.reject_reason);
@@ -190,7 +188,7 @@ void activateRank(c10::intrusive_ptr<c10d::ProcessGroup> backend,
                   const std::vector<int>& ranks) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    auto resp = mooncakeBackend->activateRank(ranks);
+    auto resp = mooncakeBackend->activateRanks(ranks);
     if (resp.status == ViewUpdateStatus::Rejected) {
         throw std::runtime_error("activate_rank rejected: " +
                                  resp.reject_reason);
@@ -203,31 +201,35 @@ void joinGroup(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     mooncakeBackend->joinGroup();
 }
 
-at::Tensor getFailedRanks(c10::intrusive_ptr<c10d::Work> work) {
+at::Tensor getFailedRanksHint(c10::intrusive_ptr<c10d::Work> work) {
     if (auto* w = dynamic_cast<MooncakeWorkCuda*>(work.get())) {
-        return w->getFailedRanks();
+        return w->getFailedRanksHint();
     }
     if (auto* w = dynamic_cast<MooncakeWorkCpu*>(work.get())) {
-        return w->getFailedRanks();
+        return w->getFailedRanksHint();
     }
     if (auto* w = dynamic_cast<MooncakeP2PWork*>(work.get())) {
-        return w->getFailedRanks();
+        return w->getFailedRanksHint();
     }
     return at::Tensor();
 }
 
 /// Python-facing wrapper that extracts the raw TransferEngine* from a
-/// mooncake.engine.TransferEngine Python object and passes it to
-/// MooncakeBackend::setExternalEngine().  The caller must ensure the
+/// mooncake.engine.TransferEngine Python object and makes it the process-wide
+/// engine for all MooncakeBackend instances.  The caller must ensure the
 /// TransferEnginePy object outlives all MooncakeBackend instances.
 void setTransferEnginePy(pybind11::object engine_obj) {
     if (engine_obj.is_none()) {
         g_ctx.external_engine = nullptr;
+        g_ctx.engine = g_ctx.owned_engine.get();
+        g_ctx.engine_initialized = false;
         return;
     }
     auto get_engine_ptr = engine_obj.attr("get_engine_ptr");
     uintptr_t ptr = get_engine_ptr().cast<uintptr_t>();
     g_ctx.external_engine = reinterpret_cast<TransferEngine*>(ptr);
+    g_ctx.engine = g_ctx.external_engine;
+    g_ctx.engine_initialized = true;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -266,7 +268,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deactivate_rank", &deactivateRank, py::arg("backend"),
           py::arg("ranks"));
     m.def("join_group", &joinGroup);
-    m.def("get_failed_ranks", &getFailedRanks, py::arg("work"));
+    m.def("get_failed_ranks", &getFailedRanksHint, py::arg("work"));
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(
