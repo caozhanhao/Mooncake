@@ -79,7 +79,7 @@ class AgentInterface {
                                      std::chrono::milliseconds timeout) = 0;
 
     virtual void registerGroup(const GroupView& group, bool auto_deactivate,
-                               c10::intrusive_ptr<MooncakeBackend> backend) = 0;
+                               MooncakeBackend* backend) = 0;
 
     virtual void unregisterGroup(GroupId group_id) = 0;
 
@@ -143,7 +143,7 @@ class AgentHost : public AgentInterface {
                              std::chrono::milliseconds timeout) override;
 
     void registerGroup(const GroupView& group, bool auto_deactivate,
-                       c10::intrusive_ptr<MooncakeBackend> backend) override;
+                       MooncakeBackend* backend) override;
     void unregisterGroup(GroupId group_id) override;
     uint64_t getAgentSessionEpoch() override {
         return agent_.getAgentSessionEpoch();
@@ -217,7 +217,10 @@ class AgentHost : public AgentInterface {
 
     // Backend registry: for view application and link reset.
     // Accessed only from the executor thread.
-    std::unordered_map<GroupId, c10::intrusive_ptr<MooncakeBackend>> backends_;
+    // Raw pointers — lifetime is managed by PyTorch's intrusive_ptr;
+    // MooncakeBackend::~MooncakeBackend() ensures the pointer is erased
+    // from this map before the object is destroyed.
+    std::unordered_map<GroupId, MooncakeBackend*> backends_;
 
     // Transfer observation queue: worker thread -> executor.
     ThreadSafeQueue<TransferObservationEvent> observation_queue_;
@@ -226,21 +229,21 @@ class AgentHost : public AgentInterface {
     void tick();
 
     void doRegisterGroup(GroupView group, bool auto_deactivate,
-                         c10::intrusive_ptr<MooncakeBackend> backend);
+                         MooncakeBackend* backend);
     void doPublishLocalEndpoint(GroupEndpointPublication endpoint);
 
     void runEffects(const AgentApplyResult& effects);
     template <typename F>
     void forEachBackend(F&& func) {
         for (auto& [group_id, backend] : backends_) {
-            func(backend);
+            func(backend);  // backend is MooncakeBackend*
         }
     }
     template <typename F>
     void withBackend(GroupId group_id, F&& func) {
         auto it = backends_.find(group_id);
         if (it != backends_.end()) {
-            func(it->second);
+            func(it->second);  // it->second is MooncakeBackend*
         }
     }
 };

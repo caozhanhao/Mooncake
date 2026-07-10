@@ -229,9 +229,9 @@ void AgentHost::waitUntilRankActive(GroupId group_id, GlobalRank rank,
 // Agent interface: Group management
 
 void AgentHost::doRegisterGroup(GroupView group, bool auto_deactivate,
-                                c10::intrusive_ptr<MooncakeBackend> backend) {
+                                MooncakeBackend* backend) {
     auto group_id = group.group_id;
-    backends_.insert_or_assign(group_id, std::move(backend));
+    backends_.insert_or_assign(group_id, backend);
     agent_.registerGroup(group, auto_deactivate);
 
     RegisterGroupRequest req;
@@ -261,15 +261,15 @@ void AgentHost::doRegisterGroup(GroupView group, bool auto_deactivate,
 }
 
 void AgentHost::registerGroup(const GroupView& group, bool auto_deactivate,
-                              c10::intrusive_ptr<MooncakeBackend> backend) {
+                              MooncakeBackend* backend) {
     executor_.postAndWait([this, group = group, auto_deactivate,
-                           backend = std::move(backend)]() mutable {
-        doRegisterGroup(std::move(group), auto_deactivate, std::move(backend));
+                           backend]() mutable {
+        doRegisterGroup(std::move(group), auto_deactivate, backend);
     });
 }
 
 void AgentHost::unregisterGroup(GroupId group_id) {
-    executor_.post([this, group_id]() {
+    executor_.postAndWait([this, group_id]() {
         LOG(INFO) << "[AGENT] unregisterGroup rank=" << rank_
                   << " group=" << group_id;
         agent_.unregisterGroup(group_id);

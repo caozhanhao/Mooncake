@@ -280,10 +280,10 @@ MooncakeBackend::MooncakeBackend(
     }
     bool auto_deactivate = options_ ? options_->autoDeactivateOnFailure_ : true;
 
-    // Register group is synchronous
-    agent_.registerGroup(
-        initial_group, auto_deactivate,
-        c10::intrusive_ptr<MooncakeBackend>::reclaim_copy(this));
+    // Register group is synchronous.  Pass `this` as a raw pointer — the
+    // backend's lifetime is managed by the intrusive_ptr returned from
+    // make_intrusive; backends_ only needs a non-owning lookup key.
+    agent_.registerGroup(initial_group, auto_deactivate, this);
 
     agent_.publishLocalEndpoint(buildEndpointMetadata());
 
@@ -294,7 +294,15 @@ MooncakeBackend::MooncakeBackend(
     LOG(INFO) << "init done";
 }
 
-MooncakeBackend::~MooncakeBackend() { shutdown(); }
+MooncakeBackend::~MooncakeBackend() {
+    shutdown();
+    // Ensure this backend is removed from backends_ before destruction.
+    // Blocks until the executor thread has erased the raw pointer and sent
+    // the unregisterGroup RPC to the Coordinator.
+    if (meta_) {
+        agent_.unregisterGroup(meta_->group_id);
+    }
+}
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 
@@ -914,12 +922,6 @@ void MooncakeBackend::shutdown() {
     // still be reported during shutdown.
     if (meta_) {
         meta_->backend = nullptr;
-    }
-
-    // Notify the Coordinator that this rank has left the group.
-    // Fire-and-forget: do not block on other ranks.
-    if (meta_) {
-        agent_.unregisterGroup(meta_->group_id);
     }
 }
 
