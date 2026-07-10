@@ -250,6 +250,7 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
     TransferObservationReport req;
     req.group_id = event.group_id;
     req.reporter_rank = rank_;
+    req.local_success = event.local_success;
 
     bool has_changed = false;
 

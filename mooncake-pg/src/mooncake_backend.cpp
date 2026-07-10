@@ -278,14 +278,23 @@ MooncakeBackend::MooncakeBackend(
     }
     bool auto_deactivate = options_ ? options_->autoDeactivateOnFailure_ : true;
 
+    LOG(INFO) << "about to agent_.joinGroup";
+    
     // Join group is synchronous
     agent_.joinGroup(initial_group, auto_deactivate,
                      c10::intrusive_ptr<MooncakeBackend>::reclaim_copy(this));
+
+    LOG(INFO) << "agent_.joinGroup done, about to publish ep";
+
     agent_.publishLocalEndpoint(buildEndpointMetadata());
+
+    LOG(INFO) << "ep published, about to waiting group readys";
 
     auto view =
         agent_.waitUntilGroupReady(meta_->group_id, std::chrono::seconds(30));
+
     applyViewChange(view);
+    LOG(INFO) << "init done";
 }
 
 MooncakeBackend::~MooncakeBackend() { shutdown(); }
@@ -922,20 +931,17 @@ void MooncakeBackend::syncActiveRanksTensor() {
         active_ranks[i] = meta_->activeRanks[i] ? 1 : 0;
     }
 
+    // Always keep activeRanksTensor on CPU.  This is a small bitmap read by
+    // Python via pg.get_active_ranks(); keeping it on CPU avoids CUDA stream
+    // synchronisation issues when the executor thread updates it via
+    // applyViewChange while the main thread reads it.
     auto cpu_tensor = torch::tensor(active_ranks, torch::dtype(torch::kInt32));
     if (!meta_->activeRanksTensor.defined() ||
         meta_->activeRanksTensor.size(0) != max_group_size_) {
-        meta_->activeRanksTensor =
-            cpu_tensor.to(isCpu_ ? torch::kCPU : torch::kCUDA);
+        meta_->activeRanksTensor = cpu_tensor;
         return;
     }
-
-    if (meta_->activeRanksTensor.device().is_cpu()) {
-        meta_->activeRanksTensor.copy_(cpu_tensor);
-    } else {
-        meta_->activeRanksTensor.copy_(
-            cpu_tensor.to(meta_->activeRanksTensor.device()));
-    }
+    meta_->activeRanksTensor.copy_(cpu_tensor);
 }
 
 void MooncakeBackend::extendGroupSizeTo(int newSize) {
@@ -1004,9 +1010,10 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
     // Membership boundary (activation/deactivation): reset the
     // collective sequence so that all ranks, including joiners and
     // replacements, agree on the double-buffer parity.
-    if (meta_->epoch != view.epoch) {
+    bool epoch_changed = false;
+    if (meta_->epoch.load(std::memory_order_acquire) != view.epoch) {
         meta_->taskCount = 0;
-        meta_->epoch = view.epoch;
+        epoch_changed = true;
     }
 
     // Rank order
@@ -1022,7 +1029,7 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
         // active ranks
         const auto& member = view.members[global_rank];
         meta_->activeRanks[local_rank] = member.isActive();
-        if (member.isActive() && member.endpoint_epoch != kInvalidEpoch) {
+        if (member.endpoint_epoch != kInvalidEpoch) {
             meta_->segmentInfos[local_rank] = member.endpoint_info;
             auto handle = ctx_.link_manager.resolvePeer(global_rank);
             if (handle) {
@@ -1037,12 +1044,18 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
     }
 
     // Keep the Python-visible activeRanksTensor in sync with the view.
-    // FIXME: will this cause a deadlock?
     syncActiveRanksTensor();
 
     // Recalculate activeSize from the view (count of active members).
     meta_->activeSize = std::count_if(view.members.begin(), view.members.end(),
                                       [](auto&& m) { return m.isActive(); });
+
+    // Publish epoch AFTER all data-plane state (activeRanks, segmentInfos,
+    // etc.) is updated.  This ensures that a thread observing the new epoch
+    // via getCurrentEpoch() (acquire) sees the complete membership state.
+    if (epoch_changed) {
+        meta_->epoch.store(view.epoch, std::memory_order_release);
+    }
 }
 
 void MooncakeBackend::onPeerLinkReset(GlobalRank peer) {

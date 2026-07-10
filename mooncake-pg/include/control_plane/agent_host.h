@@ -125,6 +125,10 @@ class AgentHost : public AgentInterface {
     static constexpr auto kCoordinatorAddrPollInterval =
         std::chrono::milliseconds(100);
 
+    // Throttle repeated registerAgent error logs.
+    static constexpr auto kRegisterErrorLogInterval =
+        std::chrono::seconds(5);
+
     AgentHost(c10::intrusive_ptr<c10d::Store> store, const std::string& host_ip,
               GlobalRank rank, int max_world_size, LinkManager& link_manager);
 
@@ -190,6 +194,11 @@ class AgentHost : public AgentInterface {
     // Bootstrap synchronization: one-shot latch with executor-managed promises.
     bool registration_done_ = false;
     std::vector<std::shared_ptr<std::promise<void>>> registration_promises_;
+
+    // Throttling state for registerAgent error logs.  Accessed only from the
+    // executor thread.
+    std::chrono::steady_clock::time_point last_register_error_log_time_;
+    uint64_t register_error_log_suppressed_ = 0;
 
     // group_ready_promises_ is fulfilled when joinGroup returns and
     // the GroupView is applied.

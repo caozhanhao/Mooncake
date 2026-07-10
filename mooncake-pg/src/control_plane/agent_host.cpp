@@ -181,7 +181,7 @@ void AgentHost::waitUntilRankActive(GroupId group_id, GlobalRank rank,
 
     executor_.post([this, group_id, rank, promise]() {
         auto view = agent_.getGroupView(group_id);
-        if (view.member(rank).isActive()) {
+        if (view.members[rank].isActive()) {
             promise->set_value();
         } else {
             rank_active_promises_[group_id][rank].push_back(promise);
@@ -357,11 +357,10 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
         // agent_.groups_, which is only safe to access from the executor.
         auto old_view = agent_.getGroupView(group_id);
         std::vector<GlobalRank> newly_activated;
-        for (size_t idx = 0; idx < push.view.rank_order.size(); ++idx) {
-            InGroupRank igr = static_cast<InGroupRank>(idx);
-            GlobalRank gr = push.view.globalRank(igr);
-            if (!old_view.member(gr).isActive() &&
-                push.view.member(gr).isActive()) {
+        for (size_t igr = 0; igr < push.view.rank_order.size(); ++igr) {
+            GlobalRank gr = push.view.rank_order[igr];
+            if (!old_view.members[gr].isActive() &&
+                push.view.members[gr].isActive()) {
                 newly_activated.push_back(gr);
             }
         }
@@ -482,11 +481,32 @@ void AgentHost::startRegisterRpc() {
                             backend->buildEndpointMetadata());
                     });
                 } else {
-                    LOG(ERROR)
-                        << "AgentHost: registerAgent failed: " << resp.error_msg
-                        << " (will retry after heartbeat interval; if this "
-                           "persists, the Coordinator may be rejecting a "
-                           "replacement rank before the old one times out)";
+                    auto now = std::chrono::steady_clock::now();
+                    if (last_register_error_log_time_.time_since_epoch() ==
+                            std::chrono::steady_clock::duration{} ||
+                        now - last_register_error_log_time_ >=
+                            kRegisterErrorLogInterval) {
+                        std::string suppressed_msg;
+                        if (register_error_log_suppressed_ > 0) {
+                            suppressed_msg =
+                                " (suppressed " +
+                                std::to_string(register_error_log_suppressed_) +
+                                " identical log" +
+                                (register_error_log_suppressed_ > 1 ? "s" : "") +
+                                " since last print)";
+                        }
+                        LOG(ERROR)
+                            << "AgentHost: registerAgent failed: "
+                            << resp.error_msg
+                            << " (will retry after heartbeat interval; if this "
+                               "persists, the Coordinator may be rejecting a "
+                               "replacement rank before the old one times out)"
+                            << suppressed_msg;
+                        last_register_error_log_time_ = now;
+                        register_error_log_suppressed_ = 0;
+                    } else {
+                        ++register_error_log_suppressed_;
+                    }
                 }
             });
         });

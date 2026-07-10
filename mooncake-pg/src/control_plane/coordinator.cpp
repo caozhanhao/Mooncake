@@ -51,8 +51,8 @@ CentralizedCoordinatorStateMachine::handleRegister(const RegisterRequest& req) {
         result.response.success = false;
         result.response.error_msg =
             "rank already registered, and is not offline.";
-        LOG(INFO) << "[COORD] registerAgent rank=" << req.rank
-                  << " rejected: already registered";
+        // LOG(INFO) << "[COORD] registerAgent rank=" << req.rank
+        //           << " rejected: already registered";
         return result;
     }
 
@@ -217,7 +217,7 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
 
         // Check activatable before applying changes.
         for (GlobalRank rank : req.requested_ranks) {
-            if (!view.member(rank).isActive()) changed = true;
+            if (!view.members[rank].isActive()) changed = true;
         }
 
         if (changed &&
@@ -233,13 +233,13 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
 
         // Apply.
         for (GlobalRank rank : req.requested_ranks) {
-            view.member(rank).status = GroupMemberStatus::kActive;
+            view.members[rank].status = GroupMemberStatus::kActive;
         }
     } else {
         // deactivate
         for (GlobalRank rank : req.requested_ranks) {
-            if (view.member(rank).isActive()) {
-                view.member(rank).status = GroupMemberStatus::kInactive;
+            if (view.members[rank].isActive()) {
+                view.members[rank].status = GroupMemberStatus::kInactive;
                 changed = true;
             }
         }
@@ -421,7 +421,7 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
         }
 
         auto& view = it->second;
-        auto& member = view.member(req.rank);
+        auto& member = view.members[req.rank];
         member.agent_session_epoch = req.agent_session_epoch;
         member.endpoint_epoch = ep.endpoint_epoch;
         member.endpoint_info = ep.endpoint_info;
@@ -607,7 +607,7 @@ CentralizedCoordinatorStateMachine::handleLeaveGroup(
     }
 
     auto& view = it->second;
-    auto& member = view.member(req.rank);
+    auto& member = view.members[req.rank];
     if (member.hasLeft()) {
         LOG(INFO) << "[COORD] leaveGroup rank=" << req.rank
                   << " group=" << req.group_id << " ignored: already left";
@@ -647,7 +647,7 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
     std::vector<GroupId> groups_to_erase;
     for (auto& [group_id, view] : group_views_) {
         if (!rankInValidRange(rank)) continue;
-        auto& member = view.member(rank);
+        auto& member = view.members[rank];
         if (member.status == GroupMemberStatus::kActive) {
             member.status = GroupMemberStatus::kInactive;
             view.epoch++;
@@ -693,88 +693,63 @@ bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
 //
 // Tie-breaking: prefer cliques containing Rank 0 (it hosts the
 // Coordinator and Store), then lexicographically smallest.
-std::vector<GlobalRank> CentralizedCoordinatorStateMachine::findHealthySet()
-    const {
-    std::vector<GlobalRank> candidates;
+std::vector<GlobalRank>
+CentralizedCoordinatorStateMachine::extendHealthySet() const {
+    // Step 1: Collect current HEALTHY ranks.
+    std::vector<GlobalRank> result;
     for (GlobalRank i{0}; i < max_world_size_; ++i) {
-        if (ranks_[i].state != RankState::OFFLINE) {
-            candidates.push_back(i);
+        if (ranks_[i].state == RankState::HEALTHY) {
+            result.push_back(i);
         }
     }
 
-    int n = static_cast<int>(candidates.size());
-    if (n == 0) return {};
-
-    std::vector<std::vector<uint8_t>> adj(n, std::vector<uint8_t>(n, 0));
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            if (isMutuallyConnected(candidates[i], candidates[j])) {
-                adj[i][j] = 1;
+    // Step 2: Iteratively remove ranks no longer mutually connected to all
+    // others in the set.
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto it = result.begin(); it != result.end();) {
+            bool connected_to_all = true;
+            for (GlobalRank other : result) {
+                if (*it == other) continue;
+                if (!isMutuallyConnected(*it, other)) {
+                    connected_to_all = false;
+                    break;
+                }
+            }
+            if (!connected_to_all) {
+                it = result.erase(it);
+                changed = true;
+            } else {
+                ++it;
             }
         }
     }
 
-    std::vector<GlobalRank> best;
-    std::vector<GlobalRank> current;
-
-    auto isBetter = [&](const std::vector<GlobalRank>& a,
-                        const std::vector<GlobalRank>& b) -> bool {
-        if (a.size() != b.size()) return a.size() > b.size();
-        bool a_has_0 = std::find(a.begin(), a.end(), 0) != a.end();
-        bool b_has_0 = std::find(b.begin(), b.end(), 0) != b.end();
-        if (a_has_0 != b_has_0) return a_has_0;
-        return std::lexicographical_compare(a.begin(), a.end(), b.begin(),
-                                            b.end());
-    };
-
-    static constexpr int kMaxSearchSteps = 100000;
-    int search_steps = 0;
-
-    std::function<void(const std::vector<int>&)> search =
-        [&](const std::vector<int>& allowed) {
-            if (++search_steps > kMaxSearchSteps) return;
-
-            if (current.size() + allowed.size() <= best.size()) return;
-
-            for (size_t i = 0; i < allowed.size(); ++i) {
-                int v = allowed[i];
-
-                current.push_back(candidates[v]);
-
-                std::vector<int> next_allowed;
-                next_allowed.reserve(allowed.size() - i - 1);
-
-                for (size_t j = i + 1; j < allowed.size(); ++j) {
-                    int u = allowed[j];
-                    if (adj[v][u]) {
-                        next_allowed.push_back(u);
-                    }
-                }
-
-                search(next_allowed);
-
-                if (isBetter(current, best)) {
-                    best = current;
-                }
-                current.pop_back();
+    // Step 3: Extend with new mutually-connected candidates.  A candidate is
+    // added only if it is connected to every current member.
+    for (GlobalRank i{0}; i < max_world_size_; ++i) {
+        if (ranks_[i].state == RankState::OFFLINE) continue;
+        if (std::find(result.begin(), result.end(), i) != result.end())
+            continue;
+        bool connected_to_all = true;
+        for (GlobalRank existing : result) {
+            if (!isMutuallyConnected(i, existing)) {
+                connected_to_all = false;
+                break;
             }
-        };
-
-    std::vector<int> initial_allowed(n);
-    std::iota(initial_allowed.begin(), initial_allowed.end(), 0);
-
-    search(initial_allowed);
-
-    if (best.empty() && !candidates.empty()) {
-        best.push_back(candidates[0]);
+        }
+        if (connected_to_all) {
+            result.push_back(i);
+        }
     }
 
-    return best;
+    return result;
 }
 
 void CentralizedCoordinatorStateMachine::updateRankStates(
     std::vector<CoordinatorEffect>& effects) {
-    auto healthy_set = findHealthySet();
+    auto healthy_set = extendHealthySet();
 
     // Debug: show all rank link_status and healthy_set
     {
@@ -815,7 +790,7 @@ void CentralizedCoordinatorStateMachine::updateRankStates(
 
 void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
     std::vector<CoordinatorEffect>& effects) {
-    auto healthy_set = findHealthySet();
+    auto healthy_set = extendHealthySet();
 
     // For auto_deactivate groups, remove unhealthy ranks from the active set.
     // However, during bootstrap / BootstrapSyncing we do NOT do this: we wait
@@ -826,11 +801,11 @@ void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
         if (view.status != GroupStatus::Ready) continue;
         bool changed = false;
         for (GlobalRank i{0}; i < max_world_size_; ++i) {
-            if (!view.member(i).isActive()) continue;
+            if (!view.members[i].isActive()) continue;
             bool in_healthy = std::find(healthy_set.begin(), healthy_set.end(),
                                         i) != healthy_set.end();
             if (!in_healthy) {
-                view.member(i).status = GroupMemberStatus::kInactive;
+                view.members[i].status = GroupMemberStatus::kInactive;
                 changed = true;
                 LOG(INFO) << "[COORD] auto_deactivate group=" << group_id
                           << " rank=" << i;
@@ -853,12 +828,12 @@ bool CentralizedCoordinatorStateMachine::isActivatableSet(
     // Build the future active set: old active ∪ new ranks.
     std::vector<GlobalRank> future_active;
     for (GlobalRank i{0}; i < max_world_size_; ++i) {
-        if (old_view.member(i).isActive()) {
+        if (old_view.members[i].isActive()) {
             future_active.push_back(i);
         }
     }
     for (GlobalRank r : new_ranks) {
-        if (!old_view.member(r).isActive()) {
+        if (!old_view.members[r].isActive()) {
             future_active.push_back(r);
         }
     }
@@ -886,7 +861,7 @@ bool CentralizedCoordinatorStateMachine::isRankActivatable(
     auto group = group_views_.find(group_id);
     if (group == group_views_.end()) return false;
 
-    const auto& member = group->second.member(rank);
+    const auto& member = group->second.members[rank];
     return (member.status == GroupMemberStatus::kActive ||
             member.status == GroupMemberStatus::kInactive) &&
            member.endpoint_epoch != kInvalidEpoch &&
@@ -910,7 +885,7 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
             std::vector<GlobalRank> peer_ranks;
             bool has_any_active = false;
             for (GlobalRank i{0}; i < max_world_size_; ++i) {
-                if (!view.member(i).isActive()) continue;
+                if (!view.members[i].isActive()) continue;
                 has_any_active = true;
                 peer_ranks.push_back(i);
             }
@@ -999,7 +974,7 @@ bool CentralizedCoordinatorStateMachine::joinGroup(
         view.rank_order = group.rank_order;
         view.members.resize(max_world_size_);
         for (GlobalRank r : group.rank_order) {
-            view.member(r).status = GroupMemberStatus::kActive;
+            view.members[r].status = GroupMemberStatus::kActive;
         }
         view.status = GroupStatus::Bootstrapping;
         group_views_[group_id] = std::move(view);
@@ -1081,7 +1056,7 @@ CentralizedCoordinatorStateMachine::computeRequiredViewAcks(
     for (GlobalRank i{0}; i < max_world_size_; ++i) {
         if (i == proposer) continue;
         if (ranks_[i].state == RankState::OFFLINE) continue;
-        if (old_view.member(i).isActive() || new_view.member(i).isActive()) {
+        if (old_view.members[i].isActive() || new_view.members[i].isActive()) {
             required.insert(i);
         }
     }

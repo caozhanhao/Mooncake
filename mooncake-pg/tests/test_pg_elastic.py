@@ -607,6 +607,7 @@ def _fault_detection_worker(
         f"rank {ctx.rank}: epoch should increase after deactivation"
     )
     time.sleep(0.5)
+
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
     work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
     work.wait()
@@ -628,9 +629,11 @@ def _replacement_recovery_worker(
 
     if ctx.proc_rank < ctx.world_size:
         # Original rank (0, 1, 2, or 3)
+        print(f"[DEBUG survivor {logical_rank}] worker start", flush=True)
         device = ctx.init_group(rank=logical_rank)
 
         # Round 1: all healthy
+        print(f"[DEBUG survivor {logical_rank}] round 1 start", flush=True)
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
         work.wait()
@@ -638,9 +641,11 @@ def _replacement_recovery_worker(
             f"rank {logical_rank}: round 1 should succeed locally"
         failed_ranks_hint = pg.get_failed_ranks_hint(work)
         assert failed_ranks_hint.cpu().tolist() == [0] * ctx.world_size
+        print(f"[DEBUG survivor {logical_rank}] round 1 done", flush=True)
 
         if logical_rank == BROKEN_RANK:
             # Broken rank exits
+            print(f"[DEBUG broken {logical_rank}] exiting", flush=True)
             ctx.record_result({"role": "broken"})
             broken_exited.set()
             os._exit(0)
@@ -648,8 +653,10 @@ def _replacement_recovery_worker(
         # Survivor ranks
         broken_exited.wait()
         backend = ctx.get_backend()
+        print(f"[DEBUG survivor {logical_rank}] broken_exited, backend={backend}", flush=True)
 
-        # Round 2: run collective with dead rank → local_success=False
+        # Round 2: run collective with dead rank -> local_success=False
+        print(f"[DEBUG survivor {logical_rank}] round 2 start", flush=True)
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
         work.wait()
@@ -659,13 +666,13 @@ def _replacement_recovery_worker(
         expected_failed_ranks_hint = [0] * ctx.world_size
         expected_failed_ranks_hint[BROKEN_RANK] = 1
         assert failed_ranks_hint.cpu().tolist() == expected_failed_ranks_hint
-
-        # Wait for auto_deactivate to propagate before signalling replacement.
-        time.sleep(0.5)
+        print(f"[DEBUG survivor {logical_rank}] round 2 done", flush=True)
 
         # Signal that we're ready for replacement
         if logical_rank == 0:
+            print(f"[DEBUG survivor {logical_rank}] setting start_recovery", flush=True)
             start_recovery.set()
+
 
         # Wait for replacement to be connected (metadata published)
         # Use longer poll interval to avoid overloading the connection poller
@@ -676,11 +683,18 @@ def _replacement_recovery_worker(
             description=f"rank {logical_rank} waiting for replacement to connect",
         )
 
+        print(f"[DEBUG survivor {logical_rank}] waiting for replacement ready", flush=True)
+
+
         # Wait for replacement to be ready for join_group
         replacement_ready.wait()
 
+        print(f"[DEBUG survivor {logical_rank}] replacement ready", flush=True)
+        
         # All ranks call recover_ranks to include replacement
+        print(f"[DEBUG survivor {logical_rank}] calling recover_ranks", flush=True)
         pg.recover_ranks(backend, [BROKEN_RANK])
+        print(f"[DEBUG survivor {logical_rank}] recover_ranks done", flush=True)
 
         # Final collective with all 4 ranks
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
@@ -695,21 +709,30 @@ def _replacement_recovery_worker(
     else:
         # Replacement process (proc_rank = world_size)
         # Wait for signal to start
+        print(f"[DEBUG replacement {logical_rank}] waiting start_recovery", flush=True)
         start_recovery.wait()
+        print(f"[DEBUG replacement {logical_rank}] start_recovery set", flush=True)
 
         # Replacement initializes with is_extension (local-only mode)
+        print(f"[DEBUG replacement {logical_rank}] init_group start", flush=True)
         device = ctx.init_group(rank=logical_rank, is_extension=True)
         backend = ctx.get_backend()
+        print(f"[DEBUG replacement {logical_rank}] init_group done", flush=True)
 
         # Signal that we're initialized and ready for join_group
         replacement_ready.set()
+        print(f"[DEBUG replacement {logical_rank}] replacement_ready set", flush=True)
 
         # join_group completes the connection and switches to global mode
+        print(f"[DEBUG replacement {logical_rank}] join_group start", flush=True)
         pg.join_group(backend)
+        print(f"[DEBUG replacement {logical_rank}] join_group done", flush=True)
 
         # Final collective with all 4 ranks
+        print(f"[DEBUG replacement {logical_rank}] final all_reduce start", flush=True)
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        print(f"[DEBUG replacement {logical_rank}] final all_reduce done", flush=True)
 
         ctx.record_result({"role": "replacement"})
 
@@ -798,6 +821,10 @@ class _ElasticMixin:
             timeout_s=30.0,
         )
 
+        # Check for errors BEFORE role-based assertions so failures
+        # (assertion errors, segfaults, timeouts) are surfaced clearly.
+        self.assert_no_errors(rows)
+
         # All survivors should complete
         survivor_rows = [r for r in rows if r.get("role") == "survivor"]
         self.assertEqual(len(survivor_rows), self.world_size - 1)
@@ -822,6 +849,8 @@ class _ElasticMixin:
             timeout_s=60.0,
         )
 
+        self.assert_no_errors(rows)
+
         # Verify all participants completed
         survivor_rows = [r for r in rows if r.get("role") == "survivor"]
         replacement_rows = [r for r in rows if r.get("role") == "replacement"]
@@ -845,6 +874,8 @@ class _ElasticMixin:
             nprocs=self.world_size,
             timeout_s=30.0,
         )
+
+        self.assert_no_errors(rows)
 
         # Verify all participants completed
         original_rows = [r for r in rows if r.get("role") == "original"]
@@ -871,6 +902,8 @@ class _ElasticMixin:
             timeout_s=60.0,
         )
 
+        self.assert_no_errors(rows)
+
         result_rows = [r for r in rows if r.get("role") == "extension_subgroups"]
         self.assertEqual(len(result_rows), self.world_size)
 
@@ -889,6 +922,8 @@ class _ElasticMixin:
             nprocs=self.world_size,
             timeout_s=60.0,
         )
+
+        self.assert_no_errors(rows)
 
         primary_rows = [r for r in rows if r.get("role") == "primary"]
         joiner_rows = [r for r in rows if r.get("role") == "joiner"]
@@ -915,6 +950,8 @@ class _ElasticMixin:
             timeout_s=60.0,
         )
 
+        self.assert_no_errors(rows)
+
         survivor_rows = [r for r in rows if r.get("role") == "survivor"]
         replacement_rows = [r for r in rows if r.get("role") == "replacement"]
         broken_rows = [r for r in rows if r.get("role") == "broken"]
@@ -937,6 +974,8 @@ class _ElasticMixin:
             broken_exited,
             timeout_s=30.0,
         )
+
+        self.assert_no_errors(rows)
 
         # All survivors should complete
         survivor_rows = [r for r in rows if r.get("role") == "survivor"]

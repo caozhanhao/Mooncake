@@ -214,6 +214,25 @@ at::Tensor getFailedRanksHint(c10::intrusive_ptr<c10d::Work> work) {
     return at::Tensor();
 }
 
+bool getLocalSuccess(c10::intrusive_ptr<c10d::Work> work) {
+    if (auto* w = dynamic_cast<MooncakeWorkCuda*>(work.get())) {
+        return w->getLocalSuccess();
+    }
+    if (auto* w = dynamic_cast<MooncakeWorkCpu*>(work.get())) {
+        return w->getLocalSuccess();
+    }
+    if (auto* w = dynamic_cast<MooncakeP2PWork*>(work.get())) {
+        return w->getLocalSuccess();
+    }
+    return false;
+}
+
+int64_t getCurrentEpoch(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    return static_cast<int64_t>(mooncakeBackend->getCurrentEpoch());
+}
+
 /// Python-facing wrapper that extracts the raw TransferEngine* from a
 /// mooncake.engine.TransferEngine Python object and makes it the process-wide
 /// engine for all MooncakeBackend instances.  The caller must ensure the
@@ -268,7 +287,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deactivate_rank", &deactivateRank, py::arg("backend"),
           py::arg("ranks"));
     m.def("join_group", &joinGroup);
-    m.def("get_failed_ranks", &getFailedRanksHint, py::arg("work"));
+    m.def("get_failed_ranks_hint", &getFailedRanksHint, py::arg("work"));
+    m.def("get_local_success", &getLocalSuccess, py::arg("work"),
+          "Return True iff all locally-attempted peers succeeded in this "
+          "operation.");
+    m.def("get_current_epoch", &getCurrentEpoch, py::arg("backend"),
+          "Get the current GroupView epoch (monotonically increasing on "
+          "membership changes).");
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(

@@ -130,7 +130,7 @@ bool RpcClient::tryReconnect(const std::string& addr) {
         return false;
     }
 
-    LOG(INFO) << "RpcClient: reconnected to " << addr;
+    // LOG(INFO) << "RpcClient: reconnected to " << addr;
     std::lock_guard<std::mutex> lock(state_->mutex);
     state_->clients[addr] = client;
     return true;

@@ -192,12 +192,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     void checkGroupTransitions(std::vector<CoordinatorEffect>& effects);
 
     bool isMutuallyConnected(GlobalRank a, GlobalRank b) const;
-    std::vector<GlobalRank> findHealthySet() const;
-
     // Preserve existing HEALTHY ranks that are still mutually connected,
     // then extend with new candidates that have full connectivity to all
-    // current members.  Unlike findHealthySet() (max clique), this never
-    // evicts a healthy rank just because a new clique becomes possible.
+    // current members.
     std::vector<GlobalRank> extendHealthySet() const;
 
     bool canEraseGroup(const GroupView& view) const;
