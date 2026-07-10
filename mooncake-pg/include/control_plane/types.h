@@ -2,6 +2,7 @@
 #define MOONCAKE_PG_CONTROL_PLANE_TYPES_H
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // mooncake-pg uses two rank namespaces that are easy to confuse:
@@ -21,10 +22,11 @@ namespace mooncake {
 using GlobalRank = int32_t;
 using InGroupRank = int32_t;
 
-using GroupId = int32_t;  // process group ID (= backendIndex)
+using GroupId = std::string;  // process group ID (from PyTorch
+                              // DistributedBackendOptions::group_id)
 
 constexpr GlobalRank kInvalidGlobalRank = -1;
-constexpr GroupId kInvalidGroupId = -1;
+inline const GroupId kInvalidGroupId = "";
 constexpr int kMaxNumRanks = 64;
 
 // Epoch sentinels.  All epochs start at kInvalidEpoch (0) and only increase
@@ -91,9 +93,9 @@ struct GroupMember {
 
 // Group lifecycle status.
 //
-//   joinGroup()
-//       |
-//       v
+//   registerGroup()
+//          |
+//          v
 //   Bootstrapping  -- all active ranks HEALTHY + have endpoints -->
 //   BootstrapSyncing
 //       (waiting for       (Coordinator broadcasts ViewUpdate,
@@ -121,7 +123,7 @@ enum class GroupStatus : uint8_t {
 // epoch starts at 0 and monotonically increases; the first real epoch after
 // bootstrap completion is 1.
 struct GroupView {
-    GroupId group_id = 0;
+    GroupId group_id;
     GroupStatus status = GroupStatus::Bootstrapping;
     uint64_t epoch = 0;
     std::vector<GlobalRank> rank_order;  // InGroupRank → GlobalRank
@@ -133,7 +135,7 @@ struct GroupView {
 // indexed by GlobalRank (size kMaxNumRanks).  Producers must translate
 // InGroupRank peers to GlobalRank via rank_order before setting bits.
 struct TransferObservationEvent {
-    GroupId group_id = 0;
+    GroupId group_id;
     std::vector<uint8_t> attempted_ranks;
     std::vector<uint8_t> failed_ranks_hint;
     std::vector<uint8_t> succeeded_ranks;

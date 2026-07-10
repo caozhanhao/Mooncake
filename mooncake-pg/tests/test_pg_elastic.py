@@ -24,7 +24,6 @@ BROKEN_RANK = 1
 def _extension_worker(
     ctx: MooncakePGWorkerContext,
     extend_event: mp.Event,
-    init_done_event: mp.Event,
 ) -> None:
     """Worker for testing extension mode - new ranks join existing group."""
     initial_world_size = ctx.world_size - 1
@@ -60,10 +59,10 @@ def _extension_worker(
         # Two-phase extension protocol:
         #   1) joiner publishes metadata + establishes transport readiness
         #   2) healthy ranks recover/activate it via recover_ranks()
-        # Note: get_peer_state() checks both link readiness and endpoint
-        # availability.  After the joiner registers, TE links come up quickly
-        # but may flap after ~5s if no collective keeps them alive.  Use a
-        # short timeout so we catch the link-up window.
+        # Note: get_peer_state() guarantees the peer has joined this group,
+        # has a valid endpoint, and is HEALTHY in the Coordinator's view.
+        # It intentionally does NOT require the local TE link to be up; the
+        # Coordinator's isActivatableSet() will retry until links are ready.
         wait_until(
             lambda: all(pg.get_peer_state(backend, join_ranks)),
             timeout_s=10.0,
@@ -142,11 +141,11 @@ def _extension_worker_with_subgroups(
     """Multi-subgroup elastic extension test using split-ranks pattern.
 
     Layout (world_size=4, primary=[0,1], joiners=[2,3]):
-      group_a: primary ranks=[0],   joiner ranks=[0,2],     max_world_size=2
-      group_b: primary ranks=[1],   joiner ranks=[1,3],     max_world_size=2
-      group_c: primary ranks=[0,1], joiner ranks=[0,1,2,3], max_world_size=4
+      group_a: primary ranks=[0],   extended ranks=[0,2],     max_group_size=2
+      group_b: primary ranks=[1],   extended ranks=[1,3],     max_group_size=2
+      group_c: primary ranks=[0,1], extended ranks=[0,1,2,3], max_group_size=4
 
-    Primary ranks must initialize WORLD with world_size=initial_world_size and
+    Primary ranks must initialize group with group_size=initial_world_size and
     create subgroups using only their current membership; joiners wait for the
     extend signal, then init WORLD with the full world_size and create subgroups
     using the full eventual membership. PyTorch's new_group uses a monotonic
@@ -483,7 +482,6 @@ def _allgather_reduce_scatter_extension_worker(
 def _allgather_reduce_scatter_recovery_worker(
     ctx: MooncakePGWorkerContext,
     broken_exited: mp.Event,
-    replacement_ready: mp.Event,
     start_recovery: mp.Event,
 ) -> None:
     """Test _allgather_base and _reduce_scatter_base across rank recovery.
@@ -521,7 +519,6 @@ def _allgather_reduce_scatter_recovery_worker(
             poll_interval_s=2.0,
             description=f"rank {logical_rank} waiting for replacement",
         )
-        replacement_ready.wait()
         pg.recover_ranks(backend, [broken_rank])
 
         # Post-recovery: all 4 ranks active again.
@@ -532,7 +529,6 @@ def _allgather_reduce_scatter_recovery_worker(
         start_recovery.wait()
         device = ctx.init_group(rank=logical_rank, is_extension=True)
         backend = ctx.get_backend()
-        replacement_ready.set()
         pg.join_group(backend)
 
         # Post-recovery: all 4 ranks active.
@@ -621,7 +617,6 @@ def _fault_detection_worker(
 def _replacement_recovery_worker(
     ctx: MooncakePGWorkerContext,
     broken_exited: mp.Event,
-    replacement_ready: mp.Event,
     start_recovery: mp.Event,
 ) -> None:
     """Worker for testing replacement recovery."""
@@ -629,11 +624,9 @@ def _replacement_recovery_worker(
 
     if ctx.proc_rank < ctx.world_size:
         # Original rank (0, 1, 2, or 3)
-        print(f"[DEBUG survivor {logical_rank}] worker start", flush=True)
         device = ctx.init_group(rank=logical_rank)
 
         # Round 1: all healthy
-        print(f"[DEBUG survivor {logical_rank}] round 1 start", flush=True)
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
         work.wait()
@@ -641,11 +634,9 @@ def _replacement_recovery_worker(
             f"rank {logical_rank}: round 1 should succeed locally"
         failed_ranks_hint = pg.get_failed_ranks_hint(work)
         assert failed_ranks_hint.cpu().tolist() == [0] * ctx.world_size
-        print(f"[DEBUG survivor {logical_rank}] round 1 done", flush=True)
 
         if logical_rank == BROKEN_RANK:
             # Broken rank exits
-            print(f"[DEBUG broken {logical_rank}] exiting", flush=True)
             ctx.record_result({"role": "broken"})
             broken_exited.set()
             os._exit(0)
@@ -653,10 +644,8 @@ def _replacement_recovery_worker(
         # Survivor ranks
         broken_exited.wait()
         backend = ctx.get_backend()
-        print(f"[DEBUG survivor {logical_rank}] broken_exited, backend={backend}", flush=True)
 
         # Round 2: run collective with dead rank -> local_success=False
-        print(f"[DEBUG survivor {logical_rank}] round 2 start", flush=True)
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
         work.wait()
@@ -666,13 +655,10 @@ def _replacement_recovery_worker(
         expected_failed_ranks_hint = [0] * ctx.world_size
         expected_failed_ranks_hint[BROKEN_RANK] = 1
         assert failed_ranks_hint.cpu().tolist() == expected_failed_ranks_hint
-        print(f"[DEBUG survivor {logical_rank}] round 2 done", flush=True)
 
         # Signal that we're ready for replacement
         if logical_rank == 0:
-            print(f"[DEBUG survivor {logical_rank}] setting start_recovery", flush=True)
             start_recovery.set()
-
 
         # Wait for replacement to be connected (metadata published)
         # Use longer poll interval to avoid overloading the connection poller
@@ -683,18 +669,8 @@ def _replacement_recovery_worker(
             description=f"rank {logical_rank} waiting for replacement to connect",
         )
 
-        print(f"[DEBUG survivor {logical_rank}] waiting for replacement ready", flush=True)
-
-
-        # Wait for replacement to be ready for join_group
-        replacement_ready.wait()
-
-        print(f"[DEBUG survivor {logical_rank}] replacement ready", flush=True)
-        
         # All ranks call recover_ranks to include replacement
-        print(f"[DEBUG survivor {logical_rank}] calling recover_ranks", flush=True)
         pg.recover_ranks(backend, [BROKEN_RANK])
-        print(f"[DEBUG survivor {logical_rank}] recover_ranks done", flush=True)
 
         # Final collective with all 4 ranks
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
@@ -709,30 +685,18 @@ def _replacement_recovery_worker(
     else:
         # Replacement process (proc_rank = world_size)
         # Wait for signal to start
-        print(f"[DEBUG replacement {logical_rank}] waiting start_recovery", flush=True)
         start_recovery.wait()
-        print(f"[DEBUG replacement {logical_rank}] start_recovery set", flush=True)
 
         # Replacement initializes with is_extension (local-only mode)
-        print(f"[DEBUG replacement {logical_rank}] init_group start", flush=True)
         device = ctx.init_group(rank=logical_rank, is_extension=True)
         backend = ctx.get_backend()
-        print(f"[DEBUG replacement {logical_rank}] init_group done", flush=True)
-
-        # Signal that we're initialized and ready for join_group
-        replacement_ready.set()
-        print(f"[DEBUG replacement {logical_rank}] replacement_ready set", flush=True)
 
         # join_group completes the connection and switches to global mode
-        print(f"[DEBUG replacement {logical_rank}] join_group start", flush=True)
         pg.join_group(backend)
-        print(f"[DEBUG replacement {logical_rank}] join_group done", flush=True)
 
         # Final collective with all 4 ranks
-        print(f"[DEBUG replacement {logical_rank}] final all_reduce start", flush=True)
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        print(f"[DEBUG replacement {logical_rank}] final all_reduce done", flush=True)
 
         ctx.record_result({"role": "replacement"})
 
@@ -837,13 +801,11 @@ class _ElasticMixin:
         """Test that replacement can join and restore full collective."""
         spawn_ctx = mp.get_context("spawn")
         broken_exited = spawn_ctx.Event()
-        replacement_ready = spawn_ctx.Event()
         start_recovery = spawn_ctx.Event()
 
         rows = self.spawn_backend_and_collect(
             _replacement_recovery_worker,
             broken_exited,
-            replacement_ready,
             start_recovery,
             nprocs=self.world_size + 1,
             timeout_s=60.0,
@@ -864,13 +826,11 @@ class _ElasticMixin:
         """Test extension mode allows new ranks to join existing group."""
         spawn_ctx = mp.get_context("spawn")
         extend_event = spawn_ctx.Event()
-        init_done_event = spawn_ctx.Event()
 
         # Spawn world_size processes: (world_size - 1) original + 1 extension
         rows = self.spawn_backend_and_collect(
             _extension_worker,
             extend_event,
-            init_done_event,
             nprocs=self.world_size,
             timeout_s=30.0,
         )
@@ -938,13 +898,11 @@ class _ElasticMixin:
         """
         spawn_ctx = mp.get_context("spawn")
         broken_exited = spawn_ctx.Event()
-        replacement_ready = spawn_ctx.Event()
         start_recovery = spawn_ctx.Event()
 
         rows = self.spawn_backend_and_collect(
             _allgather_reduce_scatter_recovery_worker,
             broken_exited,
-            replacement_ready,
             start_recovery,
             nprocs=self.world_size + 1,
             timeout_s=60.0,

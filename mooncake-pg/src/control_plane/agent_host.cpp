@@ -1,7 +1,9 @@
 #include "control_plane/agent_host.h"
 
+#include <chrono>
 #include <exception>
 #include <stdexcept>
+#include <unistd.h>
 
 #include <glog/logging.h>
 
@@ -10,6 +12,21 @@
 #include "control_plane/rpc_runtime.h"
 
 namespace mooncake {
+
+namespace {
+
+// Generate a process-unique starting point for agent_session_epoch so that
+// replacement processes cannot collide with the old rank's session epoch.
+// The low bits mix the current time, the high bits hold the pid; the result
+// is guaranteed non-zero so it is distinguishable from kInvalidEpoch.
+uint64_t generateInitialAgentSessionEpoch() {
+    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    uint64_t pid = static_cast<uint64_t>(getpid());
+    uint64_t base = (pid << 32) ^ static_cast<uint64_t>(now);
+    return base == 0 ? 1 : base;
+}
+
+}  // namespace
 
 // AgentRpcServiceImpl
 
@@ -38,6 +55,7 @@ AgentHost::AgentHost(c10::intrusive_ptr<c10d::Store> store,
       host_ip_(host_ip),
       rank_(rank),
       max_world_size_(max_world_size),
+      agent_session_epoch_(generateInitialAgentSessionEpoch()),
       rpc_client_(std::make_unique<RpcClient>()) {}
 
 AgentHost::~AgentHost() { shutdown(); }
@@ -100,8 +118,8 @@ void AgentHost::shutdown() {
     // Stop RPC server first — no new pushes accepted, in-flight handlers
     // are guaranteed to have finished posting to the executor.
     if (rpc_server_) rpc_server_->shutdown();
-    // Drain the executor next so that queued tasks (including leaveGroup /
-    // leaveGroup sends) finish before we tear down the RpcClient.
+    // Drain the executor next so that queued tasks (including unregisterGroup /
+    // unregisterGroup sends) finish before we tear down the RpcClient.
     executor_.shutdown();
     // Mark RpcClient as shutting down last.  In-flight async coroutines on the
     // global I/O executor may still fire after this point, but their connection
@@ -169,7 +187,7 @@ GroupView AgentHost::waitUntilGroupReady(GroupId group_id,
             }
         });
         throw std::runtime_error("waitUntilGroupReady timed out for group " +
-                                 std::to_string(group_id));
+                                 group_id);
     }
     return future.get();
 }
@@ -204,65 +222,65 @@ void AgentHost::waitUntilRankActive(GroupId group_id, GlobalRank rank,
         });
         throw std::runtime_error("waitUntilRankActive timed out for rank " +
                                  std::to_string(rank) + " in group " +
-                                 std::to_string(group_id));
+                                 group_id);
     }
 }
 
 // Agent interface: Group management
 
-void AgentHost::doJoinGroup(GroupView group, bool auto_deactivate,
-                            c10::intrusive_ptr<MooncakeBackend> backend) {
+void AgentHost::doRegisterGroup(GroupView group, bool auto_deactivate,
+                                c10::intrusive_ptr<MooncakeBackend> backend) {
     auto group_id = group.group_id;
     backends_.insert_or_assign(group_id, std::move(backend));
-    agent_.joinGroup(group, auto_deactivate);
+    agent_.registerGroup(group, auto_deactivate);
 
-    JoinGroupRequest req;
+    RegisterGroupRequest req;
     req.rank = rank_;
     req.agent_session_epoch = agent_.getAgentSessionEpoch();
     req.group = std::move(group);
     req.auto_deactivate = auto_deactivate;
 
-    auto resp = rpc_client_->call<&CoordinatorRpcService::joinGroup>(
+    auto resp = rpc_client_->call<&CoordinatorRpcService::registerGroup>(
         coordinator_addr_, std::move(req));
 
-    LOG(INFO) << "[AGENT] joinGroup rank=" << rank_ << " group=" << group_id
+    LOG(INFO) << "[AGENT] registerGroup rank=" << rank_ << " group=" << group_id
               << " success=" << resp.success;
 
     if (!resp.success) {
-        LOG(ERROR) << "AgentHost: joinGroup failed for group " << group_id
+        LOG(ERROR) << "AgentHost: registerGroup failed for group " << group_id
                    << ": " << resp.reject_reason;
         auto it = group_ready_promises_.find(group_id);
         if (it != group_ready_promises_.end()) {
             for (auto& p : it->second) {
                 p->set_exception(std::make_exception_ptr(std::runtime_error(
-                    "joinGroup rejected: " + resp.reject_reason)));
+                    "registerGroup rejected: " + resp.reject_reason)));
             }
             group_ready_promises_.erase(it);
         }
     }
 }
 
-void AgentHost::joinGroup(const GroupView& group, bool auto_deactivate,
-                          c10::intrusive_ptr<MooncakeBackend> backend) {
+void AgentHost::registerGroup(const GroupView& group, bool auto_deactivate,
+                              c10::intrusive_ptr<MooncakeBackend> backend) {
     executor_.postAndWait([this, group = group, auto_deactivate,
                            backend = std::move(backend)]() mutable {
-        doJoinGroup(std::move(group), auto_deactivate, std::move(backend));
+        doRegisterGroup(std::move(group), auto_deactivate, std::move(backend));
     });
 }
 
-void AgentHost::leaveGroup(GroupId group_id) {
+void AgentHost::unregisterGroup(GroupId group_id) {
     executor_.post([this, group_id]() {
-        LOG(INFO) << "[AGENT] leaveGroup rank=" << rank_
+        LOG(INFO) << "[AGENT] unregisterGroup rank=" << rank_
                   << " group=" << group_id;
-        agent_.leaveGroup(group_id);
+        agent_.unregisterGroup(group_id);
         backends_.erase(group_id);
 
-        LeaveGroupRequest req;
+        UnregisterGroupRequest req;
         req.group_id = group_id;
         req.rank = rank_;
         req.agent_session_epoch = agent_.getAgentSessionEpoch();
-        rpc_client_->send<&CoordinatorRpcService::leaveGroup>(coordinator_addr_,
-                                                              req);
+        rpc_client_->send<&CoordinatorRpcService::unregisterGroup>(
+            coordinator_addr_, req);
     });
 }
 
@@ -492,7 +510,8 @@ void AgentHost::startRegisterRpc() {
                                 " (suppressed " +
                                 std::to_string(register_error_log_suppressed_) +
                                 " identical log" +
-                                (register_error_log_suppressed_ > 1 ? "s" : "") +
+                                (register_error_log_suppressed_ > 1 ? "s"
+                                                                    : "") +
                                 " since last print)";
                         }
                         LOG(ERROR)
@@ -574,10 +593,15 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                         coordinator_addr_, e.request);
                 },
                 [this](const EnablePeerProbe& e) {
+                    LOG(INFO)
+                        << "[AGENT] EnablePeerProbe rank=" << rank_
+                        << " peer=" << e.rank << " server=" << e.te_server_name;
                     link_manager_.enablePeerProbe(e.rank, e.te_server_name,
                                                   e.warmup_recv_addr);
                 },
                 [this](const DisconnectLink& e) {
+                    LOG(INFO) << "[AGENT] DisconnectLink rank=" << rank_
+                              << " peer=" << e.peer;
                     link_manager_.disconnect(e.peer);
                 },
                 [this](const StopReconnect& e) {

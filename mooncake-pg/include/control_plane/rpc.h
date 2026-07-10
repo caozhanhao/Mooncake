@@ -53,14 +53,14 @@ struct HeartbeatResponse {
     bool require_reregister = false;
 };
 
-struct JoinGroupRequest {
+struct RegisterGroupRequest {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
     GroupView group;
     bool auto_deactivate = true;
 };
 
-struct JoinGroupResponse {
+struct RegisterGroupResponse {
     bool success = false;
     std::string reject_reason;
 };
@@ -72,7 +72,7 @@ enum class ViewUpdateStatus : uint8_t {
 };
 
 struct ProposeViewUpdateRequest {
-    GroupId group_id = 0;
+    GroupId group_id;
     GlobalRank source_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
     std::vector<GlobalRank> requested_ranks;  // ranks to activate/deactivate
@@ -90,7 +90,7 @@ struct ProposeViewUpdateResponse {
 // agent_session_epoch is NOT included here  - the Host fills it in the
 // enclosing PublishEndpointRequest before sending the RPC.
 struct GroupEndpointPublication {
-    GroupId group_id = 0;
+    GroupId group_id;
     uint64_t endpoint_epoch = kInvalidEpoch;
     GroupEndpointInfo endpoint_info;
 };
@@ -106,14 +106,14 @@ struct PublishEndpointResponse {
     std::string reject_reason;
 };
 
-struct LeaveGroupRequest {
-    GroupId group_id = 0;
+struct UnregisterGroupRequest {
+    GroupId group_id;
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
 };
 
 struct TransferObservationReport {
-    GroupId group_id = 0;
+    GroupId group_id;
     GlobalRank reporter_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
     uint64_t epoch = 0;          // GroupView::epoch observed by the reporter
@@ -147,13 +147,13 @@ struct RankStateUpdatePush {
 };
 
 struct ViewUpdatePush {
-    GroupId group_id = 0;
+    GroupId group_id;
     GroupView view;
 };
 
 struct ViewUpdateAck {
     GlobalRank rank = kInvalidGlobalRank;
-    GroupId group_id = 0;
+    GroupId group_id;
     uint64_t epoch = kInvalidEpoch;
     bool applied = false;
     std::string error_msg;
@@ -231,12 +231,12 @@ struct PublishRankStateSnapshot {
 };
 
 struct ApplyViewToBackend {
-    GroupId group_id = 0;
+    GroupId group_id;
     GroupView view;
 };
 
 struct MarkBackendViewStale {
-    GroupId group_id = 0;
+    GroupId group_id;
 };
 
 struct NotifyTEUnreachable {
@@ -274,9 +274,9 @@ class CoordinatorRpcService {
                                RegisterRequest req) = 0;
     virtual void heartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                            HeartbeatRequest req) = 0;
-    virtual void joinGroup(coro_rpc::context<JoinGroupResponse> ctx,
-                           JoinGroupRequest req) = 0;
-    virtual void leaveGroup(LeaveGroupRequest req) = 0;
+    virtual void registerGroup(coro_rpc::context<RegisterGroupResponse> ctx,
+                               RegisterGroupRequest req) = 0;
+    virtual void unregisterGroup(UnregisterGroupRequest req) = 0;
     virtual void proposeViewUpdate(
         coro_rpc::context<ProposeViewUpdateResponse> ctx,
         ProposeViewUpdateRequest req) = 0;

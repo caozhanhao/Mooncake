@@ -93,6 +93,11 @@ class LinkManager {
     // Used by pg.get_peer_state().
     bool isRankReady(GlobalRank peer) const;
 
+    // Check only the Coordinator-authoritative HEALTHY state, ignoring the
+    // local TE link.  Used when callers need a guarantee about Coordinator
+    // membership rather than local link readiness.
+    bool isRankHealthy(GlobalRank peer) const;
+
     void publishLinkUp(GlobalRank peer, TransferMetadata::SegmentID target_id);
     void publishLinkDown(GlobalRank peer);
 

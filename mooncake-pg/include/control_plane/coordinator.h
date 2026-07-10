@@ -28,14 +28,14 @@ class CoordinatorStateMachine {
     virtual CoordinatorApplyResult<HeartbeatResponse> handleHeartbeat(
         const HeartbeatRequest& req) = 0;
 
-    virtual CoordinatorApplyResult<JoinGroupResponse> handleJoinGroup(
-        const JoinGroupRequest& req) = 0;
+    virtual CoordinatorApplyResult<RegisterGroupResponse> handleRegisterGroup(
+        const RegisterGroupRequest& req) = 0;
 
     virtual CoordinatorApplyResult<void> handleProposeViewUpdate(
         uint64_t propose_id, const ProposeViewUpdateRequest& req) = 0;
 
-    virtual CoordinatorApplyResult<void> handleLeaveGroup(
-        const LeaveGroupRequest& req) = 0;
+    virtual CoordinatorApplyResult<void> handleUnregisterGroup(
+        const UnregisterGroupRequest& req) = 0;
 
     virtual CoordinatorApplyResult<void> handleProposalAck(uint64_t propose_id,
                                                            GlobalRank rank,
@@ -73,8 +73,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     CoordinatorApplyResult<HeartbeatResponse> handleHeartbeat(
         const HeartbeatRequest& req) override;
 
-    CoordinatorApplyResult<JoinGroupResponse> handleJoinGroup(
-        const JoinGroupRequest& req) override;
+    CoordinatorApplyResult<RegisterGroupResponse> handleRegisterGroup(
+        const RegisterGroupRequest& req) override;
 
     CoordinatorApplyResult<void> handleProposeViewUpdate(
         uint64_t propose_id, const ProposeViewUpdateRequest& req) override;
@@ -95,8 +95,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     CoordinatorApplyResult<void> checkTimeouts() override;
 
-    CoordinatorApplyResult<void> handleLeaveGroup(
-        const LeaveGroupRequest& req) override;
+    CoordinatorApplyResult<void> handleUnregisterGroup(
+        const UnregisterGroupRequest& req) override;
 
     CoordinatorApplyResult<void> handleBootstrapAck(GroupId group_id,
                                                     GlobalRank rank,
@@ -137,7 +137,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // Proposal 2PC (activate/deactivate).  Maps propose_id -> pending state.
     struct PendingProposal {
         uint64_t propose_id = 0;
-        GroupId group_id = 0;
+        GroupId group_id;
         ProposeViewUpdateResponse eventual_response;
         std::unordered_set<GlobalRank> waiting_acks;
         std::chrono::steady_clock::time_point deadline;
@@ -209,9 +209,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                           const std::vector<GlobalRank>& new_ranks,
                           const GroupView& old_view) const;
 
-    bool joinGroup(const GroupView& group, bool auto_deactivate,
-                   JoinGroupResponse& response,
-                   std::vector<CoordinatorEffect>& effects);
+    bool registerGroup(GlobalRank joining_rank, const GroupView& group,
+                       bool auto_deactivate, RegisterGroupResponse& response,
+                       std::vector<CoordinatorEffect>& effects);
 
     std::vector<GlobalRank> computeRequiredViewAcks(const GroupView& old_view,
                                                     const GroupView& new_view,

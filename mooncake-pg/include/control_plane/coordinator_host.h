@@ -65,8 +65,8 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
     void heartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                    HeartbeatRequest req) override;
 
-    void joinGroup(coro_rpc::context<JoinGroupResponse> ctx,
-                   JoinGroupRequest req) override;
+    void registerGroup(coro_rpc::context<RegisterGroupResponse> ctx,
+                       RegisterGroupRequest req) override;
 
     void proposeViewUpdate(coro_rpc::context<ProposeViewUpdateResponse> ctx,
                            ProposeViewUpdateRequest req) override;
@@ -78,7 +78,7 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
 
     void reportTransferObservation(TransferObservationReport req) override;
 
-    void leaveGroup(LeaveGroupRequest req) override;
+    void unregisterGroup(UnregisterGroupRequest req) override;
 
    private:
     CoordinatorHost& host_;
@@ -102,10 +102,10 @@ class CoordinatorHost {
     void postHeartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                        HeartbeatRequest req);
 
-    void postJoinGroup(coro_rpc::context<JoinGroupResponse> ctx,
-                       JoinGroupRequest req);
+    void postRegisterGroup(coro_rpc::context<RegisterGroupResponse> ctx,
+                           RegisterGroupRequest req);
 
-    void postLeaveGroup(LeaveGroupRequest req);
+    void postUnregisterGroup(UnregisterGroupRequest req);
 
     void postProposeViewUpdate(coro_rpc::context<ProposeViewUpdateResponse> ctx,
                                ProposeViewUpdateRequest req);

@@ -33,7 +33,7 @@ MooncakeProcessContext::MooncakeProcessContext() {
 }
 
 MooncakeProcessContext::~MooncakeProcessContext() {
-    // Shutdown AgentHost first so any queued leaveGroup RPCs are drained
+    // Shutdown AgentHost first so any queued unregisterGroup RPCs are drained
     // before RpcClient is torn down.
     if (agent_host) agent_host->shutdown();
     // Shutdown CoordinatorHost second so rank 0 fails pending proposals.

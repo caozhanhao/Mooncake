@@ -24,6 +24,7 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -44,7 +45,7 @@ struct TransferGroupMeta {
     int activeSize;  // Number of in-group slots that is active
     int taskCount;
 
-    GroupId group_id = 0;
+    GroupId group_id;
     std::atomic<uint64_t> epoch{0};  // GroupView epoch, synced by control plane
 
     bool* activeRanks;

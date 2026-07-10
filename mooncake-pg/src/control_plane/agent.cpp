@@ -22,15 +22,15 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
 
 // Group lifecycle
 
-void AgentStateMachine::joinGroup(const GroupView& group,
-                                  bool auto_deactivate) {
+void AgentStateMachine::registerGroup(const GroupView& group,
+                                      bool auto_deactivate) {
     GroupEntry entry;
     entry.view = group;
     entry.auto_deactivate = auto_deactivate;
     groups_[group.group_id] = std::move(entry);
 }
 
-void AgentStateMachine::leaveGroup(GroupId group_id) {
+void AgentStateMachine::unregisterGroup(GroupId group_id) {
     groups_.erase(group_id);
 }
 

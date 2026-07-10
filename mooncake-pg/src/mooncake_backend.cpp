@@ -247,7 +247,9 @@ MooncakeBackend::MooncakeBackend(
         .p2p_ack_region = (uint64_t)p2p_proxy_->ack_region(),
     };
 
-    meta_->group_id = static_cast<int32_t>(ctx_.next_group_id++);
+    TORCH_CHECK(!distBackendOpts.group_id.empty(),
+                "MooncakeBackend: distBackendOpts.group_id must not be empty");
+    meta_->group_id = distBackendOpts.group_id;
 
     // Register a lightweight Backend shim so that PyTorch's P2P dispatch path
     // (batch_isend_irecv → _get_backend → getBackend) can find a registered
@@ -278,17 +280,12 @@ MooncakeBackend::MooncakeBackend(
     }
     bool auto_deactivate = options_ ? options_->autoDeactivateOnFailure_ : true;
 
-    LOG(INFO) << "about to agent_.joinGroup";
-    
-    // Join group is synchronous
-    agent_.joinGroup(initial_group, auto_deactivate,
-                     c10::intrusive_ptr<MooncakeBackend>::reclaim_copy(this));
-
-    LOG(INFO) << "agent_.joinGroup done, about to publish ep";
+    // Register group is synchronous
+    agent_.registerGroup(
+        initial_group, auto_deactivate,
+        c10::intrusive_ptr<MooncakeBackend>::reclaim_copy(this));
 
     agent_.publishLocalEndpoint(buildEndpointMetadata());
-
-    LOG(INFO) << "ep published, about to waiting group readys";
 
     auto view =
         agent_.waitUntilGroupReady(meta_->group_id, std::chrono::seconds(30));
@@ -882,6 +879,11 @@ void MooncakeBackend::shutdown() {
         p2p_proxy_->abandonResources();
     }
 
+    // Phase 4: Release resources if no hung operations
+    if (has_hung_operation) {
+        p2p_proxy_->abandonResources();
+    }
+
     if (!has_hung_operation) {
         for (size_t i = 0; i < 2; i++) {
             ctx_.engine->unregisterLocalMemory(cpu_sync_send_region_[i]);
@@ -917,7 +919,7 @@ void MooncakeBackend::shutdown() {
     // Notify the Coordinator that this rank has left the group.
     // Fire-and-forget: do not block on other ranks.
     if (meta_) {
-        agent_.leaveGroup(meta_->group_id);
+        agent_.unregisterGroup(meta_->group_id);
     }
 }
 
@@ -956,7 +958,20 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
     output.reserve(ranks.size());
     for (const int rank : ranks) {
         TORCH_CHECK(rank >= 0 && rank < kMaxNumRanks, "Rank out of range");
-        output.push_back(ctx_.link_manager.isRankReady(rank));
+        // Guarantee that recover_ranks() will succeed: the peer must be a
+        // member of this group, have published an endpoint, and be HEALTHY in
+        // the Coordinator's view.  Local TE link state is intentionally
+        // excluded; the Coordinator's isActivatableSet() will retry if links
+        // are not yet mutually ready.
+        bool healthy = ctx_.link_manager.isRankHealthy(rank);
+        bool member = member_bitmap_[rank].load(std::memory_order_acquire);
+        bool endpoint = endpoint_bitmap_[rank].load(std::memory_order_acquire);
+        bool ready = healthy && member && endpoint;
+        LOG(INFO) << "[BACKEND] getPeerState rank=" << meta_->globalRank
+                  << " peer=" << rank << " healthy=" << healthy
+                  << " member=" << member << " endpoint=" << endpoint
+                  << " ready=" << ready;
+        output.push_back(ready);
     }
     return output;
 }
@@ -1007,6 +1022,17 @@ void MooncakeBackend::joinGroup() {
 }
 
 void MooncakeBackend::applyViewChange(const GroupView& view) {
+    // Ignore stale views that arrive out of order (e.g. a delayed Ready
+    // re-broadcast arriving after the activation view).
+    auto current_epoch = meta_->epoch.load(std::memory_order_acquire);
+    if (view.epoch < current_epoch) {
+        LOG(WARNING) << "[BACKEND] applyViewChange rank=" << meta_->globalRank
+                     << " group=" << meta_->group_id
+                     << " ignoring stale view epoch=" << view.epoch
+                     << " current_epoch=" << current_epoch;
+        return;
+    }
+
     // Membership boundary (activation/deactivation): reset the
     // collective sequence so that all ranks, including joiners and
     // replacements, agree on the double-buffer parity.
@@ -1043,6 +1069,45 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
         }
     }
 
+    // Update the membership/endpoint bitmaps used by getPeerState().  This lets
+    // callers wait until a replacement/extension rank has joined this group and
+    // published an endpoint before calling recover_ranks().  TE link readiness
+    // is intentionally NOT part of this guarantee.
+    //
+    // member_bitmap_ is true for any rank that is currently a member of this
+    // group (active or inactive).  A failed rank that has not yet been
+    // auto-deactivated is still active but is no longer HEALTHY, so
+    // getPeerState() correctly returns false for it.
+    for (int i = 0; i < kMaxNumRanks; ++i) {
+        const auto& member = view.members[i];
+        bool is_member = member.isMember();
+        member_bitmap_[i].store(is_member, std::memory_order_release);
+
+        bool has_valid_endpoint = member.endpoint_epoch != kInvalidEpoch;
+        uint64_t prev_epoch =
+            last_endpoint_epoch_[i].load(std::memory_order_acquire);
+        uint64_t prev_session =
+            last_agent_session_epoch_[i].load(std::memory_order_acquire);
+        bool session_changed = has_valid_endpoint &&
+                               member.agent_session_epoch != kInvalidEpoch &&
+                               member.agent_session_epoch != prev_session;
+        bool is_fresh_endpoint =
+            has_valid_endpoint &&
+            (session_changed || member.endpoint_epoch != prev_epoch);
+
+        bool endpoint_ready = member.isActive() || is_fresh_endpoint;
+        endpoint_bitmap_[i].store(endpoint_ready, std::memory_order_release);
+
+        if (has_valid_endpoint) {
+            last_endpoint_epoch_[i].store(member.endpoint_epoch,
+                                          std::memory_order_release);
+        }
+        if (member.agent_session_epoch != kInvalidEpoch) {
+            last_agent_session_epoch_[i].store(member.agent_session_epoch,
+                                               std::memory_order_release);
+        }
+    }
+
     // Keep the Python-visible activeRanksTensor in sync with the view.
     syncActiveRanksTensor();
 
@@ -1059,8 +1124,17 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
 }
 
 void MooncakeBackend::onPeerLinkReset(GlobalRank peer) {
+    if (isShutdown_) return;
     if (p2p_proxy_) {
         p2p_proxy_->resetPeerState(peer);
+    }
+    // Clear the worker-visible segmentID for any local slot that maps to this
+    // peer, so that in-flight workers do not issue transfers over a dead link.
+    for (int local_rank = 0; local_rank < meta_->size; ++local_rank) {
+        if (meta_->rank_order[local_rank] == peer) {
+            meta_->segmentIDs[local_rank] =
+                static_cast<TransferMetadata::SegmentID>(-1);
+        }
     }
 }
 

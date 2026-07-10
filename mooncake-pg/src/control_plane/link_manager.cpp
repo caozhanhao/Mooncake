@@ -243,6 +243,12 @@ bool LinkManager::isRankReady(GlobalRank peer) const {
                0;
 }
 
+bool LinkManager::isRankHealthy(GlobalRank peer) const {
+    if (!rankInRange(peer)) return false;
+    return read_state_[peer].rank_state.load(std::memory_order_acquire) ==
+           static_cast<uint8_t>(RankState::HEALTHY);
+}
+
 void LinkManager::publishLinkUp(GlobalRank peer,
                                 TransferMetadata::SegmentID target_id) {
     if (!rankInRange(peer)) return;

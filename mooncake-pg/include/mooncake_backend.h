@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <array>
 #include <vector>
 #include <mooncake_worker.cuh>
 #include <work_handles.h>
@@ -43,7 +44,6 @@ struct MooncakeProcessContext {
         std::make_unique<TransferEngine>(true);
     TransferEngine* engine = owned_engine.get();
     bool engine_initialized = false;
-    int next_group_id = 0;
     int max_world_size = 0;
 
     // === Process-level subsystems (no more singletons) ===
@@ -343,6 +343,25 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     int max_group_size_ =
         0;  // per-group capacity (max active members for this group)
     mutable uint64_t next_endpoint_epoch_ = kInitialEndpointEpoch;
+
+    // Per-rank membership/endpoint bitmaps for this group, updated from the
+    // authoritative GroupView.  getPeerState() uses them to guarantee that a
+    // peer is ready to be activated: it must be a group member (kInactive or
+    // kActive), have a valid endpoint, and be HEALTHY in the Coordinator's
+    // view. We intentionally do NOT require the local TE link to be up here.
+    std::array<std::atomic<bool>, kMaxNumRanks> member_bitmap_{};
+    std::array<std::atomic<bool>, kMaxNumRanks> endpoint_bitmap_{};
+
+    // Last endpoint_epoch observed per rank.  Used to distinguish a stale
+    // endpoint left behind by an auto-deactivated rank from a fresh endpoint
+    // published by a replacement/extension rank, so that getPeerState() does
+    // not return true for a failed rank whose slot has not yet been refreshed.
+    std::array<std::atomic<uint64_t>, kMaxNumRanks> last_endpoint_epoch_{};
+
+    // Last agent_session_epoch observed per rank.  A replacement process uses a
+    // fresh session, so even if its first endpoint_epoch collides with the old
+    // rank's epoch we must treat its endpoint as fresh.
+    std::array<std::atomic<uint64_t>, kMaxNumRanks> last_agent_session_epoch_{};
 
     // P2P async infrastructure
     // p2p_proxy_ is created in MooncakeBackend, but can live longer than

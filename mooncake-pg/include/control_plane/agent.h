@@ -14,8 +14,8 @@ class AgentStateMachine {
    public:
     AgentStateMachine(GlobalRank rank, int max_world_size);
 
-    void joinGroup(const GroupView& group, bool auto_deactivate);
-    void leaveGroup(GroupId group_id);
+    void registerGroup(const GroupView& group, bool auto_deactivate);
+    void unregisterGroup(GroupId group_id);
 
     AgentApplyResult handlePeerJoined(const PeerJoinedPush& push);
     AgentApplyResult handleRankStateUpdate(const RankStateUpdatePush& push);

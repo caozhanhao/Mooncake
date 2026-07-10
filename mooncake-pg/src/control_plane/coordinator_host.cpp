@@ -21,13 +21,13 @@ void CoordinatorRpcServiceImpl::heartbeat(
     host_.postHeartbeat(std::move(ctx), std::move(req));
 }
 
-void CoordinatorRpcServiceImpl::joinGroup(
-    coro_rpc::context<JoinGroupResponse> ctx, JoinGroupRequest req) {
-    host_.postJoinGroup(std::move(ctx), std::move(req));
+void CoordinatorRpcServiceImpl::registerGroup(
+    coro_rpc::context<RegisterGroupResponse> ctx, RegisterGroupRequest req) {
+    host_.postRegisterGroup(std::move(ctx), std::move(req));
 }
 
-void CoordinatorRpcServiceImpl::leaveGroup(LeaveGroupRequest req) {
-    host_.postLeaveGroup(std::move(req));
+void CoordinatorRpcServiceImpl::unregisterGroup(UnregisterGroupRequest req) {
+    host_.postUnregisterGroup(std::move(req));
 }
 
 void CoordinatorRpcServiceImpl::proposeViewUpdate(
@@ -71,14 +71,16 @@ void CoordinatorHost::start() {
     // Start RPC server.
     rpc_server_ = std::make_unique<RpcServer>(/*port=*/0, /*thread_num=*/2);
     rpc_impl_ = std::make_unique<CoordinatorRpcServiceImpl>(*this);
-    rpc_server_->registerHandler<
-        &CoordinatorRpcService::registerAgent,
-        &CoordinatorRpcService::heartbeat, &CoordinatorRpcService::joinGroup,
-        &CoordinatorRpcService::proposeViewUpdate,
-        &CoordinatorRpcService::publishEndpoint,
-        &CoordinatorRpcService::leaveGroup,
-        &CoordinatorRpcService::reportLinkStateChange,
-        &CoordinatorRpcService::reportTransferObservation>(rpc_impl_.get());
+    rpc_server_
+        ->registerHandler<&CoordinatorRpcService::registerAgent,
+                          &CoordinatorRpcService::heartbeat,
+                          &CoordinatorRpcService::registerGroup,
+                          &CoordinatorRpcService::proposeViewUpdate,
+                          &CoordinatorRpcService::publishEndpoint,
+                          &CoordinatorRpcService::unregisterGroup,
+                          &CoordinatorRpcService::reportLinkStateChange,
+                          &CoordinatorRpcService::reportTransferObservation>(
+            rpc_impl_.get());
 
     rpc_server_->start();
 
@@ -128,19 +130,19 @@ void CoordinatorHost::postHeartbeat(coro_rpc::context<HeartbeatResponse> ctx,
         });
 }
 
-void CoordinatorHost::postJoinGroup(coro_rpc::context<JoinGroupResponse> ctx,
-                                    JoinGroupRequest req) {
+void CoordinatorHost::postRegisterGroup(
+    coro_rpc::context<RegisterGroupResponse> ctx, RegisterGroupRequest req) {
     executor_.post(
         [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
-            auto result = state_machine_.handleJoinGroup(req);
+            auto result = state_machine_.handleRegisterGroup(req);
             ctx.response_msg(std::move(result.response));
             runEffects(result.effects);
         });
 }
 
-void CoordinatorHost::postLeaveGroup(LeaveGroupRequest req) {
+void CoordinatorHost::postUnregisterGroup(UnregisterGroupRequest req) {
     executor_.post([this, req = std::move(req)]() {
-        auto result = state_machine_.handleLeaveGroup(req);
+        auto result = state_machine_.handleUnregisterGroup(req);
         runEffects(result.effects);
     });
 }
@@ -225,6 +227,9 @@ void CoordinatorHost::runEffects(
                     }
                 },
                 [this](const PushEffect<PeerJoinedPush>& e) {
+                    LOG(INFO) << "[COORD] broadcast PeerJoinedPush rank="
+                              << e.push.rank
+                              << " te_server_name=" << e.push.te_server_name;
                     for (GlobalRank i{0}; i < max_world_size_; ++i) {
                         if (i != e.push.rank && state_machine_.getRankState(
                                                     i) != RankState::OFFLINE) {
@@ -240,13 +245,26 @@ void CoordinatorHost::runEffects(
 void CoordinatorHost::pushToAgent(GlobalRank rank,
                                   const RankStateUpdatePush& msg) {
     const auto& addr = state_machine_.getAgentAddr(rank);
-    if (addr.empty()) return;
+    if (addr.empty()) {
+        LOG(WARNING) << "[COORD] RankStateUpdatePush target rank=" << rank
+                     << " has no agent_addr; skipping";
+        return;
+    }
+    LOG(INFO) << "[COORD] pushing RankStateUpdatePush to rank=" << rank
+              << " addr=" << addr
+              << " new_state=" << static_cast<int>(msg.new_state);
     rpc_client_->send<&AgentRpcService::onRankStateUpdate>(addr, msg);
 }
 
 void CoordinatorHost::pushToAgent(GlobalRank rank, const PeerJoinedPush& msg) {
     const auto& addr = state_machine_.getAgentAddr(rank);
-    if (addr.empty()) return;
+    if (addr.empty()) {
+        LOG(WARNING) << "[COORD] PeerJoinedPush target rank=" << rank
+                     << " has no agent_addr; skipping";
+        return;
+    }
+    LOG(INFO) << "[COORD] pushing PeerJoinedPush to rank=" << rank
+              << " addr=" << addr;
     rpc_client_->send<&AgentRpcService::onPeerJoined>(addr, msg);
 }
 
@@ -267,33 +285,35 @@ void CoordinatorHost::pushViewUpdate(const ViewUpdateEffect& effect) {
             addr.empty())
             continue;
 
-        // If required_acks is non-empty, only send to required ranks.
+        // Determine if this rank is required to ACK (for proposal 2PC).
+        bool is_required_ack = false;
         if (!effect.required_acks.empty()) {
-            bool required = std::find(effect.required_acks.begin(),
-                                      effect.required_acks.end(),
-                                      i) != effect.required_acks.end();
-            if (!required) continue;
+            is_required_ack = std::find(effect.required_acks.begin(),
+                                        effect.required_acks.end(),
+                                        i) != effect.required_acks.end();
         }
 
-        // Use callAsync (not fire-and-forget send) to capture ACKs from
-        // agents.  Bootstrap ACKs always drive the bootstrap 2PC handler;
-        // proposal ACKs additionally drive the proposal 2PC handler.
-        rpc_client_->callAsync<&AgentRpcService::onViewUpdate>(
-            addr, push,
-            [this, group_id, ack_route, rank = i](ViewUpdateAck ack) {
-                if (!ack.applied) return;
-                // 1. Drive Bootstrap 2PC (always safe; no-op if not in
-                // BootstrapSyncing).
-                postBootstrapAck(group_id, rank, ack.epoch);
-                // 2. Drive Proposal 2PC (only for proposal-originated pushes).
-                std::visit(overloaded{[](const BootstrapAckRoute&) {},
-                                      [&](const ProposalAckRoute& r) {
-                                          postProposalAck(r.propose_id, rank,
-                                                          ack.epoch,
-                                                          ack.applied);
-                                      }},
-                           ack_route);
-            });
+        // Required-ACK ranks use callAsync so their replies drive 2PC;
+        // everyone else gets a fire-and-forget send — no callback overhead.
+        if (is_required_ack) {
+            rpc_client_->callAsync<&AgentRpcService::onViewUpdate>(
+                addr, push,
+                [this, group_id, ack_route, rank = i](ViewUpdateAck ack) {
+                    if (!ack.applied) return;
+                    std::visit(overloaded{[&](const BootstrapAckRoute&) {
+                                              postBootstrapAck(group_id, rank,
+                                                               ack.epoch);
+                                          },
+                                          [&](const ProposalAckRoute& r) {
+                                              postProposalAck(r.propose_id,
+                                                              rank, ack.epoch,
+                                                              ack.applied);
+                                          }},
+                               ack_route);
+                });
+        } else {
+            rpc_client_->send<&AgentRpcService::onViewUpdate>(addr, push);
+        }
     }
 }
 

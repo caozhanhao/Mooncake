@@ -35,7 +35,7 @@ class MooncakeBackend;
 //     MooncakeBackend                         AgentHost
 //   +-----------------+              +---------------------------+
 //   | proposeActivate |-> (sync) --->| call Coordinator RPC      |
-//   | joinGroup       |-> post() --->| agent_.joinGroup()        |
+//   | registerGroup   |-> post() --->| agent_.registerGroup()    |
 //   | pushObservation |-> enqueue -->| observation_queue_        |
 //   +-----------------+              +---------------------------+
 //                                            |
@@ -78,10 +78,10 @@ class AgentInterface {
     virtual void waitUntilRankActive(GroupId group_id, GlobalRank rank,
                                      std::chrono::milliseconds timeout) = 0;
 
-    virtual void joinGroup(const GroupView& group, bool auto_deactivate,
-                           c10::intrusive_ptr<MooncakeBackend> backend) = 0;
+    virtual void registerGroup(const GroupView& group, bool auto_deactivate,
+                               c10::intrusive_ptr<MooncakeBackend> backend) = 0;
 
-    virtual void leaveGroup(GroupId group_id) = 0;
+    virtual void unregisterGroup(GroupId group_id) = 0;
 
     virtual uint64_t getAgentSessionEpoch() = 0;
 
@@ -126,8 +126,7 @@ class AgentHost : public AgentInterface {
         std::chrono::milliseconds(100);
 
     // Throttle repeated registerAgent error logs.
-    static constexpr auto kRegisterErrorLogInterval =
-        std::chrono::seconds(5);
+    static constexpr auto kRegisterErrorLogInterval = std::chrono::seconds(5);
 
     AgentHost(c10::intrusive_ptr<c10d::Store> store, const std::string& host_ip,
               GlobalRank rank, int max_world_size, LinkManager& link_manager);
@@ -143,9 +142,9 @@ class AgentHost : public AgentInterface {
     void waitUntilRankActive(GroupId group_id, GlobalRank rank,
                              std::chrono::milliseconds timeout) override;
 
-    void joinGroup(const GroupView& group, bool auto_deactivate,
-                   c10::intrusive_ptr<MooncakeBackend> backend) override;
-    void leaveGroup(GroupId group_id) override;
+    void registerGroup(const GroupView& group, bool auto_deactivate,
+                       c10::intrusive_ptr<MooncakeBackend> backend) override;
+    void unregisterGroup(GroupId group_id) override;
     uint64_t getAgentSessionEpoch() override {
         return agent_.getAgentSessionEpoch();
     }
@@ -200,7 +199,7 @@ class AgentHost : public AgentInterface {
     std::chrono::steady_clock::time_point last_register_error_log_time_;
     uint64_t register_error_log_suppressed_ = 0;
 
-    // group_ready_promises_ is fulfilled when joinGroup returns and
+    // group_ready_promises_ is fulfilled when registerGroup returns and
     // the GroupView is applied.
     std::unordered_map<GroupId,
                        std::vector<std::shared_ptr<std::promise<GroupView>>>>
@@ -208,7 +207,8 @@ class AgentHost : public AgentInterface {
 
     // rank_active_promises_[group_id][rank] is fulfilled when a ViewUpdate
     // push activates `rank` in `group_id`.  Used by extension/replacement
-    // ranks to block in joinGroup() until recover_ranks activates them.
+    // ranks to block in MooncakeBackend::joinGroup() until recover_ranks
+    // activates them.
     std::unordered_map<
         GroupId,
         std::unordered_map<GlobalRank,
@@ -225,8 +225,8 @@ class AgentHost : public AgentInterface {
     void startRegisterRpc();
     void tick();
 
-    void doJoinGroup(GroupView group, bool auto_deactivate,
-                     c10::intrusive_ptr<MooncakeBackend> backend);
+    void doRegisterGroup(GroupView group, bool auto_deactivate,
+                         c10::intrusive_ptr<MooncakeBackend> backend);
     void doPublishLocalEndpoint(GroupEndpointPublication endpoint);
 
     void runEffects(const AgentApplyResult& effects);
