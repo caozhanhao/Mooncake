@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_BACKEND_H
 #define MOONCAKE_BACKEND_H
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -258,7 +259,10 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     at::Tensor getActiveRanksTensor() { return meta_->activeRanksTensor; }
 
-    int getNumSyncedRanks() { return meta_ ? meta_->activeSize : 0; }
+    int getNumSyncedRanks() {
+        if (!meta_ || !meta_->activeRanks) return 0;
+        return std::count(meta_->activeRanks, meta_->activeRanks + meta_->size, true);
+    }
 
     void extendGroupSizeTo(int size);
 

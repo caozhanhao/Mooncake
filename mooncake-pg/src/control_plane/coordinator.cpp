@@ -1082,6 +1082,21 @@ bool CentralizedCoordinatorStateMachine::registerGroup(
     // proposeViewUpdate (activate_rank / recover_ranks) from an existing
     // active member.  Until then, the extension backend operates in local-only
     // mode (its own rank is masked out of collectives by activeRanks).
+    //
+    // However, extend the existing rank_order with the new ranks now so that
+    // every member's ViewUpdate already carries the correct local→global
+    // mapping.  getPeerState() relies on rank_order to resolve in-group ranks,
+    // and without this extension an existing member would read garbage/identity
+    // for the joiner's slot and never see member=1.
+    if (new_order.size() > existing_order.size()) {
+        auto& ext_order = group_views_[group_id].rank_order;
+        for (size_t i = existing_order.size(); i < new_order.size(); ++i) {
+            ext_order.push_back(new_order[i]);
+        }
+        LOG(INFO) << "[COORD] registerGroup extended rank_order for group="
+                  << group_id << " old_size=" << existing_order.size()
+                  << " new_size=" << ext_order.size();
+    }
 
     // The joining rank needs to be able to receive view updates from the
     // Coordinator, even if it is not yet active.  Promote kNone to kInactive

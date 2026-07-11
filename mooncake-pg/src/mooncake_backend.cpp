@@ -272,7 +272,14 @@ MooncakeBackend::MooncakeBackend(
     meta_->rank = rank;
     meta_->globalRank = initial_rank_order[rank];
     for (int32_t i = 0; i < max_group_size_; ++i) {
-        meta_->rank_order[i] = initial_rank_order[i];
+        // initial_rank_order only has `size` entries; for remaining
+        // extension slots default to identity so that in-group rank i
+        // maps to global rank i until applyViewChange overwrites it.
+        if (i < size) {
+            meta_->rank_order[i] = initial_rank_order[i];
+        } else {
+            meta_->rank_order[i] = static_cast<GlobalRank>(i);
+        }
     }
     meta_->size = max_group_size_;  // slot capacity
     meta_->activeSize = size;
@@ -1024,19 +1031,23 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
     output.reserve(ranks.size());
     for (const int rank : ranks) {
         TORCH_CHECK(rank >= 0 && rank < kMaxNumRanks, "Rank out of range");
+        // ranks are in-group (local) ranks; resolve to global rank via
+        // the rank_order mapping stored in this backend's GroupView.
+        GlobalRank global_rank = meta_->rank_order[rank];
         // Guarantee that recover_ranks() will succeed: the peer must be a
         // member of this group, have an endpoint published for the current
         // session (the Coordinator tells us this via GroupMember::endpoint),
         // and be HEALTHY in the Coordinator's view.  Local TE link state is
         // intentionally excluded; the Coordinator's isActivatableSet() will
         // retry if links are not yet mutually ready.
-        bool healthy = ctx_.link_manager.isRankHealthy(rank);
-        bool member = member_bitmap_[rank].load(std::memory_order_acquire);
+        bool healthy = ctx_.link_manager.isRankHealthy(global_rank);
+        bool member = member_bitmap_[global_rank].load(std::memory_order_acquire);
         bool endpoint_present =
-            endpoint_present_bitmap_[rank].load(std::memory_order_acquire);
+            endpoint_present_bitmap_[global_rank].load(std::memory_order_acquire);
         bool ready = healthy && member && endpoint_present;
         LOG(INFO) << "[BACKEND] getPeerState rank=" << meta_->globalRank
-                  << " peer=" << rank << " healthy=" << healthy
+                  << " peer=" << rank << " global_peer=" << global_rank
+                  << " healthy=" << healthy
                   << " member=" << member
                   << " endpoint_present=" << endpoint_present
                   << " ready=" << ready;
@@ -1051,10 +1062,11 @@ void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
 
 ProposeViewUpdateResponse MooncakeBackend::activateRanks(
     const std::vector<int>& ranks) {
+    // ranks are in-group (local) ranks; map to global ranks via rank_order.
     std::vector<GlobalRank> global_ranks;
     global_ranks.reserve(ranks.size());
     for (int r : ranks) {
-        global_ranks.push_back(r);
+        global_ranks.push_back(meta_->rank_order[r]);
     }
     LOG(INFO) << "[BACKEND] activateRanks rank=" << meta_->globalRank
               << " group=" << meta_->group_id << " targets="
@@ -1223,9 +1235,11 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
     // Keep the Python-visible activeRanksTensor in sync with the view.
     syncActiveRanksTensor();
 
-    // Recalculate activeSize from the view (count of active members).
-    meta_->activeSize = std::count_if(view.members.begin(), view.members.end(),
-                                      [](auto&& m) { return m.isActive(); });
+    // activeSize stays at the total group capacity set in the constructor.
+    // activeRanks[] (updated above via syncActiveRanksTensor) controls
+    // which ranks actually participate in collectives.  This way getSize()
+    // always returns the init_process_group world_size, which PyTorch's
+    // new_group rank validation and other management APIs depend on.
 
     // Publish epoch AFTER all data-plane state (activeRanks, segmentInfos,
     // etc.) is updated.  This ensures that a thread observing the new epoch
