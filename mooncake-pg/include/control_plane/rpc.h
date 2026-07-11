@@ -28,7 +28,6 @@ struct RegisterRequest {
 // Returned in RegisterResponse so the Agent can feed LinkManager.
 struct RankConnectionMetadata {
     GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_epoch = 0;
     std::string agent_addr;
     std::string te_server_name;
     // Warmup region addresses for LinkManager handshake.
@@ -81,7 +80,7 @@ struct ProposeViewUpdateRequest {
 
 struct ProposeViewUpdateResponse {
     ViewUpdateStatus status = ViewUpdateStatus::Rejected;
-    uint64_t new_epoch = kInvalidEpoch;
+    uint64_t new_epoch = 0;
     std::vector<GlobalRank> dropped_ranks;
     std::string reject_reason;
 };
@@ -91,7 +90,6 @@ struct ProposeViewUpdateResponse {
 // enclosing PublishEndpointRequest before sending the RPC.
 struct GroupEndpointPublication {
     GroupId group_id;
-    uint64_t endpoint_epoch = kInvalidEpoch;
     GroupEndpointInfo endpoint_info;
 };
 
@@ -133,6 +131,38 @@ struct LinkStateChangeReport {
     uint64_t agent_session_epoch = 0;
 };
 
+// Agent -> Coordinator: sync-after-failure RPC.  The caller has observed a
+// failure (local_success=false) and wants the Coordinator to make a membership
+// decision.  The request may piggyback a transfer observation if one was
+// pending locally; otherwise the observation was already sent asynchronously.
+struct SyncAfterFailureRequest {
+    GroupId group_id;
+    GlobalRank reporter_rank = kInvalidGlobalRank;
+    uint64_t agent_session_epoch = 0;
+    uint64_t current_epoch = 0;  // Agent's local GroupView epoch at call time
+
+    // Conditional piggyback: true when a pending observation for this group
+    // was drained from the local queue and attached to this request.
+    bool has_observation = false;
+    uint64_t observation_epoch = 0;
+    bool local_success = false;
+    std::vector<uint8_t> attempted_ranks;
+    std::vector<uint8_t> failed_ranks_hint;
+    std::vector<uint8_t> succeeded_ranks;
+};
+
+enum class SyncAfterFailureStatus : uint8_t {
+    kDecisionApplied = 0,  // Decision made and applied (ViewUpdate ACKed by caller)
+    kNoChange = 1,         // No pending decision, epoch matches, no window open
+    kRejected = 2,         // Invalid request (stale session, group not found, etc.)
+};
+
+struct SyncAfterFailureResponse {
+    SyncAfterFailureStatus status = SyncAfterFailureStatus::kNoChange;
+    uint64_t new_epoch = 0;
+    std::string reject_reason;
+};
+
 // Coordinator -> Agent RPC messages
 
 struct PeerJoinedPush {
@@ -154,7 +184,7 @@ struct ViewUpdatePush {
 struct ViewUpdateAck {
     GlobalRank rank = kInvalidGlobalRank;
     GroupId group_id;
-    uint64_t epoch = kInvalidEpoch;
+    uint64_t epoch = 0;
     bool applied = false;
     std::string error_msg;
 };
@@ -181,7 +211,13 @@ struct BootstrapAckRoute {};
 struct ProposalAckRoute {
     uint64_t propose_id = 0;
 };
-using ViewUpdateAckRoute = std::variant<BootstrapAckRoute, ProposalAckRoute>;
+// Sync-after-failure ACK route.  When the Coordinator pushes a ViewUpdate to
+// syncAfterFailure callers, their ACKs resolve the deferred sync RPCs.
+struct SyncAckRoute {
+    GroupId group_id;
+};
+using ViewUpdateAckRoute =
+    std::variant<BootstrapAckRoute, ProposalAckRoute, SyncAckRoute>;
 
 struct ViewUpdateEffect {
     GroupView view;
@@ -194,9 +230,15 @@ struct ReplyViewUpdateEffect {
     ProposeViewUpdateResponse response;
 };
 
+struct ReplySyncEffect {
+    uint64_t sync_id = 0;
+    SyncAfterFailureResponse response;
+};
+
 using CoordinatorEffect =
     std::variant<PushEffect<RankStateUpdatePush>, ViewUpdateEffect,
-                 ReplyViewUpdateEffect, PushEffect<PeerJoinedPush>>;
+                 ReplyViewUpdateEffect, PushEffect<PeerJoinedPush>,
+                 ReplySyncEffect>;
 
 // Agent effects
 
@@ -284,6 +326,8 @@ class CoordinatorRpcService {
                                  PublishEndpointRequest req) = 0;
     virtual void reportLinkStateChange(LinkStateChangeReport req) = 0;
     virtual void reportTransferObservation(TransferObservationReport req) = 0;
+    virtual void syncAfterFailure(coro_rpc::context<SyncAfterFailureResponse> ctx,
+                                   SyncAfterFailureRequest req) = 0;
 };
 
 class AgentRpcService {

@@ -961,24 +961,21 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
     for (const int rank : ranks) {
         TORCH_CHECK(rank >= 0 && rank < kMaxNumRanks, "Rank out of range");
         // Guarantee that recover_ranks() will succeed: the peer must be a
-        // member of this group, have published a *fresh* endpoint (so that a
-        // dead rank which has not yet been auto-deactivated is not mistaken
-        // for a replacement), and be HEALTHY in the Coordinator's view.  Local
-        // TE link state is intentionally excluded; the Coordinator's
-        // isActivatableSet() will retry if links are not yet mutually ready.
+        // member of this group, have an endpoint published for the current
+        // session (the Coordinator tells us this via GroupMember::endpoint),
+        // and be HEALTHY in the Coordinator's view.  Local TE link state is
+        // intentionally excluded; the Coordinator's isActivatableSet() will
+        // retry if links are not yet mutually ready.
         bool healthy = ctx_.link_manager.isRankHealthy(rank);
         bool member = member_bitmap_[rank].load(std::memory_order_acquire);
-        bool endpoint = endpoint_bitmap_[rank].load(std::memory_order_acquire);
-        bool ready = healthy && member && endpoint;
+        bool endpoint_present =
+            endpoint_present_bitmap_[rank].load(std::memory_order_acquire);
+        bool ready = healthy && member && endpoint_present;
         LOG(INFO) << "[BACKEND] getPeerState rank=" << meta_->globalRank
                   << " peer=" << rank << " healthy=" << healthy
-                  << " member=" << member << " endpoint=" << endpoint
-                  << " ready=" << ready
-                  << " last_endpoint_epoch="
-                  << last_endpoint_epoch_[rank].load(std::memory_order_acquire)
-                  << " last_agent_session_epoch="
-                  << last_agent_session_epoch_[rank].load(
-                         std::memory_order_acquire);
+                  << " member=" << member
+                  << " endpoint_present=" << endpoint_present
+                  << " ready=" << ready;
         output.push_back(ready);
     }
     return output;
@@ -1048,6 +1045,10 @@ void MooncakeBackend::joinGroup() {
               << " group=" << meta_->group_id << " activated";
 }
 
+SyncAfterFailureResponse MooncakeBackend::syncAfterFailure() {
+    return agent_.syncAfterFailure(meta_->group_id);
+}
+
 void MooncakeBackend::applyViewChange(const GroupView& view) {
     // Ignore stale views that arrive out of order (e.g. a delayed Ready
     // re-broadcast arriving after the activation view).
@@ -1082,8 +1083,8 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
         // active ranks
         const auto& member = view.members[global_rank];
         meta_->activeRanks[local_rank] = member.isActive();
-        if (member.endpoint_epoch != kInvalidEpoch) {
-            meta_->segmentInfos[local_rank] = member.endpoint_info;
+        if (member.endpoint.has_value()) {
+            meta_->segmentInfos[local_rank] = *member.endpoint;
             auto handle = ctx_.link_manager.resolvePeer(global_rank);
             if (handle) {
                 meta_->segmentIDs[local_rank] = handle->target_id;
@@ -1096,71 +1097,40 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
         }
     }
 
-    // Update the membership/endpoint bitmaps used by getPeerState().  This lets
-    // callers wait until a replacement/extension rank has joined this group and
-    // published an endpoint before calling recover_ranks().  TE link readiness
-    // is intentionally NOT part of this guarantee.
+    // Update the membership/endpoint-present bitmaps used by getPeerState().
+    // This lets callers wait until a replacement/extension rank has joined
+    // this group and published an endpoint before calling recover_ranks().
+    // TE link readiness is intentionally NOT part of this guarantee.
     //
     // member_bitmap_ is true for any rank that is currently a member of this
-    // group (active or inactive).  endpoint_bitmap_ is true only when the
-    // member has published a *fresh* endpoint for its current session/epoch.
-    // An active rank whose endpoint has not been refreshed (e.g. a dead rank
-    // that has not yet been auto-deactivated) is therefore NOT considered
-    // endpoint-ready, so getPeerState() will not return true for it even if
-    // the local HEALTHY bitmap is momentarily stale.
+    // group (active or inactive).  endpoint_present_bitmap_ is true when the
+    // Coordinator has told us that the rank has a valid endpoint for its
+    // current session (GroupMember::endpoint is set).  Because the Coordinator
+    // clears stale endpoints on session changes, this bitmap is authoritative.
     for (int i = 0; i < kMaxNumRanks; ++i) {
         const auto& member = view.members[i];
         bool is_member = member.isMember();
         bool old_member = member_bitmap_[i].load(std::memory_order_acquire);
         member_bitmap_[i].store(is_member, std::memory_order_release);
 
-        bool has_valid_endpoint = member.endpoint_epoch != kInvalidEpoch;
-        uint64_t prev_epoch =
-            last_endpoint_epoch_[i].load(std::memory_order_acquire);
-        uint64_t prev_session =
-            last_agent_session_epoch_[i].load(std::memory_order_acquire);
-        bool session_changed = has_valid_endpoint &&
-                               member.agent_session_epoch != kInvalidEpoch &&
-                               member.agent_session_epoch != prev_session;
-        bool is_fresh_endpoint =
-            has_valid_endpoint &&
-            (session_changed || member.endpoint_epoch != prev_epoch);
+        bool endpoint_present = member.hasEndpoint();
+        bool old_endpoint_present =
+            endpoint_present_bitmap_[i].load(std::memory_order_acquire);
+        endpoint_present_bitmap_[i].store(endpoint_present,
+                                          std::memory_order_release);
 
-        // Require a fresh endpoint: recover_ranks()/activateRanks() is only
-        // meaningful for ranks that have newly joined or re-published an
-        // endpoint.  An already-active rank with a stale endpoint (such as a
-        // rank that died before auto-deactivation) must not appear ready.
-        bool endpoint_ready = is_fresh_endpoint;
-        bool old_endpoint = endpoint_bitmap_[i].load(std::memory_order_acquire);
-        endpoint_bitmap_[i].store(endpoint_ready, std::memory_order_release);
-
-        if (is_member != old_member || endpoint_ready != old_endpoint ||
-            (i < max_group_size_ && (is_member || has_valid_endpoint))) {
+        if (is_member != old_member ||
+            endpoint_present != old_endpoint_present ||
+            (i < max_group_size_ && (is_member || endpoint_present))) {
             LOG(INFO) << "[BACKEND] applyViewChange rank=" << meta_->globalRank
                       << " group=" << meta_->group_id
                       << " peer=" << i << " epoch=" << view.epoch
                       << " status=" << static_cast<int>(member.status)
                       << " member_changed=" << (is_member != old_member)
-                      << " endpoint_changed="
-                      << (endpoint_ready != old_endpoint)
+                      << " endpoint_present_changed="
+                      << (endpoint_present != old_endpoint_present)
                       << " member=" << is_member
-                      << " endpoint_ready=" << endpoint_ready
-                      << " has_valid_endpoint=" << has_valid_endpoint
-                      << " endpoint_epoch=" << member.endpoint_epoch
-                      << " agent_session_epoch="
-                      << member.agent_session_epoch
-                      << " prev_endpoint_epoch=" << prev_epoch
-                      << " prev_agent_session_epoch=" << prev_session
-                      << " is_fresh=" << is_fresh_endpoint;
-        }
-
-        if (has_valid_endpoint) {
-            last_endpoint_epoch_[i].store(member.endpoint_epoch,
-                                          std::memory_order_release);
-        }
-        if (member.agent_session_epoch != kInvalidEpoch) {
-            last_agent_session_epoch_[i].store(member.agent_session_epoch,
-                                               std::memory_order_release);
+                      << " endpoint_present=" << endpoint_present;
         }
     }
 
@@ -1179,18 +1149,14 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
     }
 }
 
-void MooncakeBackend::onPeerLinkReset(GlobalRank peer) {
+void MooncakeBackend::onPeerLinkReset(InGroupRank peer) {
     if (isShutdown_) return;
     if (p2p_proxy_) {
         p2p_proxy_->resetPeerState(peer);
     }
-    // Clear the worker-visible segmentID for any local slot that maps to this
-    // peer, so that in-flight workers do not issue transfers over a dead link.
-    for (int local_rank = 0; local_rank < meta_->size; ++local_rank) {
-        if (meta_->rank_order[local_rank] == peer) {
-            meta_->segmentIDs[local_rank] =
-                static_cast<TransferMetadata::SegmentID>(-1);
-        }
+    if (peer >= 0 && peer < meta_->size) {
+        meta_->segmentIDs[peer] =
+            static_cast<TransferMetadata::SegmentID>(-1);
     }
 }
 
@@ -1206,7 +1172,6 @@ void MooncakeBackend::markViewStale() {
 GroupEndpointPublication MooncakeBackend::buildEndpointMetadata() const {
     GroupEndpointPublication ep;
     ep.group_id = meta_->group_id;
-    ep.endpoint_epoch = next_endpoint_epoch_++;
     ep.endpoint_info = meta_->segmentInfos[meta_->rank];
     return ep;
 }

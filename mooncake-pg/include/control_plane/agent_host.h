@@ -100,6 +100,11 @@ class AgentInterface {
                                          std::vector<uint8_t> failed_ranks_hint,
                                          std::vector<uint8_t> succeeded_ranks,
                                          bool local_success) = 0;
+
+    // Sync-after-failure: notify the Coordinator of a detected failure and
+    // block until a membership decision has been made and applied locally.
+    // Returns the decision status and new epoch.
+    virtual SyncAfterFailureResponse syncAfterFailure(GroupId group_id) = 0;
 };
 
 class AgentHost;
@@ -162,6 +167,8 @@ class AgentHost : public AgentInterface {
                                  std::vector<uint8_t> failed_ranks_hint,
                                  std::vector<uint8_t> succeeded_ranks,
                                  bool local_success) override;
+
+    SyncAfterFailureResponse syncAfterFailure(GroupId group_id) override;
 
     void postPeerJoined(PeerJoinedPush push);
     void postRankStateUpdate(RankStateUpdatePush push);

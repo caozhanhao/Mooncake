@@ -101,19 +101,15 @@ def _extension_worker(
 
         backend = ctx.get_backend()
 
-        # group_size for extension rank equals world_size passed at init.
-        # Note: this is world_size (= max_world_size for joiners), not 1,
-        # because the joiner's activeSize is initialized to world_size.
-        # The local-only behavior is ensured by activeRanks masking, not
-        # by a smaller activeSize.
+        # group_size always equals to the number of active ranks
         actual_ws = dist.get_world_size()
-        assert actual_ws == ctx.world_size, (
+        assert actual_ws == initial_world_size, (
             f"extension rank: initial world_size={actual_ws}, "
-            f"expected {ctx.world_size}"
+            f"expected {initial_world_size}"
         )
 
-        # Inactive extension ranks cannot participate in collectives until the
-        # coordinator activates them.  Block here until the primaries call
+        # Inactive extension ranks can NOT participate in collectives until the
+        # coordinator activates them.  Block here until one existing rank call
         # recover_ranks() for this slot.
         pg.join_group(backend)
 
@@ -656,12 +652,19 @@ def _replacement_recovery_worker(
         expected_failed_ranks_hint[BROKEN_RANK] = 1
         assert failed_ranks_hint.cpu().tolist() == expected_failed_ranks_hint
 
+        # Sync with the Coordinator to get the auto-deactivation decision.
+        # After this, get_peer_state() reflects the authoritative decision.
+        result = pg.sync_after_failure(backend)
+        assert result["status"] != 2, (  # kRejected
+            f"rank {logical_rank}: sync_after_failure rejected: "
+            f"{result.get('reject_reason', '')}"
+        )
+
         # Signal that we're ready for replacement
         if logical_rank == 0:
             start_recovery.set()
 
         # Wait for replacement to be connected (metadata published)
-        # Use longer poll interval to avoid overloading the connection poller
         wait_until(
             lambda: pg.get_peer_state(backend, [BROKEN_RANK])[0],
             timeout_s=30.0,

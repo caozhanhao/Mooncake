@@ -2,6 +2,7 @@
 #define MOONCAKE_PG_CONTROL_PLANE_TYPES_H
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -29,12 +30,6 @@ constexpr GlobalRank kInvalidGlobalRank = -1;
 inline const GroupId kInvalidGroupId = "";
 constexpr int kMaxNumRanks = 64;
 
-// Epoch sentinels.  All epochs start at kInvalidEpoch (0) and only increase
-// from there.  A value of kInvalidEpoch means "not yet initialised" / "stale".
-// The first real epoch value is >= 1.
-constexpr uint64_t kInvalidEpoch = 0;
-constexpr uint64_t kInitialEndpointEpoch = 1;
-
 // Process-level state for a rank.  All transitions are driven by the
 // Coordinator (authoritative); the Agent never self-demotes.
 //
@@ -54,6 +49,12 @@ enum class RankState : uint8_t {
 
 // Group-level, per-(group_id, rank) buffer/sync/P2P addresses.
 struct GroupEndpointInfo {
+    // Coordinator-assigned endpoint version.  The Agent publishes with 0 (it
+    // does not know the epoch); the Coordinator fills it in before pushing the
+    // ViewUpdate.  A change in this value tells the Agent that the remote
+    // endpoint has been republished and the LinkManager should reconnect.
+    uint64_t endpoint_epoch = 0;
+
     // collective
     uint64_t send_buffer[2] = {};
     uint64_t recv_buffer[2] = {};
@@ -74,14 +75,14 @@ enum class GroupMemberStatus : uint8_t {
 
 // Rank state inside a single GroupView.
 //
-// endpoint_epoch is monotonically increasing and never reset.  kInvalidEpoch
-// means "no endpoint published yet".  Validity requires agent_session_epoch
-// to match the rank's current session AND endpoint_epoch != kInvalidEpoch.
+// endpoint is an optional GroupEndpointInfo.  When set, the rank has published
+// an endpoint for its current agent session; the Coordinator only keeps it set
+// while agent_session_epoch matches the rank's current session.  This makes
+// endpoint.has_value() authoritative for "endpoint present and fresh".
 struct GroupMember {
     GroupMemberStatus status = GroupMemberStatus::kNone;
-    uint64_t agent_session_epoch = kInvalidEpoch;
-    uint64_t endpoint_epoch = kInvalidEpoch;
-    GroupEndpointInfo endpoint_info;
+    std::optional<uint64_t> agent_session_epoch;  // session that published endpoint
+    std::optional<GroupEndpointInfo> endpoint;
 
     bool isActive() const { return status == GroupMemberStatus::kActive; }
     bool isMember() const {
@@ -89,6 +90,7 @@ struct GroupMember {
                status == GroupMemberStatus::kInactive;
     }
     bool hasLeft() const { return status == GroupMemberStatus::kLeft; }
+    bool hasEndpoint() const { return endpoint.has_value(); }
 };
 
 // Group lifecycle status.
@@ -120,8 +122,8 @@ enum class GroupStatus : uint8_t {
 };
 
 // Runtime state for a group.  rank_order maps InGroupRank → GlobalRank.
-// epoch starts at 0 and monotonically increases; the first real epoch after
-// bootstrap completion is 1.
+// epoch is the GroupView version; it starts at 0 and monotonically increases
+// on every membership or endpoint change.
 struct GroupView {
     GroupId group_id;
     GroupStatus status = GroupStatus::Bootstrapping;

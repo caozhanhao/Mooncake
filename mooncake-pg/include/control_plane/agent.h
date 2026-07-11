@@ -35,6 +35,10 @@ class AgentStateMachine {
     AgentApplyResult processTransferObservation(
         const TransferObservationEvent& event);
 
+    // Mark the observation data as already reported (used when piggybacking
+    // on a syncAfterFailure RPC instead of sending a separate async report).
+    void markObservationReported(const TransferObservationEvent& event);
+
     GroupView getGroupView(GroupId group_id) const;
 
     enum class CoordinatorConnection { Connected, Registering, Disconnected };

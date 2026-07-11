@@ -46,6 +46,12 @@ class CoordinatorStateMachine {
                                                             GlobalRank rank,
                                                             uint64_t epoch) = 0;
 
+    virtual CoordinatorApplyResult<void> handleSyncAfterFailure(
+        uint64_t sync_id, const SyncAfterFailureRequest& req) = 0;
+
+    virtual CoordinatorApplyResult<void> handleSyncViewUpdateAck(
+        GroupId group_id, GlobalRank rank, uint64_t epoch) = 0;
+
     virtual CoordinatorApplyResult<PublishEndpointResponse>
     handlePublishEndpoint(const PublishEndpointRequest& req) = 0;
 
@@ -102,6 +108,12 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                                                     GlobalRank rank,
                                                     uint64_t epoch) override;
 
+    CoordinatorApplyResult<void> handleSyncAfterFailure(
+        uint64_t sync_id, const SyncAfterFailureRequest& req) override;
+
+    CoordinatorApplyResult<void> handleSyncViewUpdateAck(
+        GroupId group_id, GlobalRank rank, uint64_t epoch) override;
+
     RankState getRankState(GlobalRank rank) const {
         if (!rankInValidRange(rank)) return RankState::OFFLINE;
         return ranks_[rank].state;
@@ -129,6 +141,13 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     std::unordered_map<GroupId, GroupView> group_views_;
     std::unordered_map<GroupId, bool> group_auto_deactivate_;
+
+    // Coordinator-assigned endpoint epoch counter per (group_id, rank).
+    // Incremented on every successful publishEndpoint for that slot; cleared
+    // when the endpoint is invalidated (session change, deactivate, offline,
+    // unregister).  Used by the Agent as a declarative reconnect trigger.
+    std::unordered_map<GroupId, std::array<uint64_t, kMaxNumRanks>>
+        endpoint_epochs_;
 
     // Two independent 2PC flows share the same ViewUpdate ACK path:
     //   1. Proposal 2PC (activate/deactivate) - keyed by propose_id
@@ -166,6 +185,20 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     FaultReconciliationContext reconciliation_ctx_;
     std::chrono::microseconds fault_reconciliation_window_;
 
+    // Pending sync-after-failure requests.  Keyed by group_id, each entry maps
+    // caller_rank -> list of sync_ids waiting for a decision for that group.
+    // Resolved when the caller ACKs the ViewUpdate that carries the decision
+    // (via SyncAckRoute), or immediately via flushPendingSyncs when the epoch
+    // changes through a non-window path.
+    struct PendingSyncRequest {
+        uint64_t sync_id;
+        GlobalRank caller_rank;
+        uint64_t entry_epoch;
+    };
+    std::unordered_map<GroupId,
+                       std::unordered_map<GlobalRank, std::vector<uint64_t>>>
+        pending_syncs_;
+
     static constexpr auto kProposeTimeout = std::chrono::seconds(2);
     static constexpr auto kHeartbeatTimeout = std::chrono::seconds(5);
 
@@ -190,6 +223,17 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     //
     // Called after every state-changing operation.
     void checkGroupTransitions(std::vector<CoordinatorEffect>& effects);
+
+    // Resolve all pending syncs for `group_id` (or `group_id, rank`).
+    // Emits ReplySyncEffect for each pending sync_id.
+    void flushPendingSyncs(GroupId group_id,
+                           std::vector<CoordinatorEffect>& effects);
+    void flushPendingSyncs(GroupId group_id, GlobalRank rank,
+                           std::vector<CoordinatorEffect>& effects);
+
+    // Build the response for a sync-after-failure request.
+    SyncAfterFailureResponse buildSyncAfterFailureResponse(
+        GroupId group_id) const;
 
     bool isMutuallyConnected(GlobalRank a, GlobalRank b) const;
     // Preserve existing HEALTHY ranks that are still mutually connected,

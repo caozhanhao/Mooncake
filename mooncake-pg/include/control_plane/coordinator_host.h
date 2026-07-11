@@ -78,6 +78,9 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
 
     void reportTransferObservation(TransferObservationReport req) override;
 
+    void syncAfterFailure(coro_rpc::context<SyncAfterFailureResponse> ctx,
+                           SyncAfterFailureRequest req) override;
+
     void unregisterGroup(UnregisterGroupRequest req) override;
 
    private:
@@ -122,6 +125,12 @@ class CoordinatorHost {
 
     void postLinkStateChange(LinkStateChangeReport req);
 
+    void postSyncAfterFailure(coro_rpc::context<SyncAfterFailureResponse> ctx,
+                              SyncAfterFailureRequest req);
+
+    void postSyncViewUpdateAck(GroupId group_id, GlobalRank rank,
+                               uint64_t epoch);
+
    private:
     CentralizedCoordinatorStateMachine state_machine_;
     SerializedExecutor executor_;
@@ -142,6 +151,10 @@ class CoordinatorHost {
     uint64_t next_propose_id_{1};
     std::unordered_map<uint64_t, coro_rpc::context<ProposeViewUpdateResponse>>
         pending_rpcs_;
+
+    uint64_t next_sync_id_{1};
+    std::unordered_map<uint64_t, coro_rpc::context<SyncAfterFailureResponse>>
+        pending_sync_ctxs_;
 
     void runEffects(const std::vector<CoordinatorEffect>& effects);
     void pushToAgent(GlobalRank rank, const RankStateUpdatePush& msg);

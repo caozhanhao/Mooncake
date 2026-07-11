@@ -18,7 +18,7 @@ namespace {
 // Generate a process-unique starting point for agent_session_epoch so that
 // replacement processes cannot collide with the old rank's session epoch.
 // The low bits mix the current time, the high bits hold the pid; the result
-// is guaranteed non-zero so it is distinguishable from kInvalidEpoch.
+// is guaranteed non-zero so it is distinguishable from an unset session.
 uint64_t generateInitialAgentSessionEpoch() {
     auto now = std::chrono::steady_clock::now().time_since_epoch().count();
     uint64_t pid = static_cast<uint64_t>(getpid());
@@ -346,6 +346,57 @@ void AgentHost::pushTransferObservation(GroupId group_id,
         std::move(succeeded_ranks)});
 }
 
+SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
+    SyncAfterFailureRequest req;
+    req.group_id = group_id;
+    req.reporter_rank = rank_;
+    req.agent_session_epoch = agent_.getAgentSessionEpoch();
+
+    // Step 1: Drain observation queue on the executor thread.
+    // Piggyback a pending observation for the target group, and send any
+    // observations for other groups normally.
+    executor_.postAndWait([this, &req]() {
+        TransferObservationEvent event;
+        while (observation_queue_.try_dequeue(event)) {
+            if (event.group_id == req.group_id) {
+                // Piggyback this observation on the sync RPC.
+                req.has_observation = true;
+                req.local_success = event.local_success;
+                req.observation_epoch =
+                    agent_.getGroupView(req.group_id).epoch;
+                req.attempted_ranks = std::move(event.attempted_ranks);
+                req.failed_ranks_hint = std::move(event.failed_ranks_hint);
+                req.succeeded_ranks = std::move(event.succeeded_ranks);
+                // Mark as reported so the next tick won't double-report.
+                agent_.markObservationReported(event);
+            } else {
+                // Another group — process normally.
+                auto effects = agent_.processTransferObservation(event);
+                for (auto& e : effects) {
+                    if (auto* s =
+                            std::get_if<SendTransferObservation>(&e)) {
+                        s->request.agent_session_epoch =
+                            agent_.getAgentSessionEpoch();
+                        s->request.epoch =
+                            agent_.getGroupView(s->request.group_id).epoch;
+                    }
+                }
+                runEffects(effects);
+            }
+        }
+    });
+
+    // Step 2: Get current epoch (safe — executor serializes access).
+    req.current_epoch = getGroupView(group_id).epoch;
+
+    // Step 3: Synchronous RPC.  Blocks the calling thread (not the executor)
+    // until the Coordinator replies.  The reply is gated on the ViewUpdate
+    // ACK from this Agent, so get_peer_state() reflects the decision when
+    // this returns.
+    return rpc_client_->call<&CoordinatorRpcService::syncAfterFailure>(
+        coordinator_addr_, req);
+}
+
 // RPC push callbacks
 
 void AgentHost::postPeerJoined(PeerJoinedPush push) {
@@ -638,9 +689,20 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                     });
                 },
                 [this](const NotifyTEUnreachable& e) {
-                    forEachBackend([&](auto backend) {
-                        backend->onPeerLinkReset(e.peer);
-                    });
+                    // NotifyTEUnreachable carries a GlobalRank.
+                    // Translate to InGroupRank per-backend via rank_order.
+                    for (auto& [group_id, backend] : backends_) {
+                        auto view = agent_.getGroupView(group_id);
+                        for (InGroupRank lr = 0;
+                             lr < static_cast<InGroupRank>(
+                                      view.rank_order.size());
+                             ++lr) {
+                            if (view.rank_order[lr] == e.peer) {
+                                backend->onPeerLinkReset(lr);
+                                break;
+                            }
+                        }
+                    }
                 },
             },
             effect);

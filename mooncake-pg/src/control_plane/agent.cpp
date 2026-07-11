@@ -52,6 +52,15 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
     }
     if (push.rank == rank_) return effects;
 
+    // If the TE server name changed (replacement process), tear down the
+    // old link before probing the new one.  Without this the poller skips
+    // the peer because the old CONNECTED state lingers until the transport
+    // engine detects the peer failure, which can take seconds.
+    auto old = rank_connections_[push.rank];
+    if (old.has_value() && old->te_server_name != push.te_server_name) {
+        effects.push_back(DisconnectLink{push.rank});
+    }
+
     rank_connections_[push.rank] = RankConnectionMetadata{
         .rank = push.rank,
         .te_server_name = push.te_server_name,
@@ -104,6 +113,35 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
     LOG(INFO) << "[AGENT] handleViewUpdate rank=" << rank_
               << " group=" << push.group_id << " epoch=" << push.view.epoch
               << " #effects=1";
+
+    // Detect coordinator-assigned endpoint_epoch changes.  A change means the
+    // remote endpoint has been republished (e.g. replacement process) and the
+    // LinkManager must drop the old link and re-probe with the new server info.
+    const auto& old_view = it->second.view;
+    for (size_t r = 0; r < push.view.members.size(); ++r) {
+        if (r == static_cast<size_t>(rank_)) continue;
+        if (!push.view.members[r].isMember()) continue;
+        uint64_t old_epoch = 0;
+        uint64_t new_epoch = 0;
+        if (old_view.members[r].hasEndpoint()) {
+            old_epoch = old_view.members[r].endpoint->endpoint_epoch;
+        }
+        if (push.view.members[r].hasEndpoint()) {
+            new_epoch = push.view.members[r].endpoint->endpoint_epoch;
+        }
+        if (old_epoch != 0 && new_epoch != 0 && new_epoch != old_epoch) {
+            const auto& conn = rank_connections_[r];
+            if (conn.has_value()) {
+                effects.push_back(DisconnectLink{r});
+                effects.push_back(EnablePeerProbe{
+                    r, conn->te_server_name, conn->warmup_recv_addr});
+                LOG(INFO) << "[AGENT] endpoint_epoch changed rank=" << rank_
+                          << " peer=" << r
+                          << " old_epoch=" << old_epoch
+                          << " new_epoch=" << new_epoch;
+            }
+        }
+    }
 
     it->second.view = push.view;
 
@@ -298,6 +336,19 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
     }
 
     return effects;
+}
+
+void AgentStateMachine::markObservationReported(
+    const TransferObservationEvent& event) {
+    for (size_t peer = 0; peer < event.attempted_ranks.size(); ++peer) {
+        if (peer >= max_world_size_) continue;
+        if (!event.attempted_ranks[peer]) continue;
+
+        bool succeeded = event.succeeded_ranks[peer];
+        bool failed = event.failed_ranks_hint[peer];
+        bool current = succeeded && !failed;
+        last_reported_peer_status_[peer] = current;
+    }
 }
 
 void AgentStateMachine::syncRankStateSnapshot(AgentApplyResult& effects) {

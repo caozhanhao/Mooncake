@@ -52,6 +52,12 @@ void CoordinatorRpcServiceImpl::reportTransferObservation(
     host_.postTransferObservation(std::move(req));
 }
 
+void CoordinatorRpcServiceImpl::syncAfterFailure(
+    coro_rpc::context<SyncAfterFailureResponse> ctx,
+    SyncAfterFailureRequest req) {
+    host_.postSyncAfterFailure(std::move(ctx), std::move(req));
+}
+
 // CoordinatorHost
 
 CoordinatorHost::CoordinatorHost(c10::intrusive_ptr<c10d::Store> store,
@@ -79,7 +85,8 @@ void CoordinatorHost::start() {
                           &CoordinatorRpcService::publishEndpoint,
                           &CoordinatorRpcService::unregisterGroup,
                           &CoordinatorRpcService::reportLinkStateChange,
-                          &CoordinatorRpcService::reportTransferObservation>(
+                          &CoordinatorRpcService::reportTransferObservation,
+                          &CoordinatorRpcService::syncAfterFailure>(
             rpc_impl_.get());
 
     rpc_server_->start();
@@ -108,6 +115,13 @@ void CoordinatorHost::shutdown() {
             ViewUpdateStatus::Rejected, 0, {}, "coordinator shutting down"});
     }
     pending_rpcs_.clear();
+
+    // 4. Fail any pending sync requests.
+    for (auto& [sync_id, ctx] : pending_sync_ctxs_) {
+        ctx.response_msg(SyncAfterFailureResponse{
+            SyncAfterFailureStatus::kRejected, 0, "coordinator shutting down"});
+    }
+    pending_sync_ctxs_.clear();
 }
 
 void CoordinatorHost::postRegister(coro_rpc::context<RegisterResponse> ctx,
@@ -201,6 +215,27 @@ void CoordinatorHost::postLinkStateChange(LinkStateChangeReport req) {
     });
 }
 
+void CoordinatorHost::postSyncAfterFailure(
+    coro_rpc::context<SyncAfterFailureResponse> ctx,
+    SyncAfterFailureRequest req) {
+    executor_.post([this, ctx = std::move(ctx),
+                    req = std::move(req)]() mutable {
+        uint64_t sync_id = next_sync_id_++;
+        pending_sync_ctxs_.emplace(sync_id, std::move(ctx));
+        auto result = state_machine_.handleSyncAfterFailure(sync_id, req);
+        runEffects(result.effects);
+    });
+}
+
+void CoordinatorHost::postSyncViewUpdateAck(GroupId group_id, GlobalRank rank,
+                                            uint64_t epoch) {
+    executor_.post([this, group_id, rank, epoch]() {
+        auto result =
+            state_machine_.handleSyncViewUpdateAck(group_id, rank, epoch);
+        runEffects(result.effects);
+    });
+}
+
 void CoordinatorHost::runEffects(
     const std::vector<CoordinatorEffect>& effects) {
     for (const auto& effect : effects) {
@@ -224,6 +259,13 @@ void CoordinatorHost::runEffects(
                     if (it != pending_rpcs_.end()) {
                         it->second.response_msg(e.response);
                         pending_rpcs_.erase(it);
+                    }
+                },
+                [this](const ReplySyncEffect& e) {
+                    auto it = pending_sync_ctxs_.find(e.sync_id);
+                    if (it != pending_sync_ctxs_.end()) {
+                        it->second.response_msg(e.response);
+                        pending_sync_ctxs_.erase(it);
                     }
                 },
                 [this](const PushEffect<PeerJoinedPush>& e) {
@@ -308,6 +350,10 @@ void CoordinatorHost::pushViewUpdate(const ViewUpdateEffect& effect) {
                                               postProposalAck(r.propose_id,
                                                               rank, ack.epoch,
                                                               ack.applied);
+                                          },
+                                          [&](const SyncAckRoute& r) {
+                                              postSyncViewUpdateAck(
+                                                  r.group_id, rank, ack.epoch);
                                           }},
                                ack_route);
                 });

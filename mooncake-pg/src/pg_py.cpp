@@ -295,6 +295,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Get the current GroupView epoch (monotonically increasing on "
           "membership changes).");
 
+    m.def(
+        "sync_after_failure",
+        [](c10::intrusive_ptr<c10d::ProcessGroup> backend) {
+            auto mooncakeBackend =
+                c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+            SyncAfterFailureResponse resp = mooncakeBackend->syncAfterFailure();
+            py::dict result;
+            result["status"] = static_cast<uint8_t>(resp.status);
+            result["new_epoch"] = resp.new_epoch;
+            result["reject_reason"] = resp.reject_reason;
+            return result;
+        },
+        py::arg("backend"),
+        "Notify the Coordinator of a detected failure and block until a "
+        "membership decision has been made and the Agent has locally applied "
+        "the resulting ViewUpdate.  After this returns, get_peer_state() "
+        "reflects the Coordinator's authoritative decision.  Returns a dict "
+        "with keys: status (0=decision_applied, 1=no_change, 2=rejected), "
+        "new_epoch, reject_reason.");
+
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(
         m, "MooncakeBackendOptions")

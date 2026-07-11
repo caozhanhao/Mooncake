@@ -285,12 +285,18 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         return meta_ ? meta_->epoch.load(std::memory_order_acquire) : 0;
     }
 
-    // Called by AgentHost when a TE link to `peer` goes down.
+    // Called by AgentHost when a TE link to `peer` (InGroupRank) goes down.
     // Resets the per-backend P2PProxy state for the affected peer.
-    void onPeerLinkReset(GlobalRank peer);
+    void onPeerLinkReset(InGroupRank peer);
 
     // Mark this backend's view as stale (called when Agent goes OFFLINE).
     void markViewStale();
+
+    /// Sync-after-failure: notify the Coordinator of a detected failure and
+    /// block until a membership decision has been made and the Agent has
+    /// ACKed the resulting ViewUpdate.  After this returns, getPeerState()
+    /// reflects the Coordinator's authoritative decision.
+    SyncAfterFailureResponse syncAfterFailure();
 
     // Sync the activeRanksTensor on CPU/GPU from the current GroupView.
     void syncActiveRanksTensor();
@@ -342,27 +348,16 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     bool isShutdown_{false};
     int max_group_size_ =
         0;  // per-group capacity (max active members for this group)
-    mutable uint64_t next_endpoint_epoch_ = kInitialEndpointEpoch;
 
-    // Per-rank membership/endpoint bitmaps for this group, updated from the
-    // authoritative GroupView.  getPeerState() uses them to guarantee that a
-    // peer is ready to be activated: it must be a group member (kInactive or
-    // kActive), have a *fresh* endpoint (session or endpoint_epoch changed
-    // since the last observed value), and be HEALTHY in the Coordinator's
-    // view. We intentionally do NOT require the local TE link to be up here.
+    // Per-rank membership/endpoint-present bitmaps for this group, updated from
+    // the authoritative GroupView.  getPeerState() uses them to guarantee that
+    // a peer is ready to be activated: it must be a group member (kInactive or
+    // kActive), have an endpoint published for the current session (the
+    // Coordinator tells us this via GroupMember::endpoint), and be HEALTHY in
+    // the Coordinator's view.  We intentionally do NOT require the local TE
+    // link to be up here.
     std::array<std::atomic<bool>, kMaxNumRanks> member_bitmap_{};
-    std::array<std::atomic<bool>, kMaxNumRanks> endpoint_bitmap_{};
-
-    // Last endpoint_epoch observed per rank.  Used to distinguish a stale
-    // endpoint left behind by an auto-deactivated rank from a fresh endpoint
-    // published by a replacement/extension rank, so that getPeerState() does
-    // not return true for a failed rank whose slot has not yet been refreshed.
-    std::array<std::atomic<uint64_t>, kMaxNumRanks> last_endpoint_epoch_{};
-
-    // Last agent_session_epoch observed per rank.  A replacement process uses a
-    // fresh session, so even if its first endpoint_epoch collides with the old
-    // rank's epoch we must treat its endpoint as fresh.
-    std::array<std::atomic<uint64_t>, kMaxNumRanks> last_agent_session_epoch_{};
+    std::array<std::atomic<bool>, kMaxNumRanks> endpoint_present_bitmap_{};
 
     // P2P async infrastructure
     // p2p_proxy_ is created in MooncakeBackend, but can live longer than
