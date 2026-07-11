@@ -298,8 +298,12 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
         if (peer >= max_world_size_) continue;
         if (!event.attempted_ranks[peer]) continue;
 
-        bool succeeded = event.succeeded_ranks[peer];
-        bool failed = event.failed_ranks_hint[peer];
+        bool succeeded = peer < event.succeeded_ranks.size()
+                            ? event.succeeded_ranks[peer]
+                            : 0;
+        bool failed = peer < event.failed_ranks_hint.size()
+                          ? event.failed_ranks_hint[peer]
+                          : 0;
 
         // Determine current observation: failed takes precedence.
         bool current = succeeded && !failed;
@@ -344,8 +348,12 @@ void AgentStateMachine::markObservationReported(
         if (peer >= max_world_size_) continue;
         if (!event.attempted_ranks[peer]) continue;
 
-        bool succeeded = event.succeeded_ranks[peer];
-        bool failed = event.failed_ranks_hint[peer];
+        bool succeeded = peer < event.succeeded_ranks.size()
+                            ? event.succeeded_ranks[peer]
+                            : 0;
+        bool failed = peer < event.failed_ranks_hint.size()
+                          ? event.failed_ranks_hint[peer]
+                          : 0;
         bool current = succeeded && !failed;
         last_reported_peer_status_[peer] = current;
     }

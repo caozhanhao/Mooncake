@@ -204,25 +204,23 @@ struct PushEffect {
     Push push;
 };
 
-// Route for ViewUpdate ACKs.  Bootstrap ACKs always go to the bootstrap 2PC
-// handler; proposal ACKs additionally go to the proposal 2PC handler and carry
-// the propose_id that originated the push.
-struct BootstrapAckRoute {};
+// Unified ViewUpdate ACK route.  Every epoch-changing ViewUpdate requires
+// ACKs from its required_acks set.  When those ACKs arrive a single handler
+// (handleViewUpdateAck) checks all pending state — bootstrap 2PC, proposal
+// 2PC, and sync-after-failure callers — and resolves whatever matches.
+//
+// Proposal ACKs carry the propose_id that originated the push so the
+// handler can resolve the correct proposal.
+struct GeneralAckRoute {};
 struct ProposalAckRoute {
     uint64_t propose_id = 0;
 };
-// Sync-after-failure ACK route.  When the Coordinator pushes a ViewUpdate to
-// syncAfterFailure callers, their ACKs resolve the deferred sync RPCs.
-struct SyncAckRoute {
-    GroupId group_id;
-};
-using ViewUpdateAckRoute =
-    std::variant<BootstrapAckRoute, ProposalAckRoute, SyncAckRoute>;
+using ViewUpdateAckRoute = std::variant<GeneralAckRoute, ProposalAckRoute>;
 
 struct ViewUpdateEffect {
     GroupView view;
     std::vector<GlobalRank> required_acks;
-    ViewUpdateAckRoute ack_route = BootstrapAckRoute{};
+    ViewUpdateAckRoute ack_route = GeneralAckRoute{};
 };
 
 struct ReplyViewUpdateEffect {

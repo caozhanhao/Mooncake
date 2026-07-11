@@ -249,6 +249,33 @@ bool LinkManager::isRankHealthy(GlobalRank peer) const {
            static_cast<uint8_t>(RankState::HEALTHY);
 }
 
+void LinkManager::refreshPeerSegment(GlobalRank peer) {
+    if (peer == rank_) return;
+    if (!rankInRange(peer)) return;
+
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    auto& link = peers_[peer];
+
+    // Only meaningful for connected peers.
+    if (link.state != PeerLinkState::CONNECTED) return;
+    if (!link.target_id.has_value()) return;
+
+    // Close the old segment (stale rkey) and open a fresh one.
+    engine_->closeSegment(link.target_id.value());
+    engine_->removeLocalSegment(link.server_name);
+    link.target_id = engine_->openSegment(link.server_name);
+
+    // Atomically swap in the new target_id without touching link_connected.
+    // Increment the version so resolvePeer() sees the new value.
+    read_state_[peer].target_id.store(link.target_id.value(),
+                                      std::memory_order_relaxed);
+    read_state_[peer].version.fetch_add(1, std::memory_order_release);
+
+    LOG(INFO) << "[LinkManager] refreshPeerSegment rank=" << rank_
+              << " peer=" << peer
+              << " new_target_id=" << link.target_id.value();
+}
+
 void LinkManager::publishLinkUp(GlobalRank peer,
                                 TransferMetadata::SegmentID target_id) {
     if (!rankInRange(peer)) return;
@@ -273,14 +300,22 @@ void LinkManager::tearDownPeerLink(GlobalRank peer, bool stop_reconnect) {
         link.target_id = std::nullopt;
     }
 
+    // Remove the cached segment descriptor so the next openSegment() for this
+    if (!link.server_name.empty()) {
+        engine_->removeLocalSegment(link.server_name);
+    }
+
     if (link.warmup_batch_id.has_value()) {
         engine_->freeBatchID(link.warmup_batch_id.value());
         link.warmup_batch_id = std::nullopt;
     }
 
-    // Clear the warmup handshake signal so the next probe doesn't see a
-    // stale completion flag from a prior connection cycle.
-    if (warmup_recv_region_) warmup_recv_region_[peer] = 0;
+    // Only clear the warmup handshake signal when the peer is going away
+    // for good (stop_reconnect).  For a reconnect teardown the flag must be
+    // preserved: the peer may have already completed its write while we are
+    // tearing down, and clearing it would leave us waiting forever in
+    // WAITING_PEER_WARMUP while the peer is already CONNECTED.
+    if (stop_reconnect && warmup_recv_region_) warmup_recv_region_[peer] = 0;
 
     link.state = PeerLinkState::IDLE;
     if (stop_reconnect) {

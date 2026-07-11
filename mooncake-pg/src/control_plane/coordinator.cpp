@@ -1,6 +1,7 @@
 #include "control_plane/coordinator.h"
 
 #include <algorithm>
+#include <limits>
 #include <numeric>
 #include <set>
 
@@ -311,48 +312,6 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     return result;
 }
 
-// handleProposalAck  - 2PC second phase: collect ACKs from agents
-
-CoordinatorApplyResult<void>
-CentralizedCoordinatorStateMachine::handleProposalAck(uint64_t propose_id,
-                                                      GlobalRank rank,
-                                                      uint64_t epoch,
-                                                      bool applied) {
-    CoordinatorApplyResult<void> result;
-    auto it = pending_proposal_acks_.find(propose_id);
-    if (it == pending_proposal_acks_.end()) return result;  // already resolved
-
-    if (!applied || epoch != it->second.eventual_response.new_epoch)
-        return result;
-
-    it->second.waiting_acks.erase(rank);
-    if (it->second.waiting_acks.empty()) {
-        result.effects.push_back(
-            ReplyViewUpdateEffect{propose_id, it->second.eventual_response});
-        pending_proposal_acks_.erase(it);
-    }
-    return result;
-}
-
-// handleBootstrapAck  - collect ACKs during BootstrapSyncing phase
-
-CoordinatorApplyResult<void>
-CentralizedCoordinatorStateMachine::handleBootstrapAck(GroupId group_id,
-                                                       GlobalRank rank,
-                                                       uint64_t epoch) {
-    CoordinatorApplyResult<void> result;
-    auto it = group_views_.find(group_id);
-    if (it == group_views_.end()) return result;
-    if (it->second.status != GroupStatus::BootstrapSyncing) return result;
-    if (epoch != it->second.epoch) return result;  // stale ACK
-
-    auto ack_it = pending_bootstrap_acks_.find(group_id);
-    if (ack_it == pending_bootstrap_acks_.end()) return result;
-    ack_it->second.erase(rank);
-    checkGroupTransitions(result.effects);
-    return result;
-}
-
 // checkTimeouts  - heartbeat timeout + proposal ACK timeout + fault
 // reconciliation window
 
@@ -431,10 +390,10 @@ CentralizedCoordinatorStateMachine::checkTimeouts() {
                     ack_ranks.push_back(rank);
                 }
                 result.effects.push_back(ViewUpdateEffect{
-                    view, ack_ranks, SyncAckRoute{group_id}});
+                    view, ack_ranks, GeneralAckRoute{}});
             } else {
                 result.effects.push_back(
-                    ViewUpdateEffect{view, {}, BootstrapAckRoute{}});
+                    ViewUpdateEffect{view, {}, GeneralAckRoute{}});
             }
 
             LOG(INFO) << "[COORD] sealed group=" << group_id
@@ -480,7 +439,7 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
         bool had_endpoint = member.hasEndpoint();
         member.agent_session_epoch = req.agent_session_epoch;
         member.endpoint = ep.endpoint_info;
-        member.endpoint->endpoint_epoch = ++endpoint_epochs_[ep.group_id][req.rank];
+        member.endpoint->endpoint_epoch = ++endpoint_epochs_[req.rank];
 
         LOG(INFO) << "[COORD] handlePublishEndpoint rank=" << req.rank
                   << " group=" << ep.group_id
@@ -496,7 +455,7 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
             // for a replacement/extension rank before it is activated.
             view.epoch++;
             result.effects.push_back(
-                ViewUpdateEffect{view, {}, BootstrapAckRoute{}});
+                ViewUpdateEffect{view, {}, GeneralAckRoute{}});
             flushPendingSyncs(ep.group_id, result.effects);
             LOG(INFO) << "[COORD] handlePublishEndpoint pushed view update"
                       << " group=" << ep.group_id
@@ -588,18 +547,6 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
         if (req.succeeded_ranks[peer]) reporter.link_status[peer] = 1;
         if (req.failed_ranks_hint[peer]) {
             reporter.link_status[peer] = 0;
-            // When a transfer observation reports peer P as failed, P is
-            // likely dead.  Clear P's entire link_status to prevent stale
-            // data from P (collected before it died) from keeping P in the
-            // max-clique healthy set.  P keeps self=1 so it can recover if
-            // it comes back.
-            if (rankInValidRange(peer) &&
-                ranks_[peer].state != RankState::OFFLINE) {
-                ranks_[peer].link_status.assign(max_world_size_, 0);
-                ranks_[peer].link_status[peer] = 1;
-                LOG(INFO) << "[COORD] handleTransferObservation cleared "
-                          << "link_status for failed peer=" << peer;
-            }
         }
     }
 
@@ -713,7 +660,7 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
             member.agent_session_epoch = std::nullopt;
             member.endpoint = std::nullopt;
             view.epoch++;
-            effects.push_back(ViewUpdateEffect{view, {}, BootstrapAckRoute{}});
+            effects.push_back(ViewUpdateEffect{view, {}, GeneralAckRoute{}});
             flushPendingSyncs(group_id, effects);
         }
         if (canEraseGroup(view)) {
@@ -749,13 +696,6 @@ bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
            ranks_[a].link_status[b] != 0 && ranks_[b].link_status[a] != 0;
 }
 
-// Find the largest all-to-all mutually connected set of ranks.
-// This is a maximum clique problem on the mutual-connectivity graph.
-// Uses exhaustive branch-and-bound search with a step limit to prevent
-// hanging on pathological topologies.
-//
-// Tie-breaking: prefer cliques containing Rank 0 (it hosts the
-// Coordinator and Store), then lexicographically smallest.
 std::vector<GlobalRank> CentralizedCoordinatorStateMachine::extendHealthySet()
     const {
     // Step 1: Collect current HEALTHY ranks.
@@ -766,31 +706,52 @@ std::vector<GlobalRank> CentralizedCoordinatorStateMachine::extendHealthySet()
         }
     }
 
-    // Step 2: Iteratively remove ranks no longer mutually connected to all
-    // others in the set.
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (auto it = result.begin(); it != result.end();) {
-            bool connected_to_all = true;
+    // Step 2: Evict the least-connected rank until the set is a clique.
+    // (Focuses strictly on connection density; naturally terminates on singletons).
+    while (true) {
+        GlobalRank worst = kInvalidGlobalRank;
+        int worst_degree = std::numeric_limits<int>::max();
+
+        for (GlobalRank r : result) {
+            int degree = 0;
             for (GlobalRank other : result) {
-                if (*it == other) continue;
-                if (!isMutuallyConnected(*it, other)) {
-                    connected_to_all = false;
-                    break;
-                }
+                if (r == other) continue;
+                if (isMutuallyConnected(r, other)) ++degree;
             }
-            if (!connected_to_all) {
-                it = result.erase(it);
-                changed = true;
-            } else {
-                ++it;
+            if (degree < worst_degree ||
+                (degree == worst_degree &&
+                 (worst == kInvalidGlobalRank || r > worst))) {
+                worst_degree = degree;
+                worst = r;
             }
+        }
+
+        int expected = static_cast<int>(result.size()) - 1;
+        if (worst_degree >= expected) break;
+
+        result.erase(std::remove(result.begin(), result.end(), worst),
+                     result.end());
+    }
+
+    // Step 2.5: Enforce business rule - evict isolated singletons.
+    // (Clears the path so Step 3 can bootstrap other healthy candidates).
+    if (result.size() == 1) {
+        GlobalRank singleton = result[0];
+        bool has_connections = false;
+        for (GlobalRank other{0}; other < max_world_size_; ++other) {
+            if (other == singleton) continue;
+            if (ranks_[other].state == RankState::OFFLINE) continue;
+            if (isMutuallyConnected(singleton, other)) {
+                has_connections = true;
+                break;
+            }
+        }
+        if (!has_connections) {
+            result.clear();
         }
     }
 
-    // Step 3: Extend with new mutually-connected candidates.  A candidate is
-    // added only if it is connected to every current member.
+    // Step 3: Extend with new mutually-connected candidates.
     for (GlobalRank i{0}; i < max_world_size_; ++i) {
         if (ranks_[i].state == RankState::OFFLINE) continue;
         if (std::find(result.begin(), result.end(), i) != result.end())
@@ -866,7 +827,7 @@ void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
         }
         if (!deactivated_ranks.empty()) {
             view.epoch++;
-            effects.push_back(ViewUpdateEffect{view, {}, BootstrapAckRoute{}});
+            effects.push_back(ViewUpdateEffect{view, {}, GeneralAckRoute{}});
             flushPendingSyncs(group_id, effects);
             LOG(INFO) << "[COORD] auto_deactivate view update group="
                       << group_id << " epoch=" << view.epoch;
@@ -1025,7 +986,7 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                                                    acks_needed.end());
 
                 effects.push_back(
-                    ViewUpdateEffect{view, acks_needed, BootstrapAckRoute{}});
+                    ViewUpdateEffect{view, acks_needed, GeneralAckRoute{}});
                 LOG(INFO) << "[COORD] group=" << group_id
                           << " transitioned to BootstrapSyncing epoch="
                           << view.epoch;
@@ -1044,7 +1005,7 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                 view.epoch++;
                 pending_bootstrap_acks_.erase(it);
                 effects.push_back(
-                    ViewUpdateEffect{view, {}, BootstrapAckRoute{}});
+                    ViewUpdateEffect{view, {}, GeneralAckRoute{}});
                 flushPendingSyncs(group_id, effects);
                 LOG(INFO) << "[COORD] group=" << group_id
                           << " transitioned to Ready epoch=" << view.epoch;
@@ -1140,7 +1101,7 @@ bool CentralizedCoordinatorStateMachine::registerGroup(
     // Because the Coordinator executor is serialized, multiple simultaneous
     // joiners are naturally ordered into sequential pushes.
     if (view.status == GroupStatus::Ready) {
-        effects.push_back(ViewUpdateEffect{view, {}, BootstrapAckRoute{}});
+        effects.push_back(ViewUpdateEffect{view, {}, GeneralAckRoute{}});
         LOG(INFO) << "[COORD] registerGroup pushed Ready view group="
                   << group_id << " epoch=" << view.epoch;
     }
@@ -1375,18 +1336,43 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
     return result;
 }
 
-// handleSyncViewUpdateAck - ACK callback for ViewUpdate pushes with
-// SyncAckRoute.  Resolves all pending syncs for the ACKing rank.
+// handleViewUpdateAck - unified ACK handler for all ViewUpdate pushes.
+// Checks proposal 2PC, bootstrap 2PC, and pending sync callers.
 CoordinatorApplyResult<void>
-CentralizedCoordinatorStateMachine::handleSyncViewUpdateAck(
-    GroupId group_id, GlobalRank rank, uint64_t epoch) {
+CentralizedCoordinatorStateMachine::handleViewUpdateAck(
+    GroupId group_id, GlobalRank rank, uint64_t epoch, bool applied,
+    const ViewUpdateAckRoute& route) {
     CoordinatorApplyResult<void> result;
+
+    if (!applied) return result;
 
     auto view_it = group_views_.find(group_id);
     if (view_it == group_views_.end()) return result;
     if (epoch != view_it->second.epoch) return result;  // stale ACK
 
+    // 1. Proposal 2PC — carry the propose_id to resolve the right proposal.
+    if (auto* p = std::get_if<ProposalAckRoute>(&route)) {
+        auto it = pending_proposal_acks_.find(p->propose_id);
+        if (it != pending_proposal_acks_.end()) {
+            it->second.waiting_acks.erase(rank);
+            if (it->second.waiting_acks.empty()) {
+                result.effects.push_back(ReplyViewUpdateEffect{
+                    p->propose_id, it->second.eventual_response});
+                pending_proposal_acks_.erase(it);
+            }
+        }
+    }
+
+    // 2. Bootstrap 2PC — only during BootstrapSyncing.
+    auto ack_it = pending_bootstrap_acks_.find(group_id);
+    if (ack_it != pending_bootstrap_acks_.end()) {
+        ack_it->second.erase(rank);
+        checkGroupTransitions(result.effects);
+    }
+
+    // 3. Sync-after-failure callers waiting on this ACK.
     flushPendingSyncs(group_id, rank, result.effects);
+
     return result;
 }
 

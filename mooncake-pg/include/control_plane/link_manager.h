@@ -98,6 +98,13 @@ class LinkManager {
     // membership rather than local link readiness.
     bool isRankHealthy(GlobalRank peer) const;
 
+    // Reopen the TE segment for `peer` without publishing link-up/link-down
+    // events.  The link_connected flag stays set throughout.  Used when the
+    // peer's memory registration changed (e.g. after destroy+reinit) and the
+    // cached segment ID needs a fresh rkey, but the control-plane link state
+    // should not be disturbed.
+    void refreshPeerSegment(GlobalRank peer);
+
     void publishLinkUp(GlobalRank peer, TransferMetadata::SegmentID target_id);
     void publishLinkDown(GlobalRank peer);
 

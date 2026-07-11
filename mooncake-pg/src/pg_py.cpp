@@ -94,7 +94,13 @@ c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeBackend(
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
     int rank = distBackendOpts.group_rank;
+    std::cerr << "[createMooncakeBackend] ENTRY rank=" << rank
+              << " group_id=" << distBackendOpts.group_id
+              << " size=" << distBackendOpts.group_size
+              << " pid=" << getpid() << std::endl;
     auto& host = initControlPlane(distBackendOpts.store, rank, kMaxNumRanks);
+    std::cerr << "[createMooncakeBackend] initControlPlane done, creating backend..."
+              << std::endl;
     auto backend = c10::make_intrusive<MooncakeBackend>(
         std::move(distBackendOpts), std::move(backendOptions), host, g_ctx);
     return backend;
@@ -198,6 +204,10 @@ void activateRank(c10::intrusive_ptr<c10d::ProcessGroup> backend,
 void joinGroup(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    if (!mooncakeBackend) {
+        throw std::runtime_error(
+            "join_group: backend is null (C++ object was destroyed)");
+    }
     mooncakeBackend->joinGroup();
 }
 

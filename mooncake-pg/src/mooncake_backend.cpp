@@ -11,6 +11,10 @@
 #include <atomic>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <random>
+#include <unordered_map>
+#include <unistd.h>
 #include "control_plane/types.h"
 #include "memory_location.h"
 #include "mooncake_worker.cuh"
@@ -29,6 +33,63 @@ constexpr const char* REDUCE_OP_ERROR_MSG = "Only support SUM.";
 constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
 constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 constexpr int kBarrierDummyTensorSize = 1;
+
+// PyTorch may reuse the same logical group_id (e.g. "0") when a process
+// group is destroyed and recreated.  The Coordinator keys group state by
+// group_id, so reusing an id causes stale membership (e.g. kLeft) from the
+// previous incarnation to leak into the new group.
+//
+// We therefore generate a fresh Mooncake-specific group_id for every backend
+// instance.  The in-group leader (group_rank == 0) generates the id and
+// publishes it on the group-local store; the other ranks wait for the key.
+// A per-logical-group counter is used to build a unique store key for each
+// init round, avoiding stale reads when the same store is reused.
+static std::string makeMooncakeGroupId(c10d::DistributedBackendOptions& opts) {
+    const std::string& base = opts.group_id;
+    if (base.empty()) {
+        return base;
+    }
+
+    static std::mutex mu;
+    static std::unordered_map<std::string, int64_t> counter;
+    int64_t seq;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        seq = ++counter[base];
+    }
+
+    const std::string sync_key =
+        "mooncake_group_id_" + base + "_" + std::to_string(seq);
+
+    std::cerr << "[makeMooncakeGroupId] base=" << base << " rank=" << opts.group_rank
+              << " sync_key=" << sync_key << " pid=" << getpid() << std::endl;
+
+    if (opts.group_rank == 0) {
+        auto now = std::chrono::steady_clock::now().time_since_epoch();
+        auto us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        std::uniform_int_distribution<uint64_t> dis;
+        std::string unique = base + "_" + std::to_string(us) + "_" +
+                             std::to_string(getpid()) + "_" +
+                             std::to_string(dis(gen));
+
+        std::cerr << "[makeMooncakeGroupId] leader setting " << sync_key << " = " << unique << std::endl;
+        opts.store->set(sync_key, unique);
+        LOG(INFO) << "[PG] assigned mooncake group_id=" << unique
+                  << " base=" << base;
+    }
+
+    std::cerr << "[makeMooncakeGroupId] waiting for " << sync_key << "..." << std::endl;
+    opts.store->wait({sync_key});
+    std::string unique = opts.store->get_to_str(sync_key);
+    std::cerr << "[makeMooncakeGroupId] got " << sync_key << " = " << unique << std::endl;
+    LOG(INFO) << "[PG] resolved mooncake group_id=" << unique
+              << " base=" << base
+              << " rank=" << opts.group_rank;
+    return unique;
+}
 
 /**
  * @brief Initialize Mooncake backend state from the PyTorch process-group
@@ -249,7 +310,10 @@ MooncakeBackend::MooncakeBackend(
 
     TORCH_CHECK(!distBackendOpts.group_id.empty(),
                 "MooncakeBackend: distBackendOpts.group_id must not be empty");
-    meta_->group_id = distBackendOpts.group_id;
+    std::string mooncake_group_id = makeMooncakeGroupId(distBackendOpts);
+    TORCH_CHECK(!mooncake_group_id.empty(),
+                "MooncakeBackend: mooncake_group_id must not be empty");
+    meta_->group_id = std::move(mooncake_group_id);
 
     // Register a lightweight Backend shim so that PyTorch's P2P dispatch path
     // (batch_isend_irecv → _get_backend → getBackend) can find a registered
@@ -1084,15 +1148,37 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
         const auto& member = view.members[global_rank];
         meta_->activeRanks[local_rank] = member.isActive();
         if (member.endpoint.has_value()) {
+            const uint64_t old_endpoint_epoch =
+                meta_->segmentInfos[local_rank].endpoint_epoch;
             meta_->segmentInfos[local_rank] = *member.endpoint;
-            auto handle = ctx_.link_manager.resolvePeer(global_rank);
-            if (handle) {
-                meta_->segmentIDs[local_rank] = handle->target_id;
-            } else {
-                LOG(ERROR) << "applyViewChange rank=" << meta_->globalRank
-                           << ", TE link to peer=" << global_rank
-                           << " not ready yet; segmentID will be refreshed on "
-                              "LinkUp";
+
+            // If this peer republished its endpoint (e.g. after a world-group
+            // destroy+reinit or a fresh group creation), the TE segment cache
+            // may still hold stale rkeys from a previous group incarnation.
+            // Sync with the metadata server so the cached target_id resolves
+            // to fresh rkeys.  No disconnect/reconnect is needed — the
+            // control-plane link state must not be affected by group-level
+            // lifecycle operations.
+            if (old_endpoint_epoch != member.endpoint->endpoint_epoch) {
+                LOG(INFO) << "[BACKEND] applyViewChange rank=" << meta_->globalRank
+                          << " group=" << meta_->group_id
+                          << " peer=" << global_rank
+                          << " endpoint_epoch changed " << old_endpoint_epoch
+                          << " -> " << member.endpoint->endpoint_epoch
+                          << ", syncing TE segment cache";
+                ctx_.engine->syncSegmentCache();
+            }
+            // Resolve the peer and cache the current segment ID.
+            {
+                auto handle = ctx_.link_manager.resolvePeer(global_rank);
+                if (handle) {
+                    meta_->segmentIDs[local_rank] = handle->target_id;
+                } else {
+                    LOG(ERROR) << "applyViewChange rank=" << meta_->globalRank
+                               << ", TE link to peer=" << global_rank
+                               << " not ready yet; segmentID will be "
+                                  "refreshed on LinkUp";
+                }
             }
         }
     }

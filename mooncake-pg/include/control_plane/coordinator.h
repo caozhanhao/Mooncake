@@ -37,20 +37,12 @@ class CoordinatorStateMachine {
     virtual CoordinatorApplyResult<void> handleUnregisterGroup(
         const UnregisterGroupRequest& req) = 0;
 
-    virtual CoordinatorApplyResult<void> handleProposalAck(uint64_t propose_id,
-                                                           GlobalRank rank,
-                                                           uint64_t epoch,
-                                                           bool applied) = 0;
-
-    virtual CoordinatorApplyResult<void> handleBootstrapAck(GroupId group_id,
-                                                            GlobalRank rank,
-                                                            uint64_t epoch) = 0;
+    virtual CoordinatorApplyResult<void> handleViewUpdateAck(
+        GroupId group_id, GlobalRank rank, uint64_t epoch, bool applied,
+        const ViewUpdateAckRoute& route) = 0;
 
     virtual CoordinatorApplyResult<void> handleSyncAfterFailure(
         uint64_t sync_id, const SyncAfterFailureRequest& req) = 0;
-
-    virtual CoordinatorApplyResult<void> handleSyncViewUpdateAck(
-        GroupId group_id, GlobalRank rank, uint64_t epoch) = 0;
 
     virtual CoordinatorApplyResult<PublishEndpointResponse>
     handlePublishEndpoint(const PublishEndpointRequest& req) = 0;
@@ -85,11 +77,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     CoordinatorApplyResult<void> handleProposeViewUpdate(
         uint64_t propose_id, const ProposeViewUpdateRequest& req) override;
 
-    CoordinatorApplyResult<void> handleProposalAck(uint64_t propose_id,
-                                                   GlobalRank rank,
-                                                   uint64_t epoch,
-                                                   bool applied) override;
-
     CoordinatorApplyResult<PublishEndpointResponse> handlePublishEndpoint(
         const PublishEndpointRequest& req) override;
 
@@ -104,15 +91,12 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     CoordinatorApplyResult<void> handleUnregisterGroup(
         const UnregisterGroupRequest& req) override;
 
-    CoordinatorApplyResult<void> handleBootstrapAck(GroupId group_id,
-                                                    GlobalRank rank,
-                                                    uint64_t epoch) override;
-
     CoordinatorApplyResult<void> handleSyncAfterFailure(
         uint64_t sync_id, const SyncAfterFailureRequest& req) override;
 
-    CoordinatorApplyResult<void> handleSyncViewUpdateAck(
-        GroupId group_id, GlobalRank rank, uint64_t epoch) override;
+    CoordinatorApplyResult<void> handleViewUpdateAck(
+        GroupId group_id, GlobalRank rank, uint64_t epoch, bool applied,
+        const ViewUpdateAckRoute& route) override;
 
     RankState getRankState(GlobalRank rank) const {
         if (!rankInValidRange(rank)) return RankState::OFFLINE;
@@ -142,12 +126,12 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     std::unordered_map<GroupId, GroupView> group_views_;
     std::unordered_map<GroupId, bool> group_auto_deactivate_;
 
-    // Coordinator-assigned endpoint epoch counter per (group_id, rank).
-    // Incremented on every successful publishEndpoint for that slot; cleared
-    // when the endpoint is invalidated (session change, deactivate, offline,
-    // unregister).  Used by the Agent as a declarative reconnect trigger.
-    std::unordered_map<GroupId, std::array<uint64_t, kMaxNumRanks>>
-        endpoint_epochs_;
+    // Coordinator-assigned endpoint epoch counter per GlobalRank.
+    // Incremented on every successful publishEndpoint for that rank so the
+    // Agent can detect endpoint changes (e.g. after destroy+reinit) and
+    // trigger TE link re-establishment.  Per-rank (not per-group) so that
+    // epochs never collide across group create/destroy cycles.
+    std::array<uint64_t, kMaxNumRanks> endpoint_epochs_{};
 
     // Two independent 2PC flows share the same ViewUpdate ACK path:
     //   1. Proposal 2PC (activate/deactivate) - keyed by propose_id
@@ -188,8 +172,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // Pending sync-after-failure requests.  Keyed by group_id, each entry maps
     // caller_rank -> list of sync_ids waiting for a decision for that group.
     // Resolved when the caller ACKs the ViewUpdate that carries the decision
-    // (via SyncAckRoute), or immediately via flushPendingSyncs when the epoch
-    // changes through a non-window path.
+    // via handleViewUpdateAck, or immediately via flushPendingSyncs when the
+    // epoch changes through a non-window path.
     struct PendingSyncRequest {
         uint64_t sync_id;
         GlobalRank caller_rank;

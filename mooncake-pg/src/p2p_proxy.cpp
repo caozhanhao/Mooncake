@@ -343,11 +343,13 @@ void P2PProxy::handleFailedSendOp(SendOpContext& op_ctx) {
     if (meta_->backend) {
         std::vector<uint8_t> attempted(kMaxNumRanks, 0);
         std::vector<uint8_t> failed(kMaxNumRanks, 0);
+        std::vector<uint8_t> succeeded(kMaxNumRanks, 0);
         attempted[peer_global] = 1;
         failed[peer_global] = 1;
+        succeeded[peer_global] = 0;  // attempted && !failed = false
         meta_->backend->getAgent().pushTransferObservation(
-            meta_->group_id, std::move(attempted), std::move(failed), {},
-            false);
+            meta_->group_id, std::move(attempted), std::move(failed),
+            std::move(succeeded), false);
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P SendOp to peer "
@@ -365,11 +367,13 @@ void P2PProxy::handleFailedRecvOp(RecvOpContext& op_ctx) {
     if (meta_->backend) {
         std::vector<uint8_t> attempted(kMaxNumRanks, 0);
         std::vector<uint8_t> failed(kMaxNumRanks, 0);
+        std::vector<uint8_t> succeeded(kMaxNumRanks, 0);
         attempted[peer_global] = 1;
         failed[peer_global] = 1;
+        succeeded[peer_global] = 0;  // attempted && !failed = false
         meta_->backend->getAgent().pushTransferObservation(
-            meta_->group_id, std::move(attempted), std::move(failed), {},
-            false);
+            meta_->group_id, std::move(attempted), std::move(failed),
+            std::move(succeeded), false);
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P RecvOp from peer "

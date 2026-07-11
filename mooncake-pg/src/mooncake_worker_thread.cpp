@@ -97,6 +97,18 @@ void MooncakeWorker::startWorker() {
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
                     const auto submit_sequence = task.submitSequence;
                     if (skipTransfer) {
+                        // Even though we skip the data-transfer phase, we must
+                        // still mark active peers as "attempted" so the signal
+                        // phase will create per-peer sync entries and wait for
+                        // the root's signal before consuming the recv buffer.
+                        // Without this, non-root broadcast/scatter ranks race
+                        // past the root's RDMA writes and copy stale data.
+                        for (int j = 0; j < group->size; ++j) {
+                            if (!group->activeRanks[j]) continue;
+                            if (task.attemptedRanksHintHost) {
+                                task.attemptedRanksHintHost[j] = 1;
+                            }
+                        }
                         submitted_task_sequence_[i].store(
                             submit_sequence, std::memory_order_release);
                         task_status[i].store(TRANSFERRED_1,
@@ -260,11 +272,16 @@ void MooncakeWorker::startWorker() {
                     }
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
-                        // Send the completion signal to every peer that was
-                        // attempted in the data phase, regardless of whether
-                        // the coordinator has since deactivated it. Otherwise a
-                        // late deactivation can hide a failed peer.
-                        if (!task.attemptedRanksHintHost[j]) {
+                        // Send a completion signal to every active peer.
+                        // The signal phase acts as a bidirectional barrier:
+                        // each rank writes to every peer's recv_sync at its
+                        // own rank-slot and waits for every peer's signal in
+                        // its own recv_sync.  This is independent of the
+                        // data-transfer direction — even ranks that only
+                        // sent data (e.g. REDUCE contributors) or only
+                        // received (e.g. BROADCAST non-roots) must
+                        // participate so every rank sees the global barrier.
+                        if (!group->activeRanks[j]) {
                             continue;
                         }
                         if (task.failedRanksHintHost[j]) {
@@ -308,8 +325,10 @@ void MooncakeWorker::startWorker() {
                         if (task.failedRanksHintHost[j]) {
                             continue;
                         }
-                        // Only consider peers that were attempted in this op.
-                        if (!task.attemptedRanksHintHost[j]) {
+                        // Check every active peer, not just data-attempted
+                        // ones. The signal phase is a bidirectional barrier
+                        // independent of data-transfer direction.
+                        if (!group->activeRanks[j]) {
                             continue;
                         }
                         if (rankToTaskId[i][j] == kInvalidTaskId) {
@@ -357,7 +376,7 @@ void MooncakeWorker::startWorker() {
                     }
                     if (task_done) {
                         for (int j = 0; j < group->size; ++j) {
-                            if (!task.attemptedRanksHintHost[j]) continue;
+                            if (!group->activeRanks[j]) continue;
                             signal_ptr[j] = 0;
                         }
 

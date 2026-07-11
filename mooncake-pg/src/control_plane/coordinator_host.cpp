@@ -173,23 +173,6 @@ void CoordinatorHost::postProposeViewUpdate(
     });
 }
 
-void CoordinatorHost::postProposalAck(uint64_t propose_id, GlobalRank rank,
-                                      uint64_t epoch, bool applied) {
-    executor_.post([this, propose_id, rank, epoch, applied]() {
-        auto result =
-            state_machine_.handleProposalAck(propose_id, rank, epoch, applied);
-        runEffects(result.effects);
-    });
-}
-
-void CoordinatorHost::postBootstrapAck(GroupId group_id, GlobalRank rank,
-                                       uint64_t epoch) {
-    executor_.post([this, group_id, rank, epoch]() {
-        auto result = state_machine_.handleBootstrapAck(group_id, rank, epoch);
-        runEffects(result.effects);
-    });
-}
-
 void CoordinatorHost::postPublishEndpoint(
     coro_rpc::context<PublishEndpointResponse> ctx,
     PublishEndpointRequest req) {
@@ -227,11 +210,13 @@ void CoordinatorHost::postSyncAfterFailure(
     });
 }
 
-void CoordinatorHost::postSyncViewUpdateAck(GroupId group_id, GlobalRank rank,
-                                            uint64_t epoch) {
-    executor_.post([this, group_id, rank, epoch]() {
-        auto result =
-            state_machine_.handleSyncViewUpdateAck(group_id, rank, epoch);
+void CoordinatorHost::postViewUpdateAck(GroupId group_id, GlobalRank rank,
+                                        uint64_t epoch, bool applied,
+                                        ViewUpdateAckRoute route) {
+    executor_.post([this, group_id, rank, epoch, applied,
+                    route = std::move(route)]() {
+        auto result = state_machine_.handleViewUpdateAck(group_id, rank, epoch,
+                                                         applied, route);
         runEffects(result.effects);
     });
 }
@@ -342,20 +327,8 @@ void CoordinatorHost::pushViewUpdate(const ViewUpdateEffect& effect) {
                 addr, push,
                 [this, group_id, ack_route, rank = i](ViewUpdateAck ack) {
                     if (!ack.applied) return;
-                    std::visit(overloaded{[&](const BootstrapAckRoute&) {
-                                              postBootstrapAck(group_id, rank,
-                                                               ack.epoch);
-                                          },
-                                          [&](const ProposalAckRoute& r) {
-                                              postProposalAck(r.propose_id,
-                                                              rank, ack.epoch,
-                                                              ack.applied);
-                                          },
-                                          [&](const SyncAckRoute& r) {
-                                              postSyncViewUpdateAck(
-                                                  r.group_id, rank, ack.epoch);
-                                          }},
-                               ack_route);
+                    postViewUpdateAck(group_id, rank, ack.epoch,
+                                      ack.applied, ack_route);
                 });
         } else {
             rpc_client_->send<&AgentRpcService::onViewUpdate>(addr, push);
