@@ -347,7 +347,8 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // Per-rank membership/endpoint bitmaps for this group, updated from the
     // authoritative GroupView.  getPeerState() uses them to guarantee that a
     // peer is ready to be activated: it must be a group member (kInactive or
-    // kActive), have a valid endpoint, and be HEALTHY in the Coordinator's
+    // kActive), have a *fresh* endpoint (session or endpoint_epoch changed
+    // since the last observed value), and be HEALTHY in the Coordinator's
     // view. We intentionally do NOT require the local TE link to be up here.
     std::array<std::atomic<bool>, kMaxNumRanks> member_bitmap_{};
     std::array<std::atomic<bool>, kMaxNumRanks> endpoint_bitmap_{};

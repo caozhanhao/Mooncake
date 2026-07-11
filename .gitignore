@@ -209,3 +209,17 @@ _codeql_detected_source_root
 # MacOS
 .DS_Store
 .envrc
+tmp
+build-ide
+mooncake-wheel/mooncake/mooncake_client
+.gitignore
+log.txt
+mooncake-wheel/mooncake/fabric_allocator_utils.py
+mooncake-wheel/mooncake/async_store.py
+how-to-test-pg.txt
+compile_commands.json
+.test_pyenv
+log_*.txt
+pgtest.txt
+scripts/prepare_wheel_dir.sh
+*_log.txt
