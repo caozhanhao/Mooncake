@@ -163,10 +163,11 @@ class SerializedExecutor {
                             "task: %s\n",
                             name_.c_str(), e.what());
                 } catch (...) {
-                    fprintf(stderr,
-                            "SerializedExecutor(%s): unhandled non-std exception "
-                            "in task\n",
-                            name_.c_str());
+                    fprintf(
+                        stderr,
+                        "SerializedExecutor(%s): unhandled non-std exception "
+                        "in task\n",
+                        name_.c_str());
                 }
             }
             if (tick_callback_) {
@@ -178,10 +179,11 @@ class SerializedExecutor {
                             "tick callback: %s\n",
                             name_.c_str(), e.what());
                 } catch (...) {
-                    fprintf(stderr,
-                            "SerializedExecutor(%s): unhandled non-std exception "
-                            "in tick callback\n",
-                            name_.c_str());
+                    fprintf(
+                        stderr,
+                        "SerializedExecutor(%s): unhandled non-std exception "
+                        "in tick callback\n",
+                        name_.c_str());
                 }
             }
         }

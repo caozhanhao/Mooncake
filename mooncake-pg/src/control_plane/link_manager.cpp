@@ -65,24 +65,27 @@ void LinkManager::init(GlobalRank rank, int max_world_size,
     local_server_name_ = engine_->getLocalIpAndPort();
     skip_warmup_ = supportFabricMem();
 
+    peers_.resize(max_world_size_);
+    read_state_ = std::vector<PeerReadState>(max_world_size_);
+
     if (!skip_warmup_) {
-        warmup_send_region_ = std::make_unique<int32_t[]>(kMaxNumRanks);
+        warmup_send_region_ = std::make_unique<int32_t[]>(max_world_size_);
         std::memset(warmup_send_region_.get(), 0,
-                    kMaxNumRanks * sizeof(int32_t));
+                    max_world_size_ * sizeof(int32_t));
         warmup_send_region_[0] = 1;
         int rc = engine_->registerLocalMemory(warmup_send_region_.get(),
-                                              kMaxNumRanks * sizeof(int32_t),
+                                              max_world_size_ * sizeof(int32_t),
                                               kWildcardLocation);
         if (rc != 0) {
             warmup_send_region_.reset();
             LOG(ERROR) << "LinkManager: failed to register warmup send region";
         }
 
-        warmup_recv_region_ = std::make_unique<int32_t[]>(kMaxNumRanks);
+        warmup_recv_region_ = std::make_unique<int32_t[]>(max_world_size_);
         std::memset(warmup_recv_region_.get(), 0,
-                    kMaxNumRanks * sizeof(int32_t));
+                    max_world_size_ * sizeof(int32_t));
         rc = engine_->registerLocalMemory(warmup_recv_region_.get(),
-                                          kMaxNumRanks * sizeof(int32_t),
+                                          max_world_size_ * sizeof(int32_t),
                                           kWildcardLocation);
         if (rc != 0) {
             LOG(ERROR)

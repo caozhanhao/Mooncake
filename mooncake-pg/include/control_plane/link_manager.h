@@ -1,7 +1,6 @@
 #ifndef MOONCAKE_PG_LINK_MANAGER_H
 #define MOONCAKE_PG_LINK_MANAGER_H
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -12,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <transfer_engine.h>
 
@@ -138,7 +138,7 @@ class LinkManager {
             std::chrono::milliseconds(10000);
     };
 
-    std::array<PeerLink, kMaxNumRanks> peers_{};
+    std::vector<PeerLink> peers_;
     mutable std::mutex peers_mutex_;
 
     // Worker read model (atomic, lock-free)
@@ -153,7 +153,7 @@ class LinkManager {
             target_id{};  // remote segment handle
     };
 
-    std::array<PeerReadState, kMaxNumRanks> read_state_{};
+    std::vector<PeerReadState> read_state_;
 
     // Poller infrastructure
 

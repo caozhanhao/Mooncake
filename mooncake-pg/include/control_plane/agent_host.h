@@ -5,7 +5,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
-#include <queue>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -94,8 +94,6 @@ class AgentInterface {
 
     // Accessors.
     virtual uint64_t getAgentSessionEpoch() = 0;
-
-    virtual GroupView getGroupView(GroupId group_id) = 0;
 };
 
 class AgentHost;
@@ -161,8 +159,6 @@ class AgentHost : public AgentInterface {
     uint64_t getAgentSessionEpoch() override {
         return agent_.getAgentSessionEpoch();
     }
-    GroupView getGroupView(GroupId group_id) override;
-
     void postPeerJoined(PeerJoinedPush push);
     void postRankStateUpdate(RankStateUpdatePush push);
     void postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
@@ -218,9 +214,10 @@ class AgentHost : public AgentInterface {
     // Accessed only from the executor thread.
     std::unordered_map<GroupId, MooncakeBackend*> backends_;
 
-    // Transfer observation queue: worker thread -> executor.
-    std::queue<TransferObservationEvent> observation_queue_;
-    std::mutex observation_queue_mutex_;
+    // Pending observations, merged on push by worker thread.
+    // Swapped out and processed by the executor thread.
+    std::unordered_map<GroupId, TransferObservationEvent> pending_observations_;
+    std::mutex pending_observations_mutex_;
 
     void startAgentRegistration();
     void tick();

@@ -90,7 +90,9 @@ MooncakeBackend::MooncakeBackend(
       ctx_(ctx),
       options_(std::move(options)),
       isCpu_(isCpu),
-      agent_(agent) {
+      agent_(agent),
+      member_bitmap_(ctx_.max_world_size),
+      endpoint_present_bitmap_(ctx_.max_world_size) {
     const int rank = distBackendOpts.group_rank;
     const int size = distBackendOpts.group_size;
     const auto& globalRanks = distBackendOpts.global_ranks_in_group;
@@ -1094,10 +1096,12 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view) {
         return;
     }
 
-    // Membership boundary (activation/deactivation): track whether the
-    // epoch changed so downstream logic can react.
+    // Membership boundary (activation/deactivation): reset the
+    // collective sequence so that all ranks, including joiners and
+    // replacements, agree on the double-buffer parity.
     bool epoch_changed = false;
     if (meta_->epoch.load(std::memory_order_acquire) != view.epoch) {
+        meta_->taskCount = 0;
         epoch_changed = true;
     }
 
@@ -1154,7 +1158,7 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view) {
     // Coordinator has told us that the rank has a valid endpoint for its
     // current session (GroupMember::endpoint is set).  Because the Coordinator
     // clears stale endpoints on session changes, this bitmap is authoritative.
-    for (int i = 0; i < kMaxNumRanks; ++i) {
+    for (int i = 0; i < ctx_.max_world_size; ++i) {
         const auto& member = view.members[i];
         bool is_member = member.isMember();
         member_bitmap_[i].store(is_member, std::memory_order_release);

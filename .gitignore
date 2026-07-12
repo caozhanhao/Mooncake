@@ -220,3 +220,6 @@ compile_commands.json
 .test_pyenv
 log_*.txt
 *_log.txt
+.qoder/settings.local.json
+.gitignore
+mooncake-integration/mooncake/__init__.py

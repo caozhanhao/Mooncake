@@ -11,10 +11,12 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     CHECK_LE(max_world_size_, kMaxNumRanks)
         << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
         << kMaxNumRanks << ")";
-    global_rank_states_.fill(RankState::Offline);
-    link_connected_.fill(false);
-    last_reported_peer_status_.fill(false);
-    rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::Offline));
+    global_rank_states_.assign(max_world_size_, RankState::Offline);
+    link_connected_.assign(max_world_size_, false);
+    last_reported_peer_status_.assign(max_world_size_, false);
+    rank_state_snapshot_.assign(max_world_size_,
+                                static_cast<uint8_t>(RankState::Offline));
+    rank_connections_.resize(max_world_size_);
 }
 
 void AgentStateMachine::registerGroup(const GroupView& group,
@@ -102,9 +104,7 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
         return effects;
     }
 
-    // Detect coordinator-assigned endpoint_epoch changes.  A change means the
-    // remote endpoint has been republished (e.g. replacement process) and the
-    // LinkManager must drop the old link and re-probe with the new server info.
+    // Detect endpoint updates.
     const auto& old_view = it->second;
     for (size_t r = 0; r < push.view.members.size(); ++r) {
         if (r == static_cast<size_t>(rank_)) continue;
@@ -118,13 +118,30 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
             new_epoch = push.view.members[r].endpoint->endpoint_epoch;
         }
         if (old_epoch != 0 && new_epoch != 0 && new_epoch != old_epoch) {
-            const auto& conn = rank_connections_[r];
-            if (conn.has_value()) {
-                effects.push_back(DisconnectLink{r});
-                effects.push_back(EnablePeerProbe{r, conn->te_server_name,
-                                                  conn->warmup_recv_addr});
+            effects.push_back(RefreshPeerLink{r});
+        }
+    }
+
+    // Detect rank activation transitions.
+    if (!old_view.members.empty()) {
+        std::vector<GlobalRank> newly_activated;
+        for (size_t igr = 0; igr < push.view.rank_order.size(); ++igr) {
+            GlobalRank gr = push.view.rank_order[igr];
+            if (!old_view.members[gr].isActive() &&
+                push.view.members[gr].isActive()) {
+                newly_activated.push_back(gr);
             }
         }
+        if (!newly_activated.empty()) {
+            effects.push_back(NotifyRanksActivated{push.group_id,
+                                                   std::move(newly_activated)});
+        }
+    }
+
+    // Detect Ready transition.
+    if (old_view.status != GroupStatus::Ready &&
+        push.view.status == GroupStatus::Ready) {
+        effects.push_back(NotifyGroupReady{push.group_id});
     }
 
     it->second = push.view;
@@ -147,10 +164,7 @@ AgentApplyResult AgentStateMachine::handleLinkStateChange(GlobalRank peer,
         effects.push_back(NotifyTEUnreachable{peer});
     } else {
         // Link came up: re-apply current Ready views so backends refresh their
-        // cached segment IDs for this peer.  This is required for link recovery
-        // (the view stays Ready while the TE link is rebuilt) and covers any
-        // edge case where a Ready view was applied before the local TE link
-        // finished establishing.
+        // cached segment IDs for this peer.
         for (const auto& [group_id, view] : groups_) {
             if (view.status == GroupStatus::Ready) {
                 effects.push_back(ApplyViewToBackend{group_id, view});
@@ -177,12 +191,12 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
 
     // Populate global rank states.
     if (static_cast<int>(resp.all_rank_states.size()) != max_world_size_) {
-        LOG(WARNING) << "AgentStateMachine: all_rank_states size mismatch (got "
-                     << resp.all_rank_states.size() << ", expected "
-                     << max_world_size_ << "); truncating.";
+        LOG(ERROR) << "AgentStateMachine: all_rank_states size mismatch (got "
+                   << resp.all_rank_states.size() << ", expected "
+                   << max_world_size_ << "); rejecting.";
+        return effects;
     }
-    int available_states = static_cast<int>(resp.all_rank_states.size());
-    for (int32_t r = 0; r < std::min(max_world_size_, available_states); ++r) {
+    for (int32_t r = 0; r < max_world_size_; ++r) {
         global_rank_states_[r] = resp.all_rank_states[r];
     }
 
@@ -211,10 +225,14 @@ AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
     AgentApplyResult effects;
 
     rank_state_ = RankState::Offline;
-    global_rank_states_.fill(RankState::Offline);
-    link_connected_.fill(false);
-    last_reported_peer_status_.fill(false);
-    rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::Offline));
+    groups_.clear();
+    std::fill(global_rank_states_.begin(), global_rank_states_.end(),
+              RankState::Offline);
+    std::fill(link_connected_.begin(), link_connected_.end(), false);
+    std::fill(last_reported_peer_status_.begin(),
+              last_reported_peer_status_.end(), false);
+    std::fill(rank_state_snapshot_.begin(), rank_state_snapshot_.end(),
+              static_cast<uint8_t>(RankState::Offline));
     for (auto& conn : rank_connections_) conn.reset();
 
     effects.push_back(DisconnectAllLinks{});
@@ -227,70 +245,52 @@ AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
     return effects;
 }
 
-AgentApplyResult AgentStateMachine::processTransferObservation(
+std::optional<GroupObservation> AgentStateMachine::processTransferObservation(
     const TransferObservationEvent& event) {
-    AgentApplyResult effects;
+    if (rank_state_ == RankState::Offline) return std::nullopt;
 
-    if (rank_state_ == RankState::Offline) return effects;
+    if (event.attempted_ranks.size() != static_cast<size_t>(max_world_size_) ||
+        event.succeeded_ranks.size() != static_cast<size_t>(max_world_size_) ||
+        event.failed_ranks_hint.size() !=
+            static_cast<size_t>(max_world_size_)) {
+        LOG(WARNING)
+            << "AgentStateMachine: invalid TransferObservationEvent vectors. "
+            << "Expected max_world_size=" << max_world_size_ << "; dropping.";
+        return std::nullopt;
+    }
 
-    TransferObservationReport req;
-    req.group_id = event.group_id;
-    req.reporter_rank = rank_;
+    GroupObservation obs;
+    obs.group_id = event.group_id;
+    obs.group_epoch = getGroupView(event.group_id).epoch;
+    obs.attempted_ranks.assign(max_world_size_, 0);
+    obs.failed_ranks_hint.assign(max_world_size_, 0);
+    obs.succeeded_ranks.assign(max_world_size_, 0);
 
     bool has_changed = false;
 
-    // Bit-vectors are GlobalRank-indexed.  Iterate over the input size and
-    // ignore entries beyond our current max_world_size_.
-    for (size_t peer = 0; peer < event.attempted_ranks.size(); ++peer) {
-        if (peer >= max_world_size_) continue;
+    for (int peer = 0; peer < max_world_size_; ++peer) {
         if (!event.attempted_ranks[peer]) continue;
-
-        bool succeeded = peer < event.succeeded_ranks.size()
-                             ? event.succeeded_ranks[peer]
-                             : 0;
-        bool failed = peer < event.failed_ranks_hint.size()
-                          ? event.failed_ranks_hint[peer]
-                          : 0;
-
-        // Determine current observation: failed takes precedence.
-        bool current = succeeded && !failed;
-
+        bool current = event.succeeded_ranks[peer];
         if (current != last_reported_peer_status_[peer]) {
             last_reported_peer_status_[peer] = current;
-            // Lazy-init the vectors on first change.
-            if (!has_changed) {
-                req.attempted_ranks.assign(max_world_size_, 0);
-                req.failed_ranks_hint.assign(max_world_size_, 0);
-                req.succeeded_ranks.assign(max_world_size_, 0);
-            }
-            req.attempted_ranks[peer] = 1;
-            req.succeeded_ranks[peer] = current ? 1 : 0;
-            req.failed_ranks_hint[peer] = current ? 0 : 1;
+            obs.attempted_ranks[peer] = 1;
+            obs.succeeded_ranks[peer] = current ? 1 : 0;
+            obs.failed_ranks_hint[peer] = current ? 0 : 1;
             has_changed = true;
         }
     }
 
-    if (has_changed) {
-        effects.push_back(SendTransferObservation{std::move(req)});
-    }
-
-    return effects;
+    if (has_changed) return obs;
+    return std::nullopt;
 }
 
-void AgentStateMachine::markObservationReported(
-    const TransferObservationEvent& event) {
-    for (size_t peer = 0; peer < event.attempted_ranks.size(); ++peer) {
-        if (peer >= max_world_size_) continue;
-        if (!event.attempted_ranks[peer]) continue;
-
-        bool succeeded = peer < event.succeeded_ranks.size()
-                             ? event.succeeded_ranks[peer]
-                             : 0;
-        bool failed = peer < event.failed_ranks_hint.size()
-                          ? event.failed_ranks_hint[peer]
-                          : 0;
-        bool current = succeeded && !failed;
-        last_reported_peer_status_[peer] = current;
+void AgentStateMachine::mergeObservationEvent(
+    TransferObservationEvent& acc, const TransferObservationEvent& next) {
+    for (int peer = 0; peer < max_world_size_; ++peer) {
+        if (!next.attempted_ranks[peer]) continue;
+        acc.attempted_ranks[peer] = 1;
+        acc.succeeded_ranks[peer] = next.succeeded_ranks[peer];
+        acc.failed_ranks_hint[peer] = next.failed_ranks_hint[peer];
     }
 }
 

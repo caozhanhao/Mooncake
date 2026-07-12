@@ -1,10 +1,10 @@
 #ifndef MOONCAKE_PG_AGENT_H
 #define MOONCAKE_PG_AGENT_H
 
-#include <array>
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 #include "rpc.h"
 
@@ -33,12 +33,13 @@ class AgentStateMachine {
         agent_session_epoch_.store(epoch, std::memory_order_release);
     }
 
-    AgentApplyResult processTransferObservation(
+    std::optional<GroupObservation> processTransferObservation(
         const TransferObservationEvent& event);
 
-    // Mark the observation data as already reported (used when piggybacking
-    // on a syncAfterFailure RPC instead of sending a separate async report).
-    void markObservationReported(const TransferObservationEvent& event);
+    // Merge `next` into `acc` for peers where next.attempted_ranks is set.
+    // Later observations override earlier ones for the same peer.
+    void mergeObservationEvent(TransferObservationEvent& acc,
+                               const TransferObservationEvent& next);
 
     GroupView getGroupView(GroupId group_id) const;
 
@@ -68,12 +69,11 @@ class AgentStateMachine {
     std::unordered_map<GroupId, GroupView> groups_;
 
     // Per-GlobalRank state caches.
-    std::array<RankState, kMaxNumRanks> global_rank_states_{};
-    std::array<bool, kMaxNumRanks> link_connected_{};
-    std::array<bool, kMaxNumRanks> last_reported_peer_status_{};
-    std::array<uint8_t, kMaxNumRanks> rank_state_snapshot_{};
-    std::array<std::optional<RankConnectionMetadata>, kMaxNumRanks>
-        rank_connections_{};
+    std::vector<RankState> global_rank_states_;
+    std::vector<bool> link_connected_;
+    std::vector<bool> last_reported_peer_status_;
+    std::vector<uint8_t> rank_state_snapshot_;
+    std::vector<std::optional<RankConnectionMetadata>> rank_connections_;
 
     CoordinatorConnection coordinator_connection_ =
         CoordinatorConnection::Disconnected;

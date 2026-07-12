@@ -89,7 +89,7 @@ void CoordinatorHost::start() {
     store_->set("coordinator_addr", addr);
 
     executor_.setTickCallback([this]() {
-        auto result = state_machine_.checkTimeouts();
+        auto result = state_machine_.tick();
         runEffects(result.effects);
     });
 
@@ -212,19 +212,13 @@ void CoordinatorHost::runEffects(
     for (const auto& effect : effects) {
         std::visit(
             overloaded{
-                [this](const PushEffect<RankStateUpdatePush>& e) {
-                    if (e.target.kind == EffectTarget::Kind::BroadcastOnline) {
-                        for (int i = 0; i < max_world_size_; ++i) {
-                            if (state_machine_.getRankState(i) !=
-                                RankState::Offline) {
-                                pushToAgent<
-                                    &AgentRpcService::onRankStateUpdate>(
-                                    i, e.push);
-                            }
+                [this](const RankStateUpdatePush& e) {
+                    for (int i = 0; i < max_world_size_; ++i) {
+                        if (state_machine_.getRankState(i) !=
+                            RankState::Offline) {
+                            pushToAgent<&AgentRpcService::onRankStateUpdate>(i,
+                                                                             e);
                         }
-                    } else {
-                        pushToAgent<&AgentRpcService::onRankStateUpdate>(
-                            e.target.rank, e.push);
                     }
                 },
                 [this](const ViewUpdateEffect& e) { pushViewUpdate(e); },
@@ -242,12 +236,11 @@ void CoordinatorHost::runEffects(
                         pending_sync_ctxs_.erase(it);
                     }
                 },
-                [this](const PushEffect<PeerJoinedPush>& e) {
+                [this](const PeerJoinedPush& e) {
                     for (int i = 0; i < max_world_size_; ++i) {
-                        if (i != e.push.rank && state_machine_.getRankState(
-                                                    i) != RankState::Offline) {
-                            pushToAgent<&AgentRpcService::onPeerJoined>(i,
-                                                                        e.push);
+                        if (i != e.rank && state_machine_.getRankState(i) !=
+                                               RankState::Offline) {
+                            pushToAgent<&AgentRpcService::onPeerJoined>(i, e);
                         }
                     }
                 },

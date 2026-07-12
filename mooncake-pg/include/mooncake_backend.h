@@ -343,8 +343,8 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // Coordinator tells us this via GroupMember::endpoint), and be Healthy in
     // the Coordinator's view.  We intentionally do NOT require the local TE
     // link to be up here.
-    std::array<std::atomic<bool>, kMaxNumRanks> member_bitmap_{};
-    std::array<std::atomic<bool>, kMaxNumRanks> endpoint_present_bitmap_{};
+    std::vector<std::atomic<bool>> member_bitmap_;
+    std::vector<std::atomic<bool>> endpoint_present_bitmap_;
 
     // P2P async infrastructure
     // p2p_proxy_ is created in MooncakeBackend, but can live longer than

@@ -17,8 +17,6 @@ namespace {
 
 // Generate a process-unique starting point for agent_session_epoch so that
 // replacement processes cannot collide with the old rank's session epoch.
-// The low bits mix the current time, the high bits hold the pid; the result
-// is guaranteed non-zero so it is distinguishable from an unset session.
 uint64_t generateInitialAgentSessionEpoch() {
     auto now = std::chrono::steady_clock::now().time_since_epoch().count();
     uint64_t pid = static_cast<uint64_t>(getpid());
@@ -289,11 +287,15 @@ void AgentHost::pushTransferObservation(GroupId group_id,
                                         std::vector<uint8_t> attempted_ranks,
                                         std::vector<uint8_t> failed_ranks,
                                         std::vector<uint8_t> succeeded_ranks) {
-    {
-        std::lock_guard<std::mutex> lock(observation_queue_mutex_);
-        observation_queue_.push(TransferObservationEvent{
-            group_id, std::move(attempted_ranks), std::move(failed_ranks),
-            std::move(succeeded_ranks)});
+    TransferObservationEvent event{group_id, std::move(attempted_ranks),
+                                   std::move(failed_ranks),
+                                   std::move(succeeded_ranks)};
+    std::lock_guard<std::mutex> lock(pending_observations_mutex_);
+    auto it = pending_observations_.find(group_id);
+    if (it == pending_observations_.end()) {
+        pending_observations_[group_id] = std::move(event);
+    } else {
+        agent_.mergeObservationEvent(it->second, event);
     }
 }
 
@@ -304,52 +306,17 @@ SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
     req.agent_session_epoch = agent_.getAgentSessionEpoch();
 
     executor_.postAndWait([this, &req]() {
-        TransferObservationEvent event;
-        while (true) {
-            {
-                std::lock_guard<std::mutex> lock(observation_queue_mutex_);
-                if (observation_queue_.empty()) break;
-                event = std::move(observation_queue_.front());
-                observation_queue_.pop();
-            }
-            if (event.group_id == req.group_id) {
-                // Piggyback this observation on the sync RPC.
-                req.has_observation = true;
-                req.observation_epoch = agent_.getGroupView(req.group_id).epoch;
-                req.attempted_ranks = std::move(event.attempted_ranks);
-                req.failed_ranks_hint = std::move(event.failed_ranks_hint);
-                req.succeeded_ranks = std::move(event.succeeded_ranks);
-                // Mark as reported so the next tick won't double-report.
-                agent_.markObservationReported(event);
-            } else {
-                // Another group — process normally.
-                auto effects = agent_.processTransferObservation(event);
-                for (auto& e : effects) {
-                    if (auto* s = std::get_if<SendTransferObservation>(&e)) {
-                        s->request.agent_session_epoch =
-                            agent_.getAgentSessionEpoch();
-                        s->request.epoch =
-                            agent_.getGroupView(s->request.group_id).epoch;
-                    }
-                }
-                runEffects(effects);
-            }
+        std::lock_guard<std::mutex> lock(pending_observations_mutex_);
+        auto it = pending_observations_.find(req.group_id);
+        if (it != pending_observations_.end()) {
+            req.observation = agent_.processTransferObservation(it->second);
+            pending_observations_.erase(it);
         }
+        req.current_epoch = agent_.getGroupView(req.group_id).epoch;
     });
-
-    req.current_epoch = getGroupView(group_id).epoch;
 
     return rpc_client_->call<&CoordinatorRpcService::syncAfterFailure>(
         coordinator_addr_, req);
-}
-
-GroupView AgentHost::getGroupView(GroupId group_id) {
-    auto promise = std::make_shared<std::promise<GroupView>>();
-    auto future = promise->get_future();
-    executor_.post([this, group_id, promise]() {
-        promise->set_value(agent_.getGroupView(group_id));
-    });
-    return future.get();
 }
 
 void AgentHost::postPeerJoined(PeerJoinedPush push) {
@@ -371,51 +338,7 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
 
     executor_.post([this, ctx = std::move(ctx), push = std::move(push),
                     group_id, epoch]() mutable {
-        // Snapshot ranks that transition from inactive -> active in this
-        // update. Must be done on the executor thread because it reads
-        // agent_.groups_, which is only safe to access from the executor.
-        auto old_view = agent_.getGroupView(group_id);
-        std::vector<GlobalRank> newly_activated;
-        // If the group was already erased, old_view.members is empty;
-        // handleViewUpdate will return early with no effects.
-        if (!old_view.members.empty()) {
-            for (size_t igr = 0; igr < push.view.rank_order.size(); ++igr) {
-                GlobalRank gr = push.view.rank_order[igr];
-                if (!old_view.members[gr].isActive() &&
-                    push.view.members[gr].isActive()) {
-                    newly_activated.push_back(gr);
-                }
-            }
-        }
-
         runEffects(agent_.handleViewUpdate(push));
-
-        // Wake up waitUntilGroupReady callers when group reaches Ready status.
-        if (push.view.status == GroupStatus::Ready) {
-            auto it = group_ready_promises_.find(group_id);
-            if (it != group_ready_promises_.end()) {
-                for (auto& p : it->second) {
-                    p->set_value(push.view);
-                }
-                group_ready_promises_.erase(it);
-            }
-        }
-
-        // Wake up waitUntilRankActive callers for newly activated ranks.
-        for (GlobalRank gr : newly_activated) {
-            auto it = rank_active_promises_.find(group_id);
-            if (it != rank_active_promises_.end()) {
-                auto rit = it->second.find(gr);
-                if (rit != it->second.end()) {
-                    for (auto& p : rit->second) {
-                        p->set_value();
-                    }
-                    it->second.erase(rit);
-                }
-                if (it->second.empty()) rank_active_promises_.erase(it);
-            }
-        }
-
         ctx.response_msg(ViewUpdateAck{.rank = rank_,
                                        .group_id = group_id,
                                        .epoch = epoch,
@@ -539,27 +462,6 @@ void AgentHost::startAgentRegistration() {
 void AgentHost::tick() {
     if (!rpc_client_) return;
 
-    // Consume transfer observation queue.
-    TransferObservationEvent event;
-    while (true) {
-        {
-            std::lock_guard<std::mutex> lock(observation_queue_mutex_);
-            if (observation_queue_.empty()) break;
-            event = std::move(observation_queue_.front());
-            observation_queue_.pop();
-        }
-        auto effects = agent_.processTransferObservation(event);
-        for (auto& effect : effects) {
-            if (auto* e = std::get_if<SendTransferObservation>(&effect)) {
-                e->request.agent_session_epoch = agent_.getAgentSessionEpoch();
-                e->request.epoch =
-                    agent_.getGroupView(e->request.group_id).epoch;
-            }
-        }
-        runEffects(effects);
-    }
-
-    // Check if reconnect is needed.
     if (agent_.getCoordinatorConnection() ==
         AgentStateMachine::CoordinatorConnection::Disconnected) {
         if (rpc_client_->tryReconnect(coordinator_addr_)) {
@@ -568,11 +470,32 @@ void AgentHost::tick() {
         return;
     }
 
-    // Do not send heartbeats while an agent registration is in flight; wait
-    // for the registerAgent response first.
     if (agent_.getCoordinatorConnection() ==
         AgentStateMachine::CoordinatorConnection::AgentRegistering) {
         return;
+    }
+
+    // Flush pending observations.
+    std::unordered_map<GroupId, TransferObservationEvent> batch;
+    {
+        std::lock_guard<std::mutex> lock(pending_observations_mutex_);
+        batch.swap(pending_observations_);
+    }
+    if (!batch.empty()) {
+        TransferObservationReport report;
+        report.reporter_rank = rank_;
+        report.agent_session_epoch = agent_.getAgentSessionEpoch();
+        for (auto& [group_id, ev] : batch) {
+            auto obs = agent_.processTransferObservation(ev);
+            if (obs.has_value()) {
+                report.observations.push_back(std::move(*obs));
+            }
+        }
+        if (!report.observations.empty()) {
+            rpc_client_
+                ->send<&CoordinatorRpcService::reportTransferObservation>(
+                    coordinator_addr_, std::move(report));
+        }
     }
 
     // Send heartbeat.
@@ -594,11 +517,6 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
     for (const auto& effect : effects) {
         std::visit(
             overloaded{
-                [this](const SendTransferObservation& e) {
-                    rpc_client_->send<
-                        &CoordinatorRpcService::reportTransferObservation>(
-                        coordinator_addr_, e.request);
-                },
                 [this](const EnablePeerProbe& e) {
                     link_manager_.enablePeerProbe(e.rank, e.te_server_name,
                                                   e.warmup_recv_addr);
@@ -611,6 +529,9 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                 },
                 [this](const ClearPeerMetadata& e) {
                     link_manager_.publishLinkDown(e.peer);
+                },
+                [this](const RefreshPeerLink& e) {
+                    link_manager_.refreshPeerSegment(e.peer);
                 },
                 [this](const DisconnectAllLinks&) {
                     for (int i = 0; i < max_world_size_; ++i) {
@@ -639,9 +560,26 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                         backend->markViewStale();
                     });
                 },
+                [this](const NotifyGroupReady& e) {
+                    auto it = group_ready_promises_.find(e.group_id);
+                    if (it == group_ready_promises_.end()) return;
+                    auto view = agent_.getGroupView(e.group_id);
+                    for (auto& p : it->second) p->set_value(view);
+                    group_ready_promises_.erase(it);
+                },
+                [this](const NotifyRanksActivated& e) {
+                    auto it = rank_active_promises_.find(e.group_id);
+                    if (it == rank_active_promises_.end()) return;
+                    for (GlobalRank gr : e.ranks) {
+                        auto rit = it->second.find(gr);
+                        if (rit != it->second.end()) {
+                            for (auto& p : rit->second) p->set_value();
+                            it->second.erase(rit);
+                        }
+                    }
+                    if (it->second.empty()) rank_active_promises_.erase(it);
+                },
                 [this](const NotifyTEUnreachable& e) {
-                    // NotifyTEUnreachable carries a GlobalRank.
-                    // Translate to InGroupRank per-backend via rank_order.
                     for (auto& [group_id, backend] : backends_) {
                         auto view = agent_.getGroupView(group_id);
                         for (int lr = 0;

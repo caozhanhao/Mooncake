@@ -64,7 +64,7 @@ class CoordinatorStateMachine {
                                                              bool applied) = 0;
 
     // Periodic.
-    virtual CoordinatorApplyResult<void> checkTimeouts() = 0;
+    virtual CoordinatorApplyResult<void> tick() = 0;
 };
 
 // CentralizedCoordinatorStateMachine - single-node implementation of the
@@ -116,7 +116,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                                                      bool applied) override;
 
     // Periodic.
-    CoordinatorApplyResult<void> checkTimeouts() override;
+    CoordinatorApplyResult<void> tick() override;
 
     RankState getRankState(GlobalRank rank) const {
         if (!rankInRange(rank)) return RankState::Offline;
@@ -141,14 +141,14 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     };
 
     // Per-GlobalRank coordinator state.
-    std::array<RankInfo, kMaxNumRanks> ranks_{};
+    std::vector<RankInfo> ranks_;
 
     std::unordered_map<GroupId, GroupView> group_views_;
 
     // Coordinator-assigned endpoint epoch counter per GlobalRank.
     // Incremented on every successful publishEndpoint for that rank so the
     // Agent can detect endpoint changes.
-    std::array<uint64_t, kMaxNumRanks> endpoint_epochs_{};
+    std::vector<uint64_t> endpoint_epochs_;
 
     struct PendingViewUpdateBarrier {
         GroupId group_id;
