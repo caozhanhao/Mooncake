@@ -4,6 +4,8 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -56,14 +58,6 @@ class MooncakeBackend;
 //                              |  NotifyTEUnreachable -> fanout |
 //                              |              ...               |
 //                              +--------------------------------+
-//
-//   Coordinator pushes:                LinkManager events:
-//   onPeerJoined -> postPeerJoined()   LinkUp/LinkDown -> postTELinkEvent()
-//   onRankStateUpdate -> post...()     (both post to executor)
-//   onViewUpdate -> post...()
-//
-// The Agent never makes autonomous decisions about health or membership.
-// It strictly follows the Coordinator's authoritative broadcasts.
 
 // AgentInterface - control-plane service interface exposed to MooncakeBackend.
 class AgentInterface {
@@ -83,10 +77,6 @@ class AgentInterface {
 
     virtual void unregisterGroup(GroupId group_id) = 0;
 
-    virtual uint64_t getAgentSessionEpoch() = 0;
-
-    virtual GroupView getGroupView(GroupId group_id) = 0;
-
     virtual void publishLocalEndpoint(GroupEndpointPublication endpoint) = 0;
 
     virtual ProposeViewUpdateResponse proposeActivate(
@@ -95,16 +85,17 @@ class AgentInterface {
     virtual ProposeViewUpdateResponse proposeDeactivate(
         GroupId group_id, const std::vector<GlobalRank>& ranks) = 0;
 
-    virtual void pushTransferObservation(GroupId group_id,
-                                         std::vector<uint8_t> attempted_ranks,
-                                         std::vector<uint8_t> failed_ranks_hint,
-                                         std::vector<uint8_t> succeeded_ranks,
-                                         bool local_success) = 0;
+    virtual void pushTransferObservation(
+        GroupId group_id, std::vector<uint8_t> attempted_ranks,
+        std::vector<uint8_t> failed_ranks_hint,
+        std::vector<uint8_t> succeeded_ranks) = 0;
 
-    // Sync-after-failure: notify the Coordinator of a detected failure and
-    // block until a membership decision has been made and applied locally.
-    // Returns the decision status and new epoch.
     virtual SyncAfterFailureResponse syncAfterFailure(GroupId group_id) = 0;
+
+    // Accessors.
+    virtual uint64_t getAgentSessionEpoch() = 0;
+
+    virtual GroupView getGroupView(GroupId group_id) = 0;
 };
 
 class AgentHost;
@@ -131,7 +122,8 @@ class AgentHost : public AgentInterface {
         std::chrono::milliseconds(100);
 
     // Throttle repeated registerAgent error logs.
-    static constexpr auto kRegisterErrorLogInterval = std::chrono::seconds(5);
+    static constexpr auto kAgentRegisterErrorLogInterval =
+        std::chrono::seconds(5);
 
     AgentHost(c10::intrusive_ptr<c10d::Store> store, const std::string& host_ip,
               GlobalRank rank, int max_world_size, LinkManager& link_manager);
@@ -150,10 +142,6 @@ class AgentHost : public AgentInterface {
     void registerGroup(const GroupView& group, bool auto_deactivate,
                        MooncakeBackend* backend) override;
     void unregisterGroup(GroupId group_id) override;
-    uint64_t getAgentSessionEpoch() override {
-        return agent_.getAgentSessionEpoch();
-    }
-    GroupView getGroupView(GroupId group_id) override;
     void publishLocalEndpoint(GroupEndpointPublication endpoint) override;
 
     ProposeViewUpdateResponse proposeActivate(
@@ -165,10 +153,15 @@ class AgentHost : public AgentInterface {
     void pushTransferObservation(GroupId group_id,
                                  std::vector<uint8_t> attempted_ranks,
                                  std::vector<uint8_t> failed_ranks_hint,
-                                 std::vector<uint8_t> succeeded_ranks,
-                                 bool local_success) override;
+                                 std::vector<uint8_t> succeeded_ranks) override;
 
     SyncAfterFailureResponse syncAfterFailure(GroupId group_id) override;
+
+    // Accessors.
+    uint64_t getAgentSessionEpoch() override {
+        return agent_.getAgentSessionEpoch();
+    }
+    GroupView getGroupView(GroupId group_id) override;
 
     void postPeerJoined(PeerJoinedPush push);
     void postRankStateUpdate(RankStateUpdatePush push);
@@ -181,7 +174,6 @@ class AgentHost : public AgentInterface {
     AgentStateMachine agent_;
     SerializedExecutor executor_;
 
-    // Process-level TE link manager (non-owning, owned by ProcessContext).
     LinkManager& link_manager_;
 
     c10::intrusive_ptr<c10d::Store> store_;
@@ -198,13 +190,13 @@ class AgentHost : public AgentInterface {
     std::unique_ptr<AgentRpcServiceImpl> rpc_impl_;
 
     // Bootstrap synchronization: one-shot latch with executor-managed promises.
-    bool registration_done_ = false;
-    std::vector<std::shared_ptr<std::promise<void>>> registration_promises_;
+    bool agent_registration_done_ = false;
+    std::vector<std::shared_ptr<std::promise<void>>>
+        agent_registration_promises_;
 
-    // Throttling state for registerAgent error logs.  Accessed only from the
-    // executor thread.
-    std::chrono::steady_clock::time_point last_register_error_log_time_;
-    uint64_t register_error_log_suppressed_ = 0;
+    // Throttling state for registerAgent error logs
+    std::chrono::steady_clock::time_point last_agent_register_error_log_time_;
+    uint64_t agent_register_error_log_suppressed_ = 0;
 
     // group_ready_promises_ is fulfilled when registerGroup returns and
     // the GroupView is applied.
@@ -224,20 +216,20 @@ class AgentHost : public AgentInterface {
 
     // Backend registry: for view application and link reset.
     // Accessed only from the executor thread.
-    // Raw pointers — lifetime is managed by PyTorch's intrusive_ptr;
-    // MooncakeBackend::~MooncakeBackend() ensures the pointer is erased
-    // from this map before the object is destroyed.
     std::unordered_map<GroupId, MooncakeBackend*> backends_;
 
     // Transfer observation queue: worker thread -> executor.
-    ThreadSafeQueue<TransferObservationEvent> observation_queue_;
+    std::queue<TransferObservationEvent> observation_queue_;
+    std::mutex observation_queue_mutex_;
 
-    void startRegisterRpc();
+    void startAgentRegistration();
     void tick();
 
-    void doRegisterGroup(GroupView group, bool auto_deactivate,
-                         MooncakeBackend* backend);
-    void doPublishLocalEndpoint(GroupEndpointPublication endpoint);
+    void sendPublishEndpointRpc(GroupEndpointPublication endpoint);
+
+    ProposeViewUpdateResponse proposeViewUpdateInternal(
+        GroupId group_id, const std::vector<GlobalRank>& ranks,
+        bool is_activate);
 
     void runEffects(const AgentApplyResult& effects);
     template <typename F>

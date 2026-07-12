@@ -13,21 +13,19 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     CHECK_LE(max_world_size_, kMaxNumRanks)
         << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
         << kMaxNumRanks << ")";
-    global_rank_states_.assign(kMaxNumRanks, RankState::OFFLINE);
-    link_connected_.assign(kMaxNumRanks, false);
-    last_reported_peer_status_.assign(kMaxNumRanks, false);
-    rank_state_snapshot_.assign(kMaxNumRanks,
-                                static_cast<uint8_t>(RankState::OFFLINE));
+    global_rank_states_.fill(RankState::OFFLINE);
+    link_connected_.fill(false);
+    last_reported_peer_status_.fill(false);
+    rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::OFFLINE));
 }
 
 // Group lifecycle
 
 void AgentStateMachine::registerGroup(const GroupView& group,
                                       bool auto_deactivate) {
-    GroupEntry entry;
-    entry.view = group;
-    entry.auto_deactivate = auto_deactivate;
-    groups_[group.group_id] = std::move(entry);
+    GroupView view = group;
+    view.auto_deactivate = auto_deactivate;
+    groups_[group.group_id] = std::move(view);
 }
 
 void AgentStateMachine::unregisterGroup(GroupId group_id) {
@@ -37,7 +35,7 @@ void AgentStateMachine::unregisterGroup(GroupId group_id) {
 GroupView AgentStateMachine::getGroupView(GroupId group_id) const {
     auto it = groups_.find(group_id);
     if (it != groups_.end()) {
-        return it->second.view;
+        return it->second;
     }
     return GroupView{};
 }
@@ -117,7 +115,7 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
     // Detect coordinator-assigned endpoint_epoch changes.  A change means the
     // remote endpoint has been republished (e.g. replacement process) and the
     // LinkManager must drop the old link and re-probe with the new server info.
-    const auto& old_view = it->second.view;
+    const auto& old_view = it->second;
     for (size_t r = 0; r < push.view.members.size(); ++r) {
         if (r == static_cast<size_t>(rank_)) continue;
         if (!push.view.members[r].isMember()) continue;
@@ -133,29 +131,27 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
             const auto& conn = rank_connections_[r];
             if (conn.has_value()) {
                 effects.push_back(DisconnectLink{r});
-                effects.push_back(EnablePeerProbe{
-                    r, conn->te_server_name, conn->warmup_recv_addr});
+                effects.push_back(EnablePeerProbe{r, conn->te_server_name,
+                                                  conn->warmup_recv_addr});
                 LOG(INFO) << "[AGENT] endpoint_epoch changed rank=" << rank_
-                          << " peer=" << r
-                          << " old_epoch=" << old_epoch
+                          << " peer=" << r << " old_epoch=" << old_epoch
                           << " new_epoch=" << new_epoch;
             }
         }
     }
 
-    it->second.view = push.view;
+    it->second = push.view;
 
     effects.push_back(ApplyViewToBackend{push.group_id, push.view});
     return effects;
 }
 
-AgentApplyResult AgentStateMachine::handleLinkStateChanged(GlobalRank peer,
-                                                           bool connected) {
+AgentApplyResult AgentStateMachine::handleLinkStateChange(GlobalRank peer,
+                                                          bool connected) {
     AgentApplyResult effects;
     if (!rankInRange(peer)) {
-        LOG(WARNING)
-            << "AgentStateMachine: handleLinkStateChanged out-of-range "
-            << peer;
+        LOG(WARNING) << "AgentStateMachine: handleLinkStateChange out-of-range "
+                     << peer;
         return effects;
     }
     link_connected_[peer] = connected;
@@ -168,9 +164,9 @@ AgentApplyResult AgentStateMachine::handleLinkStateChanged(GlobalRank peer,
         // (the view stays Ready while the TE link is rebuilt) and covers any
         // edge case where a Ready view was applied before the local TE link
         // finished establishing.
-        for (const auto& [group_id, entry] : groups_) {
-            if (entry.view.status == GroupStatus::Ready) {
-                effects.push_back(ApplyViewToBackend{group_id, entry.view});
+        for (const auto& [group_id, view] : groups_) {
+            if (view.status == GroupStatus::Ready) {
+                effects.push_back(ApplyViewToBackend{group_id, view});
             }
         }
     }
@@ -183,8 +179,8 @@ HeartbeatRequest AgentStateMachine::buildHeartbeat() const {
     return req;
 }
 
-AgentApplyResult AgentStateMachine::applyRegisterResponse(
-    const RegisterResponse& resp) {
+AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
+    const RegisterAgentResponse& resp) {
     AgentApplyResult effects;
 
     if (!resp.success) {
@@ -204,10 +200,9 @@ AgentApplyResult AgentStateMachine::applyRegisterResponse(
     }
 
     // Populate groups (view includes rank_order and member state).
-    for (const auto& view : resp.groups) {
-        auto& group = groups_[view.group_id];
-        group.view = view;
-        effects.push_back(ApplyViewToBackend{view.group_id, view});
+    for (const auto& gv : resp.groups) {
+        groups_[gv.group_id] = gv;
+        effects.push_back(ApplyViewToBackend{gv.group_id, gv});
     }
 
     // Populate connection metadata and trigger peer probes.
@@ -229,11 +224,10 @@ AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
     AgentApplyResult effects;
 
     rank_state_ = RankState::OFFLINE;
-    global_rank_states_.assign(kMaxNumRanks, RankState::OFFLINE);
-    link_connected_.assign(kMaxNumRanks, false);
-    last_reported_peer_status_.assign(kMaxNumRanks, false);
-    rank_state_snapshot_.assign(kMaxNumRanks,
-                                static_cast<uint8_t>(RankState::OFFLINE));
+    global_rank_states_.fill(RankState::OFFLINE);
+    link_connected_.fill(false);
+    last_reported_peer_status_.fill(false);
+    rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::OFFLINE));
     for (auto& conn : rank_connections_) conn.reset();
 
     effects.push_back(DisconnectAllLinks{});
@@ -242,33 +236,6 @@ AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
     snapshot.states.assign(rank_state_snapshot_.begin(),
                            rank_state_snapshot_.begin() + max_world_size_);
     effects.push_back(std::move(snapshot));
-
-    return effects;
-}
-
-AgentApplyResult AgentStateMachine::markOffline() {
-    AgentApplyResult effects;
-
-    rank_state_ = RankState::OFFLINE;
-    coordinator_connection_ = CoordinatorConnection::Disconnected;
-    global_rank_states_.assign(kMaxNumRanks, RankState::OFFLINE);
-    link_connected_.assign(kMaxNumRanks, false);
-    last_reported_peer_status_.assign(kMaxNumRanks, false);
-    rank_state_snapshot_.assign(kMaxNumRanks,
-                                static_cast<uint8_t>(RankState::OFFLINE));
-    for (auto& conn : rank_connections_) conn.reset();
-
-    effects.push_back(DisconnectAllLinks{});
-    effects.push_back(ClearAllPeerMetadata{});
-    PublishRankStateSnapshot offline_snapshot;
-    offline_snapshot.states.assign(
-        rank_state_snapshot_.begin(),
-        rank_state_snapshot_.begin() + max_world_size_);
-    effects.push_back(std::move(offline_snapshot));
-
-    for (auto& [group_id, entry] : groups_) {
-        effects.push_back(MarkBackendViewStale{group_id});
-    }
 
     return effects;
 }
@@ -288,7 +255,6 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
     TransferObservationReport req;
     req.group_id = event.group_id;
     req.reporter_rank = rank_;
-    req.local_success = event.local_success;
 
     bool has_changed = false;
 
@@ -299,8 +265,8 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
         if (!event.attempted_ranks[peer]) continue;
 
         bool succeeded = peer < event.succeeded_ranks.size()
-                            ? event.succeeded_ranks[peer]
-                            : 0;
+                             ? event.succeeded_ranks[peer]
+                             : 0;
         bool failed = peer < event.failed_ranks_hint.size()
                           ? event.failed_ranks_hint[peer]
                           : 0;
@@ -349,8 +315,8 @@ void AgentStateMachine::markObservationReported(
         if (!event.attempted_ranks[peer]) continue;
 
         bool succeeded = peer < event.succeeded_ranks.size()
-                            ? event.succeeded_ranks[peer]
-                            : 0;
+                             ? event.succeeded_ranks[peer]
+                             : 0;
         bool failed = peer < event.failed_ranks_hint.size()
                           ? event.failed_ranks_hint[peer]
                           : 0;
@@ -361,7 +327,7 @@ void AgentStateMachine::markObservationReported(
 
 void AgentStateMachine::syncRankStateSnapshot(AgentApplyResult& effects) {
     bool snapshot_changed = false;
-    for (GlobalRank r{0}; r < max_world_size_; ++r) {
+    for (int r = 0; r < max_world_size_; ++r) {
         uint8_t new_val = static_cast<uint8_t>(global_rank_states_[r]);
         if (rank_state_snapshot_[r] != new_val) {
             rank_state_snapshot_[r] = new_val;

@@ -22,37 +22,45 @@ class CoordinatorStateMachine {
    public:
     virtual ~CoordinatorStateMachine() = default;
 
-    virtual CoordinatorApplyResult<RegisterResponse> handleRegister(
-        const RegisterRequest& req) = 0;
+    // Registration & heartbeat.
+    virtual CoordinatorApplyResult<RegisterAgentResponse> handleRegisterAgent(
+        const RegisterAgentRequest& req) = 0;
 
     virtual CoordinatorApplyResult<HeartbeatResponse> handleHeartbeat(
         const HeartbeatRequest& req) = 0;
 
+    // Group management.
     virtual CoordinatorApplyResult<RegisterGroupResponse> handleRegisterGroup(
         const RegisterGroupRequest& req) = 0;
-
-    virtual CoordinatorApplyResult<void> handleProposeViewUpdate(
-        uint64_t propose_id, const ProposeViewUpdateRequest& req) = 0;
 
     virtual CoordinatorApplyResult<void> handleUnregisterGroup(
         const UnregisterGroupRequest& req) = 0;
 
-    virtual CoordinatorApplyResult<void> handleViewUpdateAck(
-        GroupId group_id, GlobalRank rank, uint64_t epoch, bool applied,
-        const ViewUpdateAckRoute& route) = 0;
-
-    virtual CoordinatorApplyResult<void> handleSyncAfterFailure(
-        uint64_t sync_id, const SyncAfterFailureRequest& req) = 0;
-
+    // Endpoint publication.
     virtual CoordinatorApplyResult<PublishEndpointResponse>
     handlePublishEndpoint(const PublishEndpointRequest& req) = 0;
 
+    // Membership proposals.
+    virtual CoordinatorApplyResult<void> handleProposeViewUpdate(
+        uint64_t propose_id, const ProposeViewUpdateRequest& req) = 0;
+
+    // Data-plane observations and link state.
     virtual CoordinatorApplyResult<void> handleTransferObservation(
         const TransferObservationReport& req) = 0;
 
     virtual CoordinatorApplyResult<void> handleLinkStateChange(
         const LinkStateChangeReport& req) = 0;
 
+    // Sync-after-failure.
+    virtual CoordinatorApplyResult<void> handleSyncAfterFailure(
+        uint64_t sync_id, const SyncAfterFailureRequest& req) = 0;
+
+    // ViewUpdate ACK processing.
+    virtual CoordinatorApplyResult<void> handleViewUpdateAck(
+        GroupId group_id, GlobalRank rank, uint64_t epoch, bool applied,
+        const ViewUpdateAckRoute& route) = 0;
+
+    // Periodic.
     virtual CoordinatorApplyResult<void> checkTimeouts() = 0;
 };
 
@@ -65,41 +73,49 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         std::chrono::microseconds fault_reconciliation_window =
             std::chrono::microseconds(50000));
 
-    CoordinatorApplyResult<RegisterResponse> handleRegister(
-        const RegisterRequest& req) override;
+    // Registration & heartbeat.
+    CoordinatorApplyResult<RegisterAgentResponse> handleRegisterAgent(
+        const RegisterAgentRequest& req) override;
 
     CoordinatorApplyResult<HeartbeatResponse> handleHeartbeat(
         const HeartbeatRequest& req) override;
 
+    // Group management.
     CoordinatorApplyResult<RegisterGroupResponse> handleRegisterGroup(
         const RegisterGroupRequest& req) override;
 
-    CoordinatorApplyResult<void> handleProposeViewUpdate(
-        uint64_t propose_id, const ProposeViewUpdateRequest& req) override;
+    CoordinatorApplyResult<void> handleUnregisterGroup(
+        const UnregisterGroupRequest& req) override;
 
+    // Endpoint publication.
     CoordinatorApplyResult<PublishEndpointResponse> handlePublishEndpoint(
         const PublishEndpointRequest& req) override;
 
+    // Membership proposals.
+    CoordinatorApplyResult<void> handleProposeViewUpdate(
+        uint64_t propose_id, const ProposeViewUpdateRequest& req) override;
+
+    // Data-plane observations and link state.
     CoordinatorApplyResult<void> handleTransferObservation(
         const TransferObservationReport& req) override;
 
     CoordinatorApplyResult<void> handleLinkStateChange(
         const LinkStateChangeReport& req) override;
 
-    CoordinatorApplyResult<void> checkTimeouts() override;
-
-    CoordinatorApplyResult<void> handleUnregisterGroup(
-        const UnregisterGroupRequest& req) override;
-
+    // Sync-after-failure.
     CoordinatorApplyResult<void> handleSyncAfterFailure(
         uint64_t sync_id, const SyncAfterFailureRequest& req) override;
 
+    // ViewUpdate ACK processing.
     CoordinatorApplyResult<void> handleViewUpdateAck(
         GroupId group_id, GlobalRank rank, uint64_t epoch, bool applied,
         const ViewUpdateAckRoute& route) override;
 
+    // Periodic.
+    CoordinatorApplyResult<void> checkTimeouts() override;
+
     RankState getRankState(GlobalRank rank) const {
-        if (!rankInValidRange(rank)) return RankState::OFFLINE;
+        if (!rankInRange(rank)) return RankState::OFFLINE;
         return ranks_[rank].state;
     }
 
@@ -121,16 +137,13 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     };
 
     // Per-GlobalRank coordinator state.
-    std::vector<RankInfo> ranks_{static_cast<size_t>(kMaxNumRanks)};
+    std::array<RankInfo, kMaxNumRanks> ranks_{};
 
     std::unordered_map<GroupId, GroupView> group_views_;
-    std::unordered_map<GroupId, bool> group_auto_deactivate_;
 
     // Coordinator-assigned endpoint epoch counter per GlobalRank.
     // Incremented on every successful publishEndpoint for that rank so the
-    // Agent can detect endpoint changes (e.g. after destroy+reinit) and
-    // trigger TE link re-establishment.  Per-rank (not per-group) so that
-    // epochs never collide across group create/destroy cycles.
+    // Agent can detect endpoint changes.
     std::array<uint64_t, kMaxNumRanks> endpoint_epochs_{};
 
     // Two independent 2PC flows share the same ViewUpdate ACK path:
@@ -157,9 +170,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // the window closes.  Because link_status is global (per-rank), a single
     // global deadline is sufficient.  groups_in_window records, for each group
     // that reported during this window, the GroupView epoch at which it entered
-    // the window; this is used to seal only those groups and to avoid sealing
-    // a group whose view epoch has already moved on (e.g. a concurrent manual
-    // activate/deactivate proposal).
+    // the window.
     struct FaultReconciliationContext {
         bool active = false;
         std::chrono::steady_clock::time_point deadline;
@@ -188,8 +199,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     void transitionToOffline(GlobalRank rank,
                              std::vector<CoordinatorEffect>& effects);
-    void transitionToSynced(GlobalRank rank,
-                            std::vector<CoordinatorEffect>& effects);
 
     // Recompute the authoritative healthy set (max clique) and update
     // ranks_[].state between HEALTHY and SYNCED.  Emits rank-state effects.
@@ -212,8 +221,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // Emits ReplySyncEffect for each pending sync_id.
     void flushPendingSyncs(GroupId group_id,
                            std::vector<CoordinatorEffect>& effects);
-    void flushPendingSyncs(GroupId group_id, GlobalRank rank,
-                           std::vector<CoordinatorEffect>& effects);
 
     // Build the response for a sync-after-failure request.
     SyncAfterFailureResponse buildSyncAfterFailureResponse(
@@ -228,7 +235,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     bool canEraseGroup(const GroupView& view) const;
     void eraseGroup(GroupId group_id, std::vector<CoordinatorEffect>& effects);
 
-    bool rankInValidRange(GlobalRank rank) const {
+    bool rankInRange(GlobalRank rank) const {
         return 0 <= rank && rank < max_world_size_;
     }
     bool isRankActivatable(GroupId group_id, GlobalRank rank,
@@ -237,19 +244,17 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                           const std::vector<GlobalRank>& new_ranks,
                           const GroupView& old_view) const;
 
-    bool registerGroup(GlobalRank joining_rank, const GroupView& group,
-                       bool auto_deactivate, RegisterGroupResponse& response,
-                       std::vector<CoordinatorEffect>& effects);
+    bool processGroupRegistration(GlobalRank joining_rank,
+                                  const GroupView& group, bool auto_deactivate,
+                                  RegisterGroupResponse& response,
+                                  std::vector<CoordinatorEffect>& effects);
 
     std::vector<GlobalRank> computeRequiredViewAcks(const GroupView& old_view,
                                                     const GroupView& new_view,
                                                     GlobalRank proposer) const;
 
-    RegisterResponse buildRegisterResponse(GlobalRank for_rank) const;
-
-    // Effect factory helpers.
+    // Effect factory helper.
     CoordinatorEffect makeRankStateEffect(GlobalRank rank);
-    CoordinatorEffect makePeerJoinedEffect(GlobalRank rank);
 };
 
 }  // namespace mooncake

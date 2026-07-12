@@ -405,21 +405,11 @@ void MooncakeWorker::startWorker() {
                                             ? 1
                                             : 0;
                                 }
-                                // Compute local_success: true iff no
-                                // attempted peer failed.
-                                bool local_success = true;
-                                for (int j = 0; j < group->size; ++j) {
-                                    if (task.attemptedRanksHintHost[j] &&
-                                        task.failedRanksHintHost[j]) {
-                                        local_success = false;
-                                        break;
-                                    }
-                                }
                                 group->backend->getAgent()
                                     .pushTransferObservation(
                                         group->group_id, std::move(attempted),
-                                        std::move(failed), std::move(succeeded),
-                                        local_success);
+                                        std::move(failed),
+                                        std::move(succeeded));
                                 LOG(INFO)
                                     << "[WORKER] transfer observation pushed "
                                     << " rank=" << group->globalRank

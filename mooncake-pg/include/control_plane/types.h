@@ -81,7 +81,8 @@ enum class GroupMemberStatus : uint8_t {
 // endpoint.has_value() authoritative for "endpoint present and fresh".
 struct GroupMember {
     GroupMemberStatus status = GroupMemberStatus::kNone;
-    std::optional<uint64_t> agent_session_epoch;  // session that published endpoint
+    std::optional<uint64_t>
+        agent_session_epoch;  // session that published endpoint
     std::optional<GroupEndpointInfo> endpoint;
 
     bool isActive() const { return status == GroupMemberStatus::kActive; }
@@ -128,21 +129,19 @@ struct GroupView {
     GroupId group_id;
     GroupStatus status = GroupStatus::Bootstrapping;
     uint64_t epoch = 0;
+    bool auto_deactivate = true;
     std::vector<GlobalRank> rank_order;  // InGroupRank → GlobalRank
     std::vector<GroupMember> members;    // indexed by GlobalRank
 };
 
-// TransferObservationEvent, worker thread -> Agent queue.
-// attempted_ranks / failed_ranks_hint / succeeded_ranks are bit-vectors
-// indexed by GlobalRank (size kMaxNumRanks).  Producers must translate
-// InGroupRank peers to GlobalRank via rank_order before setting bits.
+// TransferObservationEvent — worker thread → Agent queue.
+// Bit-vectors are indexed by GlobalRank (size kMaxNumRanks).
+// Producers translate InGroupRank peers to GlobalRank via rank_order.
 struct TransferObservationEvent {
     GroupId group_id;
     std::vector<uint8_t> attempted_ranks;
     std::vector<uint8_t> failed_ranks_hint;
     std::vector<uint8_t> succeeded_ranks;
-    bool local_success =
-        false;  // true iff ALL attempted peers succeeded locally
 };
 
 }  // namespace mooncake

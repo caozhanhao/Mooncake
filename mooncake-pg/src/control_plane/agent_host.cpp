@@ -111,7 +111,7 @@ void AgentHost::start() {
     executor_.start();
 
     // Initial registration.
-    executor_.post([this]() { startRegisterRpc(); });
+    executor_.post([this]() { startAgentRegistration(); });
 }
 
 void AgentHost::shutdown() {
@@ -139,17 +139,18 @@ bool AgentHost::waitUntilRegistered(std::chrono::milliseconds timeout) {
     auto future = promise->get_future();
 
     executor_.post([this, promise]() {
-        if (registration_done_) {
+        if (agent_registration_done_) {
             promise->set_value();
         } else {
-            registration_promises_.push_back(promise);
+            agent_registration_promises_.push_back(promise);
         }
     });
 
     if (future.wait_for(timeout) != std::future_status::ready) {
         // Timeout: remove the dangling promise on the executor thread.
-        executor_.post(
-            [this, promise]() { std::erase(registration_promises_, promise); });
+        executor_.post([this, promise]() {
+            std::erase(agent_registration_promises_, promise);
+        });
         return false;
     }
     return true;
@@ -228,43 +229,38 @@ void AgentHost::waitUntilRankActive(GroupId group_id, GlobalRank rank,
 
 // Agent interface: Group management
 
-void AgentHost::doRegisterGroup(GroupView group, bool auto_deactivate,
-                                MooncakeBackend* backend) {
-    auto group_id = group.group_id;
-    backends_.insert_or_assign(group_id, backend);
-    agent_.registerGroup(group, auto_deactivate);
-
-    RegisterGroupRequest req;
-    req.rank = rank_;
-    req.agent_session_epoch = agent_.getAgentSessionEpoch();
-    req.group = std::move(group);
-    req.auto_deactivate = auto_deactivate;
-
-    auto resp = rpc_client_->call<&CoordinatorRpcService::registerGroup>(
-        coordinator_addr_, std::move(req));
-
-    LOG(INFO) << "[AGENT] registerGroup rank=" << rank_ << " group=" << group_id
-              << " success=" << resp.success;
-
-    if (!resp.success) {
-        LOG(ERROR) << "AgentHost: registerGroup failed for group " << group_id
-                   << ": " << resp.reject_reason;
-        auto it = group_ready_promises_.find(group_id);
-        if (it != group_ready_promises_.end()) {
-            for (auto& p : it->second) {
-                p->set_exception(std::make_exception_ptr(std::runtime_error(
-                    "registerGroup rejected: " + resp.reject_reason)));
-            }
-            group_ready_promises_.erase(it);
-        }
-    }
-}
-
 void AgentHost::registerGroup(const GroupView& group, bool auto_deactivate,
                               MooncakeBackend* backend) {
     executor_.postAndWait([this, group = group, auto_deactivate,
                            backend]() mutable {
-        doRegisterGroup(std::move(group), auto_deactivate, backend);
+        auto group_id = group.group_id;
+        backends_.insert_or_assign(group_id, backend);
+        agent_.registerGroup(group, auto_deactivate);
+
+        RegisterGroupRequest req;
+        req.rank = rank_;
+        req.agent_session_epoch = agent_.getAgentSessionEpoch();
+        req.group = std::move(group);
+        req.group.auto_deactivate = auto_deactivate;
+
+        auto resp = rpc_client_->call<&CoordinatorRpcService::registerGroup>(
+            coordinator_addr_, std::move(req));
+
+        LOG(INFO) << "[AGENT] registerGroup rank=" << rank_
+                  << " group=" << group_id << " success=" << resp.success;
+
+        if (!resp.success) {
+            LOG(ERROR) << "AgentHost: registerGroup failed for group "
+                       << group_id << ": " << resp.reject_reason;
+            auto it = group_ready_promises_.find(group_id);
+            if (it != group_ready_promises_.end()) {
+                for (auto& p : it->second) {
+                    p->set_exception(std::make_exception_ptr(std::runtime_error(
+                        "registerGroup rejected: " + resp.reject_reason)));
+                }
+                group_ready_promises_.erase(it);
+            }
+        }
     });
 }
 
@@ -284,16 +280,7 @@ void AgentHost::unregisterGroup(GroupId group_id) {
     });
 }
 
-GroupView AgentHost::getGroupView(GroupId group_id) {
-    auto promise = std::make_shared<std::promise<GroupView>>();
-    auto future = promise->get_future();
-    executor_.post([this, group_id, promise]() {
-        promise->set_value(agent_.getGroupView(group_id));
-    });
-    return future.get();
-}
-
-void AgentHost::doPublishLocalEndpoint(GroupEndpointPublication endpoint) {
+void AgentHost::sendPublishEndpointRpc(GroupEndpointPublication endpoint) {
     PublishEndpointRequest req;
     req.rank = rank_;
     req.agent_session_epoch = agent_.getAgentSessionEpoch();
@@ -304,34 +291,32 @@ void AgentHost::doPublishLocalEndpoint(GroupEndpointPublication endpoint) {
 
 void AgentHost::publishLocalEndpoint(GroupEndpointPublication endpoint) {
     executor_.postAndWait([this, endpoint = std::move(endpoint)]() mutable {
-        doPublishLocalEndpoint(std::move(endpoint));
+        sendPublishEndpointRpc(std::move(endpoint));
     });
 }
 
 // Agent interface: Membership proposals (synchronous)
 
-ProposeViewUpdateResponse AgentHost::proposeActivate(
-    GroupId group_id, const std::vector<GlobalRank>& ranks) {
+ProposeViewUpdateResponse AgentHost::proposeViewUpdateInternal(
+    GroupId group_id, const std::vector<GlobalRank>& ranks, bool is_activate) {
     ProposeViewUpdateRequest req;
     req.group_id = group_id;
     req.source_rank = rank_;
     req.agent_session_epoch = agent_.getAgentSessionEpoch();
     req.requested_ranks = ranks;
-    req.is_activate = true;
+    req.is_activate = is_activate;
     return rpc_client_->call<&CoordinatorRpcService::proposeViewUpdate>(
         coordinator_addr_, req);
 }
 
+ProposeViewUpdateResponse AgentHost::proposeActivate(
+    GroupId group_id, const std::vector<GlobalRank>& ranks) {
+    return proposeViewUpdateInternal(group_id, ranks, /*is_activate=*/true);
+}
+
 ProposeViewUpdateResponse AgentHost::proposeDeactivate(
     GroupId group_id, const std::vector<GlobalRank>& ranks) {
-    ProposeViewUpdateRequest req;
-    req.group_id = group_id;
-    req.source_rank = rank_;
-    req.agent_session_epoch = agent_.getAgentSessionEpoch();
-    req.requested_ranks = ranks;
-    req.is_activate = false;
-    return rpc_client_->call<&CoordinatorRpcService::proposeViewUpdate>(
-        coordinator_addr_, req);
+    return proposeViewUpdateInternal(group_id, ranks, /*is_activate=*/false);
 }
 
 // Agent interface: Transfer observation (thread-safe)
@@ -339,11 +324,13 @@ ProposeViewUpdateResponse AgentHost::proposeDeactivate(
 void AgentHost::pushTransferObservation(GroupId group_id,
                                         std::vector<uint8_t> attempted_ranks,
                                         std::vector<uint8_t> failed_ranks,
-                                        std::vector<uint8_t> succeeded_ranks,
-                                        bool local_success) {
-    observation_queue_.enqueue(TransferObservationEvent{
-        group_id, std::move(attempted_ranks), std::move(failed_ranks),
-        std::move(succeeded_ranks)});
+                                        std::vector<uint8_t> succeeded_ranks) {
+    {
+        std::lock_guard<std::mutex> lock(observation_queue_mutex_);
+        observation_queue_.push(TransferObservationEvent{
+            group_id, std::move(attempted_ranks), std::move(failed_ranks),
+            std::move(succeeded_ranks)});
+    }
 }
 
 SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
@@ -357,13 +344,17 @@ SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
     // observations for other groups normally.
     executor_.postAndWait([this, &req]() {
         TransferObservationEvent event;
-        while (observation_queue_.try_dequeue(event)) {
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lock(observation_queue_mutex_);
+                if (observation_queue_.empty()) break;
+                event = std::move(observation_queue_.front());
+                observation_queue_.pop();
+            }
             if (event.group_id == req.group_id) {
                 // Piggyback this observation on the sync RPC.
                 req.has_observation = true;
-                req.local_success = event.local_success;
-                req.observation_epoch =
-                    agent_.getGroupView(req.group_id).epoch;
+                req.observation_epoch = agent_.getGroupView(req.group_id).epoch;
                 req.attempted_ranks = std::move(event.attempted_ranks);
                 req.failed_ranks_hint = std::move(event.failed_ranks_hint);
                 req.succeeded_ranks = std::move(event.succeeded_ranks);
@@ -373,8 +364,7 @@ SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
                 // Another group — process normally.
                 auto effects = agent_.processTransferObservation(event);
                 for (auto& e : effects) {
-                    if (auto* s =
-                            std::get_if<SendTransferObservation>(&e)) {
+                    if (auto* s = std::get_if<SendTransferObservation>(&e)) {
                         s->request.agent_session_epoch =
                             agent_.getAgentSessionEpoch();
                         s->request.epoch =
@@ -395,6 +385,17 @@ SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
     // this returns.
     return rpc_client_->call<&CoordinatorRpcService::syncAfterFailure>(
         coordinator_addr_, req);
+}
+
+// Agent interface: Accessors
+
+GroupView AgentHost::getGroupView(GroupId group_id) {
+    auto promise = std::make_shared<std::promise<GroupView>>();
+    auto future = promise->get_future();
+    executor_.post([this, group_id, promise]() {
+        promise->set_value(agent_.getGroupView(group_id));
+    });
+    return future.get();
 }
 
 // RPC push callbacks
@@ -478,7 +479,7 @@ void AgentHost::postTELinkEvent(TELinkEvent event) {
             if (event.target_id.has_value()) {
                 // LinkManager already updated the read model (publishLinkUp)
                 // before emitting this event  - just update the state machine.
-                runEffects(agent_.handleLinkStateChanged(event.peer, true));
+                runEffects(agent_.handleLinkStateChange(event.peer, true));
             } else {
                 LOG(WARNING) << "AgentHost: LinkUp event for peer "
                              << event.peer << " without target_id; ignoring.";
@@ -487,8 +488,8 @@ void AgentHost::postTELinkEvent(TELinkEvent event) {
         } else {
             // LinkDown: LinkManager already called publishLinkDown in
             // tearDownPeerLink.  P2P reset is modeled as a
-            // ResetPeerP2PState effect from handleLinkStateChanged.
-            runEffects(agent_.handleLinkStateChanged(event.peer, false));
+            // ResetPeerP2PState effect from handleLinkStateChange.
+            runEffects(agent_.handleLinkStateChange(event.peer, false));
         }
 
         // Report the link state change event to the Coordinator so it can
@@ -508,19 +509,20 @@ void AgentHost::postTELinkEvent(TELinkEvent event) {
     });
 }
 
-// Internal: startRegisterRpc
+// Internal: startAgentRegistration
 
-void AgentHost::startRegisterRpc() {
+void AgentHost::startAgentRegistration() {
     // Avoid duplicate registration RPCs.  This also covers the case where a
     // heartbeat response callback asks for re-registration while another
     // registration is already in flight.
     if (agent_.getCoordinatorConnection() ==
-        AgentStateMachine::CoordinatorConnection::Registering) {
+        AgentStateMachine::CoordinatorConnection::AgentRegistering) {
         return;
     }
-    agent_.setCoordinatorRegistering();
+    agent_.setCoordinatorConnection(
+        AgentStateMachine::CoordinatorConnection::AgentRegistering);
 
-    RegisterRequest req;
+    RegisterAgentRequest req;
     req.rank = rank_;
     req.agent_addr = rpc_server_->getListenAddr(host_ip_);
     req.te_server_name = link_manager_.localServerName();
@@ -529,40 +531,43 @@ void AgentHost::startRegisterRpc() {
     agent_.setAgentSessionEpoch(agent_session_epoch_);
 
     rpc_client_->callAsync<&CoordinatorRpcService::registerAgent>(
-        coordinator_addr_, std::move(req), [this](RegisterResponse resp) {
+        coordinator_addr_, std::move(req), [this](RegisterAgentResponse resp) {
             executor_.post([this, resp = std::move(resp)]() mutable {
-                auto effects = agent_.applyRegisterResponse(resp);
+                auto effects = agent_.applyRegisterAgentResponse(resp);
                 runEffects(effects);
 
                 if (resp.success) {
-                    if (!registration_done_) {
-                        registration_done_ = true;
-                        for (auto& p : registration_promises_) {
+                    if (!agent_registration_done_) {
+                        agent_registration_done_ = true;
+                        for (auto& p : agent_registration_promises_) {
                             p->set_value();
                         }
-                        registration_promises_.clear();
+                        agent_registration_promises_.clear();
                     }
 
                     // Re-publish all local backends' endpoints after (re-)reg.
                     // (Old session endpoints were cleared by Coordinator.)
                     forEachBackend([&](auto backend) {
-                        doPublishLocalEndpoint(
+                        sendPublishEndpointRpc(
                             backend->buildEndpointMetadata());
                     });
                 } else {
                     auto now = std::chrono::steady_clock::now();
-                    if (last_register_error_log_time_.time_since_epoch() ==
+                    if (last_agent_register_error_log_time_
+                                .time_since_epoch() ==
                             std::chrono::steady_clock::duration{} ||
-                        now - last_register_error_log_time_ >=
-                            kRegisterErrorLogInterval) {
+                        now - last_agent_register_error_log_time_ >=
+                            kAgentRegisterErrorLogInterval) {
                         std::string suppressed_msg;
-                        if (register_error_log_suppressed_ > 0) {
+                        if (agent_register_error_log_suppressed_ > 0) {
                             suppressed_msg =
                                 " (suppressed " +
-                                std::to_string(register_error_log_suppressed_) +
+                                std::to_string(
+                                    agent_register_error_log_suppressed_) +
                                 " identical log" +
-                                (register_error_log_suppressed_ > 1 ? "s"
-                                                                    : "") +
+                                (agent_register_error_log_suppressed_ > 1
+                                     ? "s"
+                                     : "") +
                                 " since last print)";
                         }
                         LOG(ERROR)
@@ -572,10 +577,10 @@ void AgentHost::startRegisterRpc() {
                                "persists, the Coordinator may be rejecting a "
                                "replacement rank before the old one times out)"
                             << suppressed_msg;
-                        last_register_error_log_time_ = now;
-                        register_error_log_suppressed_ = 0;
+                        last_agent_register_error_log_time_ = now;
+                        agent_register_error_log_suppressed_ = 0;
                     } else {
-                        ++register_error_log_suppressed_;
+                        ++agent_register_error_log_suppressed_;
                     }
                 }
             });
@@ -589,7 +594,13 @@ void AgentHost::tick() {
 
     // Consume transfer observation queue.
     TransferObservationEvent event;
-    while (observation_queue_.try_dequeue(event)) {
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(observation_queue_mutex_);
+            if (observation_queue_.empty()) break;
+            event = std::move(observation_queue_.front());
+            observation_queue_.pop();
+        }
         auto effects = agent_.processTransferObservation(event);
         for (auto& effect : effects) {
             if (auto* e = std::get_if<SendTransferObservation>(&effect)) {
@@ -605,15 +616,15 @@ void AgentHost::tick() {
     if (agent_.getCoordinatorConnection() ==
         AgentStateMachine::CoordinatorConnection::Disconnected) {
         if (rpc_client_->tryReconnect(coordinator_addr_)) {
-            startRegisterRpc();
+            startAgentRegistration();
         }
         return;
     }
 
-    // Do not send heartbeats while a registration is in flight; wait for the
-    // registerAgent response first.
+    // Do not send heartbeats while an agent registration is in flight; wait
+    // for the registerAgent response first.
     if (agent_.getCoordinatorConnection() ==
-        AgentStateMachine::CoordinatorConnection::Registering) {
+        AgentStateMachine::CoordinatorConnection::AgentRegistering) {
         return;
     }
 
@@ -626,7 +637,7 @@ void AgentHost::tick() {
             executor_.post([this, resp]() {
                 if (resp.require_reregister) {
                     runEffects(agent_.prepareCleanSlateRegister());
-                    startRegisterRpc();
+                    startAgentRegistration();
                 }
             });
         });
@@ -662,14 +673,14 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                     link_manager_.publishLinkDown(e.peer);
                 },
                 [this](const DisconnectAllLinks&) {
-                    for (GlobalRank i{0}; i < max_world_size_; ++i) {
+                    for (int i = 0; i < max_world_size_; ++i) {
                         if (i != rank_) {
                             link_manager_.disconnect(i);
                         }
                     }
                 },
                 [this](const ClearAllPeerMetadata&) {
-                    for (GlobalRank i{0}; i < max_world_size_; ++i) {
+                    for (int i = 0; i < max_world_size_; ++i) {
                         if (i != rank_) {
                             link_manager_.publishLinkDown(i);
                         }
@@ -693,9 +704,8 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                     // Translate to InGroupRank per-backend via rank_order.
                     for (auto& [group_id, backend] : backends_) {
                         auto view = agent_.getGroupView(group_id);
-                        for (InGroupRank lr = 0;
-                             lr < static_cast<InGroupRank>(
-                                      view.rank_order.size());
+                        for (int lr = 0;
+                             lr < static_cast<int>(view.rank_order.size());
                              ++lr) {
                             if (view.rank_order[lr] == e.peer) {
                                 backend->onPeerLinkReset(lr);

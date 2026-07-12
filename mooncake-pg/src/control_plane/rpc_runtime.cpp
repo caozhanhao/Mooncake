@@ -15,14 +15,14 @@ bool RpcServer::start() {
     if (!server_) return false;
     // Use async_start() instead of start() to avoid blocking the calling
     // thread.  start() calls async_start().get() which blocks until the
-    // server shuts down  - this deadlocks initControlPlane since neither
+    // server shuts down — this deadlocks initControlPlane since neither
     // CoordinatorHost nor AgentHost can make progress after start().
     // async_start() fires the accept loop on the server's own thread pool
     // and returns immediately.  On listen failure the future is already
     // resolved with an error code.
     auto fut = server_->async_start();
     if (fut.hasResult()) {
-        // Listen failed  - the future resolved immediately.
+        // Listen failed — the future resolved immediately.
         auto ec = std::move(fut).get();
         LOG(ERROR) << "RpcServer: failed to start: " << ec.message();
         return false;
@@ -44,13 +44,11 @@ void RpcServer::shutdown() {
     }
 }
 
-// rpc_detail::getOrCreateClientAsync
-
-namespace rpc_detail {
+// RpcClient private helpers
 
 async_simple::coro::Lazy<std::shared_ptr<coro_rpc::coro_rpc_client>>
-getOrCreateClientAsync(std::shared_ptr<RpcSharedState> state,
-                       const std::string& addr) {
+RpcClient::getOrCreateClient(std::shared_ptr<SharedState> state,
+                             const std::string& addr) {
     // Fast path: lookup under lock.
     {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -86,21 +84,19 @@ getOrCreateClientAsync(std::shared_ptr<RpcSharedState> state,
     }
 }
 
-void spawnOnExecutor(async_simple::coro::Lazy<void> task) {
+void RpcClient::spawn(async_simple::coro::Lazy<void> task) {
     auto executor = coro_io::get_global_executor();
     std::move(task).via(executor).start([](auto&&) {});
 }
 
-std::unique_ptr<coro_rpc::coro_rpc_client> createSyncClient() {
+std::unique_ptr<coro_rpc::coro_rpc_client> RpcClient::createSyncClient() {
     coro_rpc::coro_rpc_client::config config;
     config.connect_timeout_duration = std::chrono::seconds(3);
     return std::make_unique<coro_rpc::coro_rpc_client>(
         coro_io::get_global_executor(), config);
 }
 
-}  // namespace rpc_detail
-
-// RpcClient
+// RpcClient public methods
 
 bool RpcClient::isConnected(const std::string& addr) const {
     std::lock_guard<std::mutex> lock(state_->mutex);
@@ -110,13 +106,13 @@ bool RpcClient::isConnected(const std::string& addr) const {
 bool RpcClient::tryReconnect(const std::string& addr) {
     // Evict the old entry under the lock.  In-flight coroutines may still
     // hold shared_ptr copies of the old client, so it stays alive until
-    // they complete  - no use-after-free.
+    // they complete — no use-after-free.
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
         state_->clients.erase(addr);
     }
 
-    // Reconnect (sync context  - use syncAwait).
+    // Reconnect (sync context — use syncAwait).
     coro_rpc::coro_rpc_client::config config;
     config.connect_timeout_duration = std::chrono::seconds(3);
 
@@ -130,7 +126,6 @@ bool RpcClient::tryReconnect(const std::string& addr) {
         return false;
     }
 
-    // LOG(INFO) << "RpcClient: reconnected to " << addr;
     std::lock_guard<std::mutex> lock(state_->mutex);
     state_->clients[addr] = client;
     return true;

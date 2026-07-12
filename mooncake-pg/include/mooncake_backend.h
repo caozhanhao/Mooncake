@@ -261,7 +261,8 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     int getNumSyncedRanks() {
         if (!meta_ || !meta_->activeRanks) return 0;
-        return std::count(meta_->activeRanks, meta_->activeRanks + meta_->size, true);
+        return std::count(meta_->activeRanks, meta_->activeRanks + meta_->size,
+                          true);
     }
 
     void extendGroupSizeTo(int size);

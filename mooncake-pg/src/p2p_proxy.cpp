@@ -349,7 +349,7 @@ void P2PProxy::handleFailedSendOp(SendOpContext& op_ctx) {
         succeeded[peer_global] = 0;  // attempted && !failed = false
         meta_->backend->getAgent().pushTransferObservation(
             meta_->group_id, std::move(attempted), std::move(failed),
-            std::move(succeeded), false);
+            std::move(succeeded));
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P SendOp to peer "
@@ -373,7 +373,7 @@ void P2PProxy::handleFailedRecvOp(RecvOpContext& op_ctx) {
         succeeded[peer_global] = 0;  // attempted && !failed = false
         meta_->backend->getAgent().pushTransferObservation(
             meta_->group_id, std::move(attempted), std::move(failed),
-            std::move(succeeded), false);
+            std::move(succeeded));
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P RecvOp from peer "

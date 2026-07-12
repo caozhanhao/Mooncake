@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_PG_LINK_MANAGER_H
 #define MOONCAKE_PG_LINK_MANAGER_H
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -56,7 +57,7 @@ class LinkManager {
     std::string localServerName() const;
 
     // Return the local warmup recv region base address (0 if warmup is
-    // skipped, e.g. MNNVL fabric).  Published to peers via RegisterRequest
+    // skipped, e.g. MNNVL fabric).  Published to peers via RegisterAgentRequest
     // so they can RDMA-write the warmup handshake signal.
     uint64_t getWarmupRecvAddr() const;
 
@@ -148,7 +149,7 @@ class LinkManager {
             std::chrono::milliseconds(10000);
     };
 
-    std::vector<PeerLink> peers_{static_cast<size_t>(kMaxNumRanks)};
+    std::array<PeerLink, kMaxNumRanks> peers_{};
     mutable std::mutex peers_mutex_;
 
     // Worker read model (atomic, lock-free)
@@ -163,7 +164,7 @@ class LinkManager {
             target_id{};  // remote segment handle
     };
 
-    std::vector<PeerReadState> read_state_{static_cast<size_t>(kMaxNumRanks)};
+    std::array<PeerReadState, kMaxNumRanks> read_state_{};
 
     // Poller infrastructure
 

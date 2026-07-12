@@ -61,8 +61,9 @@ static std::string makeMooncakeGroupId(c10d::DistributedBackendOptions& opts) {
     const std::string sync_key =
         "mooncake_group_id_" + base + "_" + std::to_string(seq);
 
-    std::cerr << "[makeMooncakeGroupId] base=" << base << " rank=" << opts.group_rank
-              << " sync_key=" << sync_key << " pid=" << getpid() << std::endl;
+    std::cerr << "[makeMooncakeGroupId] base=" << base
+              << " rank=" << opts.group_rank << " sync_key=" << sync_key
+              << " pid=" << getpid() << std::endl;
 
     if (opts.group_rank == 0) {
         auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -75,19 +76,21 @@ static std::string makeMooncakeGroupId(c10d::DistributedBackendOptions& opts) {
                              std::to_string(getpid()) + "_" +
                              std::to_string(dis(gen));
 
-        std::cerr << "[makeMooncakeGroupId] leader setting " << sync_key << " = " << unique << std::endl;
+        std::cerr << "[makeMooncakeGroupId] leader setting " << sync_key
+                  << " = " << unique << std::endl;
         opts.store->set(sync_key, unique);
         LOG(INFO) << "[PG] assigned mooncake group_id=" << unique
                   << " base=" << base;
     }
 
-    std::cerr << "[makeMooncakeGroupId] waiting for " << sync_key << "..." << std::endl;
+    std::cerr << "[makeMooncakeGroupId] waiting for " << sync_key << "..."
+              << std::endl;
     opts.store->wait({sync_key});
     std::string unique = opts.store->get_to_str(sync_key);
-    std::cerr << "[makeMooncakeGroupId] got " << sync_key << " = " << unique << std::endl;
+    std::cerr << "[makeMooncakeGroupId] got " << sync_key << " = " << unique
+              << std::endl;
     LOG(INFO) << "[PG] resolved mooncake group_id=" << unique
-              << " base=" << base
-              << " rank=" << opts.group_rank;
+              << " base=" << base << " rank=" << opts.group_rank;
     return unique;
 }
 
@@ -1041,14 +1044,14 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
         // intentionally excluded; the Coordinator's isActivatableSet() will
         // retry if links are not yet mutually ready.
         bool healthy = ctx_.link_manager.isRankHealthy(global_rank);
-        bool member = member_bitmap_[global_rank].load(std::memory_order_acquire);
-        bool endpoint_present =
-            endpoint_present_bitmap_[global_rank].load(std::memory_order_acquire);
+        bool member =
+            member_bitmap_[global_rank].load(std::memory_order_acquire);
+        bool endpoint_present = endpoint_present_bitmap_[global_rank].load(
+            std::memory_order_acquire);
         bool ready = healthy && member && endpoint_present;
         LOG(INFO) << "[BACKEND] getPeerState rank=" << meta_->globalRank
                   << " peer=" << rank << " global_peer=" << global_rank
-                  << " healthy=" << healthy
-                  << " member=" << member
+                  << " healthy=" << healthy << " member=" << member
                   << " endpoint_present=" << endpoint_present
                   << " ready=" << ready;
         output.push_back(ready);
@@ -1069,25 +1072,23 @@ ProposeViewUpdateResponse MooncakeBackend::activateRanks(
         global_ranks.push_back(meta_->rank_order[r]);
     }
     LOG(INFO) << "[BACKEND] activateRanks rank=" << meta_->globalRank
-              << " group=" << meta_->group_id << " targets="
-              << [&global_ranks]() {
+              << " group=" << meta_->group_id
+              << " targets=" << [&global_ranks]() {
                      std::string s;
                      for (auto r : global_ranks) s += std::to_string(r) + " ";
                      return s;
                  }();
     auto resp = agent_.proposeActivate(meta_->group_id, global_ranks);
     LOG(INFO) << "[BACKEND] activateRanks rank=" << meta_->globalRank
-              << " group=" << meta_->group_id << " status="
-              << static_cast<int>(resp.status)
+              << " group=" << meta_->group_id
+              << " status=" << static_cast<int>(resp.status)
               << " new_epoch=" << resp.new_epoch << " reason=\""
-              << resp.reject_reason << "\" dropped_ranks=["
-              << [&resp]() {
-                     std::string s;
-                     for (auto r : resp.dropped_ranks)
-                         s += std::to_string(r) + " ";
-                     return s;
-                 }()
-              << "]";
+              << resp.reject_reason << "\" dropped_ranks=[" <<
+        [&resp]() {
+            std::string s;
+            for (auto r : resp.dropped_ranks) s += std::to_string(r) + " ";
+            return s;
+        }() << "]";
     if (resp.status == ViewUpdateStatus::Rejected) {
         LOG(WARNING) << "MooncakeBackend: activate_rank rejected: "
                      << resp.reject_reason;
@@ -1173,8 +1174,8 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
             // control-plane link state must not be affected by group-level
             // lifecycle operations.
             if (old_endpoint_epoch != member.endpoint->endpoint_epoch) {
-                LOG(INFO) << "[BACKEND] applyViewChange rank=" << meta_->globalRank
-                          << " group=" << meta_->group_id
+                LOG(INFO) << "[BACKEND] applyViewChange rank="
+                          << meta_->globalRank << " group=" << meta_->group_id
                           << " peer=" << global_rank
                           << " endpoint_epoch changed " << old_endpoint_epoch
                           << " -> " << member.endpoint->endpoint_epoch
@@ -1222,8 +1223,8 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
             endpoint_present != old_endpoint_present ||
             (i < max_group_size_ && (is_member || endpoint_present))) {
             LOG(INFO) << "[BACKEND] applyViewChange rank=" << meta_->globalRank
-                      << " group=" << meta_->group_id
-                      << " peer=" << i << " epoch=" << view.epoch
+                      << " group=" << meta_->group_id << " peer=" << i
+                      << " epoch=" << view.epoch
                       << " status=" << static_cast<int>(member.status)
                       << " member_changed=" << (is_member != old_member)
                       << " endpoint_present_changed="
@@ -1256,8 +1257,7 @@ void MooncakeBackend::onPeerLinkReset(InGroupRank peer) {
         p2p_proxy_->resetPeerState(peer);
     }
     if (peer >= 0 && peer < meta_->size) {
-        meta_->segmentIDs[peer] =
-            static_cast<TransferMetadata::SegmentID>(-1);
+        meta_->segmentIDs[peer] = static_cast<TransferMetadata::SegmentID>(-1);
     }
 }
 

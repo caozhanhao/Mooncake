@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_PG_AGENT_H
 #define MOONCAKE_PG_AGENT_H
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
@@ -20,13 +21,13 @@ class AgentStateMachine {
     AgentApplyResult handlePeerJoined(const PeerJoinedPush& push);
     AgentApplyResult handleRankStateUpdate(const RankStateUpdatePush& push);
     AgentApplyResult handleViewUpdate(const ViewUpdatePush& push);
-    AgentApplyResult handleLinkStateChanged(GlobalRank peer, bool connected);
+    AgentApplyResult handleLinkStateChange(GlobalRank peer, bool connected);
 
     HeartbeatRequest buildHeartbeat() const;
 
-    AgentApplyResult applyRegisterResponse(const RegisterResponse& resp);
+    AgentApplyResult applyRegisterAgentResponse(
+        const RegisterAgentResponse& resp);
     AgentApplyResult prepareCleanSlateRegister();
-    AgentApplyResult markOffline();
 
     void setAgentSessionEpoch(uint64_t epoch) {
         agent_session_epoch_.store(epoch, std::memory_order_release);
@@ -41,18 +42,16 @@ class AgentStateMachine {
 
     GroupView getGroupView(GroupId group_id) const;
 
-    enum class CoordinatorConnection { Connected, Registering, Disconnected };
+    enum class CoordinatorConnection {
+        Connected,
+        AgentRegistering,
+        Disconnected
+    };
     CoordinatorConnection getCoordinatorConnection() const {
         return coordinator_connection_;
     }
-    void setCoordinatorConnected() {
-        coordinator_connection_ = CoordinatorConnection::Connected;
-    }
-    void setCoordinatorRegistering() {
-        coordinator_connection_ = CoordinatorConnection::Registering;
-    }
-    void setCoordinatorDisconnected() {
-        coordinator_connection_ = CoordinatorConnection::Disconnected;
+    void setCoordinatorConnection(CoordinatorConnection state) {
+        coordinator_connection_ = state;
     }
 
     uint64_t getAgentSessionEpoch() const {
@@ -66,22 +65,15 @@ class AgentStateMachine {
     RankState rank_state_ = RankState::OFFLINE;
     std::atomic<uint64_t> agent_session_epoch_{0};
 
-    struct GroupEntry {
-        GroupView view;
-        bool auto_deactivate = true;
-    };
-    std::unordered_map<GroupId, GroupEntry> groups_;
+    std::unordered_map<GroupId, GroupView> groups_;
 
     // Per-GlobalRank state caches.
-    std::vector<RankState> global_rank_states_{
-        static_cast<size_t>(kMaxNumRanks)};
-    std::vector<uint8_t> link_connected_{static_cast<size_t>(kMaxNumRanks)};
-    std::vector<uint8_t> last_reported_peer_status_{
-        static_cast<size_t>(kMaxNumRanks)};
-    std::vector<uint8_t> rank_state_snapshot_{
-        static_cast<size_t>(kMaxNumRanks)};
-    std::vector<std::optional<RankConnectionMetadata>> rank_connections_{
-        static_cast<size_t>(kMaxNumRanks)};
+    std::array<RankState, kMaxNumRanks> global_rank_states_{};
+    std::array<bool, kMaxNumRanks> link_connected_{};
+    std::array<bool, kMaxNumRanks> last_reported_peer_status_{};
+    std::array<uint8_t, kMaxNumRanks> rank_state_snapshot_{};
+    std::array<std::optional<RankConnectionMetadata>, kMaxNumRanks>
+        rank_connections_{};
 
     CoordinatorConnection coordinator_connection_ =
         CoordinatorConnection::Disconnected;

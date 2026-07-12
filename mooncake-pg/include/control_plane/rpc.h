@@ -16,7 +16,7 @@ namespace mooncake {
 
 // Agent -> Coordinator RPC messages
 
-struct RegisterRequest {
+struct RegisterAgentRequest {
     GlobalRank rank = kInvalidGlobalRank;
     std::string agent_addr;
     std::string te_server_name;
@@ -25,7 +25,7 @@ struct RegisterRequest {
 };
 
 // Process-level connection metadata for a remote rank.
-// Returned in RegisterResponse so the Agent can feed LinkManager.
+// Returned in RegisterAgentResponse so the Agent can feed LinkManager.
 struct RankConnectionMetadata {
     GlobalRank rank = kInvalidGlobalRank;
     std::string agent_addr;
@@ -34,7 +34,7 @@ struct RankConnectionMetadata {
     uint64_t warmup_recv_addr = 0;
 };
 
-struct RegisterResponse {
+struct RegisterAgentResponse {
     bool success = false;
     std::string error_msg;
     std::vector<RankState> all_rank_states;
@@ -56,7 +56,6 @@ struct RegisterGroupRequest {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
     GroupView group;
-    bool auto_deactivate = true;
 };
 
 struct RegisterGroupResponse {
@@ -114,8 +113,7 @@ struct TransferObservationReport {
     GroupId group_id;
     GlobalRank reporter_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
-    uint64_t epoch = 0;          // GroupView::epoch observed by the reporter
-    bool local_success = false;  // from TransferObservationEvent
+    uint64_t epoch = 0;  // GroupView::epoch observed by the reporter
     std::vector<uint8_t> attempted_ranks;
     std::vector<uint8_t> failed_ranks_hint;
     std::vector<uint8_t> succeeded_ranks;
@@ -132,9 +130,9 @@ struct LinkStateChangeReport {
 };
 
 // Agent -> Coordinator: sync-after-failure RPC.  The caller has observed a
-// failure (local_success=false) and wants the Coordinator to make a membership
-// decision.  The request may piggyback a transfer observation if one was
-// pending locally; otherwise the observation was already sent asynchronously.
+// failure and wants the Coordinator to make a membership decision.  The request
+// may piggyback a transfer observation if one was pending locally; otherwise
+// the observation was already sent asynchronously.
 struct SyncAfterFailureRequest {
     GroupId group_id;
     GlobalRank reporter_rank = kInvalidGlobalRank;
@@ -145,16 +143,16 @@ struct SyncAfterFailureRequest {
     // was drained from the local queue and attached to this request.
     bool has_observation = false;
     uint64_t observation_epoch = 0;
-    bool local_success = false;
     std::vector<uint8_t> attempted_ranks;
     std::vector<uint8_t> failed_ranks_hint;
     std::vector<uint8_t> succeeded_ranks;
 };
 
 enum class SyncAfterFailureStatus : uint8_t {
-    kDecisionApplied = 0,  // Decision made and applied (ViewUpdate ACKed by caller)
-    kNoChange = 1,         // No pending decision, epoch matches, no window open
-    kRejected = 2,         // Invalid request (stale session, group not found, etc.)
+    kDecisionApplied =
+        0,          // Decision made and applied (ViewUpdate ACKed by caller)
+    kNoChange = 1,  // No pending decision, epoch matches, no window open
+    kRejected = 2,  // Invalid request (stale session, group not found, etc.)
 };
 
 struct SyncAfterFailureResponse {
@@ -310,8 +308,8 @@ class CoordinatorRpcService {
    public:
     virtual ~CoordinatorRpcService() = default;
 
-    virtual void registerAgent(coro_rpc::context<RegisterResponse> ctx,
-                               RegisterRequest req) = 0;
+    virtual void registerAgent(coro_rpc::context<RegisterAgentResponse> ctx,
+                               RegisterAgentRequest req) = 0;
     virtual void heartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                            HeartbeatRequest req) = 0;
     virtual void registerGroup(coro_rpc::context<RegisterGroupResponse> ctx,
@@ -324,8 +322,9 @@ class CoordinatorRpcService {
                                  PublishEndpointRequest req) = 0;
     virtual void reportLinkStateChange(LinkStateChangeReport req) = 0;
     virtual void reportTransferObservation(TransferObservationReport req) = 0;
-    virtual void syncAfterFailure(coro_rpc::context<SyncAfterFailureResponse> ctx,
-                                   SyncAfterFailureRequest req) = 0;
+    virtual void syncAfterFailure(
+        coro_rpc::context<SyncAfterFailureResponse> ctx,
+        SyncAfterFailureRequest req) = 0;
 };
 
 class AgentRpcService {

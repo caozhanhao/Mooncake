@@ -125,7 +125,7 @@ void LinkManager::shutdown() {
 
     // Tear down all peer links.
     std::lock_guard<std::mutex> lock(peers_mutex_);
-    for (GlobalRank i{0}; i < max_world_size_; ++i) {
+    for (int i = 0; i < max_world_size_; ++i) {
         if (i == rank_) continue;
         auto& link = peers_[i];
         if (link.target_id.has_value()) {
@@ -350,7 +350,7 @@ void LinkManager::pollerLoop() {
             std::lock_guard<std::mutex> lock(peers_mutex_);
             auto now = std::chrono::steady_clock::now();
 
-            for (GlobalRank peer{0}; peer < max_world_size_; ++peer) {
+            for (int peer = 0; peer < max_world_size_; ++peer) {
                 if (peer == rank_) continue;
 
                 auto& link = peers_[peer];

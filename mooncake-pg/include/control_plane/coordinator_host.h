@@ -9,11 +9,11 @@
 
 #include "coordinator.h"
 #include "rpc.h"
+#include "rpc_runtime.h"
 #include "serialized_executor.h"
 
 namespace mooncake {
 
-// Forward declarations.
 class RpcServer;
 class RpcClient;
 
@@ -27,7 +27,7 @@ class RpcClient;
 //
 //   Agent (any rank)                 CoordinatorHost (Rank 0)
 //   +-----------------+              +---------------------------+
-//   | registerAgent   |--- RPC ----->| postRegister()            |
+//   | registerAgent   |--- RPC ----->| postRegisterAgent()       |
 //   | heartbeat       |--- RPC ----->| postHeartbeat()           |
 //   | proposeViewUpd  |--- RPC ----->| postProposeViewUpdate()   |
 //   | publishEndpoint |--- RPC ----->| postPublishEndpoint()     |
@@ -59,8 +59,8 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
    public:
     explicit CoordinatorRpcServiceImpl(CoordinatorHost& host) : host_(host) {}
 
-    void registerAgent(coro_rpc::context<RegisterResponse> ctx,
-                       RegisterRequest req) override;
+    void registerAgent(coro_rpc::context<RegisterAgentResponse> ctx,
+                       RegisterAgentRequest req) override;
 
     void heartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                    HeartbeatRequest req) override;
@@ -68,20 +68,20 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
     void registerGroup(coro_rpc::context<RegisterGroupResponse> ctx,
                        RegisterGroupRequest req) override;
 
-    void proposeViewUpdate(coro_rpc::context<ProposeViewUpdateResponse> ctx,
-                           ProposeViewUpdateRequest req) override;
+    void unregisterGroup(UnregisterGroupRequest req) override;
 
     void publishEndpoint(coro_rpc::context<PublishEndpointResponse> ctx,
                          PublishEndpointRequest req) override;
+
+    void proposeViewUpdate(coro_rpc::context<ProposeViewUpdateResponse> ctx,
+                           ProposeViewUpdateRequest req) override;
 
     void reportLinkStateChange(LinkStateChangeReport req) override;
 
     void reportTransferObservation(TransferObservationReport req) override;
 
     void syncAfterFailure(coro_rpc::context<SyncAfterFailureResponse> ctx,
-                           SyncAfterFailureRequest req) override;
-
-    void unregisterGroup(UnregisterGroupRequest req) override;
+                          SyncAfterFailureRequest req) override;
 
    private:
     CoordinatorHost& host_;
@@ -99,8 +99,8 @@ class CoordinatorHost {
     void start();
     void shutdown();
 
-    void postRegister(coro_rpc::context<RegisterResponse> ctx,
-                      RegisterRequest req);
+    void postRegisterAgent(coro_rpc::context<RegisterAgentResponse> ctx,
+                           RegisterAgentRequest req);
 
     void postHeartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                        HeartbeatRequest req);
@@ -152,9 +152,18 @@ class CoordinatorHost {
         pending_sync_ctxs_;
 
     void runEffects(const std::vector<CoordinatorEffect>& effects);
-    void pushToAgent(GlobalRank rank, const RankStateUpdatePush& msg);
-    void pushToAgent(GlobalRank rank, const PeerJoinedPush& msg);
     void pushViewUpdate(const ViewUpdateEffect& effect);
+
+    template <auto Method, typename Push>
+    void pushToAgent(GlobalRank rank, const Push& msg) {
+        const auto& addr = state_machine_.getAgentAddr(rank);
+        if (addr.empty()) {
+            LOG(WARNING) << "[COORD] push target rank=" << rank
+                         << " has no agent_addr; skipping";
+            return;
+        }
+        rpc_client_->send<Method>(addr, msg);
+    }
 };
 
 }  // namespace mooncake
