@@ -227,7 +227,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         TORCH_CHECK(!tasks_[taskId].active);
 
         size_t realSize = std::min(chunkSize, tensorSize - state->currentPos);
-        int bufferOffset = meta->taskCount % 2;
+        // Derive buffer offset from chunk index within this collective,
+        // not from a cross-collective counter.  The replacement rank
+        // during recovery starts with no history, making a global counter
+        // impossible to keep in sync.
+        int bufferOffset = (state->currentPos / chunkSize) % 2;
 
         tasks_[taskId].opType = (int)opType;
         tasks_[taskId].tensorSize = realSize;
@@ -262,7 +266,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
 
         tasks_[taskId].active = true;
         ++cpuTaskCount;
-        ++meta->taskCount;
     };
 
     (*processNextChunk)();
@@ -293,7 +296,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
         size_t realSize = std::min(tensorSize, pos + chunkSize) - pos;
         int taskId = cudaTaskCount % 2 + 2;
-        int bufferOffset = meta->taskCount % 2;
+        // Derive buffer offset from chunk index within this collective.
+        int bufferOffset = (pos / chunkSize) % 2;
         const uint64_t taskSequence =
             next_cuda_task_sequence_.fetch_add(1, std::memory_order_relaxed);
         submitted_tasks.push_back(
@@ -312,7 +316,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             pos, realSize, enq_stream);
 
         ++cudaTaskCount;
-        ++meta->taskCount;
     }
 
     auto event_end = std::make_shared<torch::Event>(torch::kCUDA);

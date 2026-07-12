@@ -27,18 +27,13 @@ struct PeerReadHandle {
 // TELinkEvent  - emitted when a physical TE link transitions up/down.
 
 struct TELinkEvent {
-    enum class Kind { LinkUp, LinkDown } kind = Kind::LinkDown;
+    enum class Kind { LinkUp, LinkDown };
+    Kind kind = Kind::LinkDown;
     GlobalRank peer = kInvalidGlobalRank;
     std::optional<TransferMetadata::SegmentID> target_id;
 };
 
-// LinkManager  - process-level manager for shared TE physical links.
-// Owned by MooncakeProcessContext; one instance per process.
-//
-// Responsibilities:
-//   1. Physical link lifecycle: openSegment, warmup handshake, closeSegment
-//   2. Low-frequency candidate probe for idle/inactive peers
-//   3. Lock-free worker read model: resolvePeer() / isRankReady()
+// Process-level manager for shared TE states.
 class LinkManager {
    public:
     LinkManager() = default;
@@ -90,13 +85,8 @@ class LinkManager {
     std::optional<PeerReadHandle> resolvePeer(GlobalRank peer) const;
 
     // Check whether the peer is ready for group operations:
-    // RankState == HEALTHY && local TE link is up.
-    // Used by pg.get_peer_state().
     bool isRankReady(GlobalRank peer) const;
 
-    // Check only the Coordinator-authoritative HEALTHY state, ignoring the
-    // local TE link.  Used when callers need a guarantee about Coordinator
-    // membership rather than local link readiness.
     bool isRankHealthy(GlobalRank peer) const;
 
     // Reopen the TE segment for `peer` without publishing link-up/link-down
@@ -122,17 +112,17 @@ class LinkManager {
     // Resource state (mutex-protected)
 
     enum class PeerLinkState : uint8_t {
-        IDLE = 0,
-        WAITING_WARMUP_TRANSFER,
-        WAITING_PEER_WARMUP,
-        CONNECTED,
-        EXPIRING,
+        Idle = 0,
+        WaitingWarmupTransfer,
+        WaitingPeerWarmup,
+        Connected,
+        Expiring,
     };
 
     struct PeerLink {
-        PeerLinkState state = PeerLinkState::IDLE;
+        PeerLinkState state = PeerLinkState::Idle;
         std::string server_name;
-        bool candidate = false;
+        bool is_candidate = false;
         bool skip_warmup = false;  // MNNVL fabric  - warmup skipped
 
         std::optional<TransferMetadata::SegmentID> target_id;

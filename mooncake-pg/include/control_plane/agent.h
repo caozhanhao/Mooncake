@@ -62,7 +62,7 @@ class AgentStateMachine {
     GlobalRank rank_;
     int max_world_size_;
 
-    RankState rank_state_ = RankState::OFFLINE;
+    RankState rank_state_ = RankState::Offline;
     std::atomic<uint64_t> agent_session_epoch_{0};
 
     std::unordered_map<GroupId, GroupView> groups_;

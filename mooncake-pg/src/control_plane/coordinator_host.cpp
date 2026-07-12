@@ -119,7 +119,7 @@ void CoordinatorHost::shutdown() {
     // 4. Fail any pending sync requests.
     for (auto& [sync_id, ctx] : pending_sync_ctxs_) {
         ctx.response_msg(SyncAfterFailureResponse{
-            SyncAfterFailureStatus::kRejected, 0, "coordinator shutting down"});
+            SyncAfterFailureStatus::Rejected, 0, "coordinator shutting down"});
     }
     pending_sync_ctxs_.clear();
 }
@@ -211,14 +211,12 @@ void CoordinatorHost::postSyncAfterFailure(
 }
 
 void CoordinatorHost::postViewUpdateAck(GroupId group_id, GlobalRank rank,
-                                        uint64_t epoch, bool applied,
-                                        ViewUpdateAckRoute route) {
-    executor_.post(
-        [this, group_id, rank, epoch, applied, route = std::move(route)]() {
-            auto result = state_machine_.handleViewUpdateAck(
-                group_id, rank, epoch, applied, route);
-            runEffects(result.effects);
-        });
+                                        uint64_t epoch, bool applied) {
+    executor_.post([this, group_id, rank, epoch, applied]() {
+        auto result =
+            state_machine_.handleViewUpdateAck(group_id, rank, epoch, applied);
+        runEffects(result.effects);
+    });
 }
 
 void CoordinatorHost::runEffects(
@@ -230,7 +228,7 @@ void CoordinatorHost::runEffects(
                     if (e.target.kind == EffectTarget::Kind::BroadcastOnline) {
                         for (int i = 0; i < max_world_size_; ++i) {
                             if (state_machine_.getRankState(i) !=
-                                RankState::OFFLINE) {
+                                RankState::Offline) {
                                 pushToAgent<
                                     &AgentRpcService::onRankStateUpdate>(
                                     i, e.push);
@@ -242,7 +240,7 @@ void CoordinatorHost::runEffects(
                     }
                 },
                 [this](const ViewUpdateEffect& e) { pushViewUpdate(e); },
-                [this](const ReplyViewUpdateEffect& e) {
+                [this](const ReplyProposalEffect& e) {
                     auto it = pending_rpcs_.find(e.propose_id);
                     if (it != pending_rpcs_.end()) {
                         it->second.response_msg(e.response);
@@ -262,7 +260,7 @@ void CoordinatorHost::runEffects(
                               << " te_server_name=" << e.push.te_server_name;
                     for (int i = 0; i < max_world_size_; ++i) {
                         if (i != e.push.rank && state_machine_.getRankState(
-                                                    i) != RankState::OFFLINE) {
+                                                    i) != RankState::Offline) {
                             pushToAgent<&AgentRpcService::onPeerJoined>(i,
                                                                         e.push);
                         }
@@ -276,41 +274,23 @@ void CoordinatorHost::runEffects(
 void CoordinatorHost::pushViewUpdate(const ViewUpdateEffect& effect) {
     ViewUpdatePush push{effect.view.group_id, effect.view};
     auto group_id = effect.view.group_id;
-    auto ack_route = effect.ack_route;  // capture for ACK routing
 
     for (int32_t i = 0; i < max_world_size_; ++i) {
         const auto& member = effect.view.members[i];
-        if (member.status == GroupMemberStatus::kNone ||
-            member.status == GroupMemberStatus::kLeft) {
+        if (member.status == GroupMemberStatus::None ||
+            member.status == GroupMemberStatus::Left) {
             continue;
         }
 
         const auto& addr = state_machine_.getAgentAddr(i);
-        if (state_machine_.getRankState(i) == RankState::OFFLINE ||
+        if (state_machine_.getRankState(i) == RankState::Offline ||
             addr.empty())
             continue;
 
-        // Determine if this rank is required to ACK (for proposal 2PC).
-        bool is_required_ack = false;
-        if (!effect.required_acks.empty()) {
-            is_required_ack = std::find(effect.required_acks.begin(),
-                                        effect.required_acks.end(),
-                                        i) != effect.required_acks.end();
-        }
-
-        // Required-ACK ranks use callAsync so their replies drive 2PC;
-        // everyone else gets a fire-and-forget send — no callback overhead.
-        if (is_required_ack) {
-            rpc_client_->callAsync<&AgentRpcService::onViewUpdate>(
-                addr, push,
-                [this, group_id, ack_route, rank = i](ViewUpdateAck ack) {
-                    if (!ack.applied) return;
-                    postViewUpdateAck(group_id, rank, ack.epoch, ack.applied,
-                                      ack_route);
-                });
-        } else {
-            rpc_client_->send<&AgentRpcService::onViewUpdate>(addr, push);
-        }
+        rpc_client_->callAsync<&AgentRpcService::onViewUpdate>(
+            addr, push, [this, group_id, rank = i](ViewUpdateAck ack) {
+                postViewUpdateAck(group_id, rank, ack.epoch, ack.applied);
+            });
     }
 }
 

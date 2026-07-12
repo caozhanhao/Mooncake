@@ -229,7 +229,7 @@ class AgentHost : public AgentInterface {
 
     ProposeViewUpdateResponse proposeViewUpdateInternal(
         GroupId group_id, const std::vector<GlobalRank>& ranks,
-        bool is_activate);
+        bool is_activation);
 
     void runEffects(const AgentApplyResult& effects);
     template <typename F>

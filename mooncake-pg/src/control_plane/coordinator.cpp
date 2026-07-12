@@ -7,6 +7,8 @@
 
 #include <glog/logging.h>
 
+#include "pg_utils.h"
+
 namespace mooncake {
 
 // Constructor
@@ -36,7 +38,7 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     CoordinatorApplyResult<RegisterAgentResponse> result;
     if (!rankInRange(req.rank)) {
         result.response.success = false;
-        result.response.error_msg = "rank out of valid range";
+        result.response.reject_reason = "rank out of valid range";
         return result;
     }
     auto& info = ranks_[req.rank];
@@ -50,9 +52,9 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     bool same_peer = (info.agent_addr == req.agent_addr &&
                       info.te_server_name == req.te_server_name);
 
-    if (info.state == RankState::HEALTHY && !same_peer) {
+    if (info.state == RankState::Healthy && !same_peer) {
         result.response.success = false;
-        result.response.error_msg =
+        result.response.reject_reason =
             "rank already registered and is HEALTHY; replacement must wait "
             "for the old process to leave the healthy set.";
         return result;
@@ -62,11 +64,9 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
               << " addr=" << req.agent_addr
               << " session=" << req.agent_session_epoch;
 
-    // A new session makes old endpoints invalid.  Clear any endpoint that
-    // belongs to a previous session so that GroupMember::endpoint being set is
-    // authoritative for "endpoint present and fresh for the current session".
+    // A new session makes old endpoints invalid
     bool session_changed =
-        (info.state != RankState::OFFLINE &&
+        (info.state != RankState::Offline &&
          info.agent_session_epoch != req.agent_session_epoch);
 
     info.agent_addr = req.agent_addr;
@@ -96,7 +96,7 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
         PeerJoinedPush{req.rank, info.te_server_name, info.warmup_recv_addr}});
 
     // Transition to SYNCED.
-    info.state = RankState::SYNCED;
+    info.state = RankState::Synced;
     result.effects.push_back(makeRankStateEffect(req.rank));
 
     // Build response.
@@ -111,7 +111,7 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     }
     for (int32_t i = 0; i < max_world_size_; ++i) {
         if (i == req.rank) continue;
-        if (ranks_[i].state == RankState::OFFLINE) continue;
+        if (ranks_[i].state == RankState::Offline) continue;
         RankConnectionMetadata conn;
         conn.rank = i;
         conn.agent_addr = ranks_[i].agent_addr;
@@ -129,27 +129,12 @@ CoordinatorApplyResult<HeartbeatResponse>
 CentralizedCoordinatorStateMachine::handleHeartbeat(
     const HeartbeatRequest& req) {
     CoordinatorApplyResult<HeartbeatResponse> result;
-    if (!rankInRange(req.rank)) {
+    if (!hasValidSession(req.rank, req.agent_session_epoch)) {
         result.response.acknowledge = false;
         result.response.require_reregister = true;
-        LOG(INFO) << "[COORD] heartbeat rank=" << req.rank
-                  << " rejected: rank out of range";
         return result;
     }
     auto& info = ranks_[req.rank];
-
-    if (info.state == RankState::OFFLINE ||
-        info.agent_session_epoch != req.agent_session_epoch) {
-        result.response.acknowledge = false;
-        result.response.require_reregister = true;
-        LOG(INFO) << "[COORD] heartbeat rank=" << req.rank
-                  << " rejected: stale session (state="
-                  << static_cast<int>(info.state)
-                  << " session=" << info.agent_session_epoch
-                  << " req_session=" << req.agent_session_epoch << ")";
-        return result;
-    }
-
     info.last_heartbeat = std::chrono::steady_clock::now();
 
     result.response.acknowledge = true;
@@ -157,29 +142,13 @@ CentralizedCoordinatorStateMachine::handleHeartbeat(
     return result;
 }
 
-// registerGroup
-
 CoordinatorApplyResult<RegisterGroupResponse>
 CentralizedCoordinatorStateMachine::handleRegisterGroup(
     const RegisterGroupRequest& req) {
     CoordinatorApplyResult<RegisterGroupResponse> result;
-    if (!rankInRange(req.rank)) {
+    if (!hasValidSession(req.rank, req.agent_session_epoch)) {
         result.response.success = false;
-        result.response.reject_reason = "rank out of valid range";
-        return result;
-    }
-    auto& info = ranks_[req.rank];
-
-    if (info.state == RankState::OFFLINE ||
-        info.agent_session_epoch != req.agent_session_epoch) {
-        result.response.success = false;
-        result.response.reject_reason = "stale agent session epoch";
-        LOG(INFO) << "[COORD] registerGroup rank=" << req.rank
-                  << " group=" << req.group.group_id
-                  << " rejected: stale session (state="
-                  << static_cast<int>(info.state)
-                  << " session=" << info.agent_session_epoch
-                  << " req_session=" << req.agent_session_epoch << ")";
+        result.response.reject_reason = "rank out of range or stale session";
         return result;
     }
 
@@ -192,16 +161,11 @@ CentralizedCoordinatorStateMachine::handleRegisterGroup(
     return result;
 }
 
-// handleUnregisterGroup - explicit, fire-and-forget group departure.
-
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleUnregisterGroup(
     const UnregisterGroupRequest& req) {
     CoordinatorApplyResult<void> result;
-    if (!rankInRange(req.rank)) {
-        LOG(INFO) << "[COORD] unregisterGroup rank=" << req.rank
-                  << " group=" << req.group_id
-                  << " rejected: rank out of range";
+    if (!hasValidSession(req.rank, req.agent_session_epoch)) {
         return result;
     }
 
@@ -209,14 +173,6 @@ CentralizedCoordinatorStateMachine::handleUnregisterGroup(
     if (it == group_views_.end()) {
         LOG(INFO) << "[COORD] unregisterGroup rank=" << req.rank
                   << " group=" << req.group_id << " rejected: group not found";
-        return result;
-    }
-
-    // Reject stale session epochs (e.g. the Agent re-registered after a
-    // disconnect and this is a delayed unregister from the old session).
-    if (ranks_[req.rank].agent_session_epoch != req.agent_session_epoch) {
-        LOG(INFO) << "[COORD] unregisterGroup rank=" << req.rank
-                  << " group=" << req.group_id << " rejected: stale session";
         return result;
     }
 
@@ -232,13 +188,17 @@ CentralizedCoordinatorStateMachine::handleUnregisterGroup(
               << " group=" << req.group_id
               << " old_status=" << static_cast<int>(member.status);
 
-    member.status = GroupMemberStatus::kLeft;
+    member.status = GroupMemberStatus::Left;
     member.agent_session_epoch = std::nullopt;
     member.endpoint = std::nullopt;
     view.epoch++;
+    rejectPendingSyncs(req.group_id, req.rank, "rank left the group",
+                       result.effects);
 
-    flushPendingSyncs(req.group_id, result.effects);
-
+    // Don't push a ViewUpdate when other members remain. The departing
+    // rank's unregister races with in-flight collectives on survivors:
+    // a ViewUpdate that changes activeRanks mid-collective may corrupt
+    // the result.
     if (canEraseGroup(view)) {
         eraseGroup(req.group_id, result.effects);
     }
@@ -253,7 +213,7 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     CoordinatorApplyResult<void> result;
     auto it = group_views_.find(req.group_id);
     if (it == group_views_.end()) {
-        result.effects.push_back(ReplyViewUpdateEffect{
+        result.effects.push_back(ReplyProposalEffect{
             propose_id,
             {ViewUpdateStatus::Rejected, 0, {}, "group not found"}});
         return result;
@@ -264,10 +224,8 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     bool changed = false;
 
     // Reject stale or offline proposer.
-    if (ranks_[req.source_rank].state == RankState::OFFLINE ||
-        ranks_[req.source_rank].agent_session_epoch !=
-            req.agent_session_epoch) {
-        result.effects.push_back(ReplyViewUpdateEffect{
+    if (!hasValidSession(req.source_rank, req.agent_session_epoch)) {
+        result.effects.push_back(ReplyProposalEffect{
             propose_id,
             {ViewUpdateStatus::Rejected,
              view.epoch,
@@ -276,43 +234,21 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
         return result;
     }
 
-    // Validate all targets are within valid GlobalRank range.
     for (GlobalRank rank : req.requested_ranks) {
         if (!rankInRange(rank)) {
             result.effects.push_back(
-                ReplyViewUpdateEffect{propose_id,
-                                      {ViewUpdateStatus::Rejected,
-                                       view.epoch,
-                                       {},
-                                       "target rank is out of valid range"}});
+                ReplyProposalEffect{propose_id,
+                                    {ViewUpdateStatus::Rejected,
+                                     view.epoch,
+                                     {},
+                                     "target rank is out of valid range"}});
             return result;
         }
     }
 
-    if (req.is_activate) {
-        // group_views_ is populated synchronously with group_views_ in
-        // registerGroup; both should always exist together.
-        auto desc_it = group_views_.find(req.group_id);
-        if (desc_it == group_views_.end()) {
-            result.effects.push_back(ReplyViewUpdateEffect{
-                propose_id,
-                {ViewUpdateStatus::Rejected,
-                 view.epoch,
-                 {},
-                 "group descriptor not found (internal error)"}});
-            return result;
-        }
-        auto& rank_order = desc_it->second.rank_order;
-
-        // Append new ranks to rank_order.
-        for (GlobalRank rank : req.requested_ranks) {
-            if (std::find(rank_order.begin(), rank_order.end(), rank) ==
-                rank_order.end()) {
-                rank_order.push_back(rank);
-            }
-        }
-
+    if (req.is_activation) {
         // Check activatable before applying changes.
+        // rank_order is managed exclusively in processGroupRegistration.
         for (GlobalRank rank : req.requested_ranks) {
             if (!view.members[rank].isActive()) changed = true;
         }
@@ -330,64 +266,51 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
         if (changed &&
             !isActivatableSet(req.group_id, req.requested_ranks, view)) {
             result.effects.push_back(
-                ReplyViewUpdateEffect{propose_id,
-                                      {ViewUpdateStatus::Rejected,
-                                       view.epoch,
-                                       {},
-                                       "new active set is not activatable"}});
+                ReplyProposalEffect{propose_id,
+                                    {ViewUpdateStatus::Rejected,
+                                     view.epoch,
+                                     {},
+                                     "new active set is not activatable"}});
             return result;
         }
 
         // Apply.
         for (GlobalRank rank : req.requested_ranks) {
-            view.members[rank].status = GroupMemberStatus::kActive;
+            view.members[rank].status = GroupMemberStatus::Active;
         }
     } else {
         // deactivate
         for (GlobalRank rank : req.requested_ranks) {
             if (view.members[rank].isActive()) {
-                view.members[rank].status = GroupMemberStatus::kInactive;
+                view.members[rank].status = GroupMemberStatus::Inactive;
                 view.members[rank].agent_session_epoch = std::nullopt;
                 view.members[rank].endpoint = std::nullopt;
                 changed = true;
             }
         }
-        // rank_order is NOT changed on deactivate.
     }
 
     if (!changed) {
-        result.effects.push_back(ReplyViewUpdateEffect{
+        result.effects.push_back(ReplyProposalEffect{
             propose_id, {ViewUpdateStatus::Applied, view.epoch, {}, ""}});
         return result;
     }
 
     view.epoch++;
 
-    // Resolve any pending syncAfterFailure callers whose view is now stale.
-    flushPendingSyncs(req.group_id, result.effects);
-
     auto required_acks =
-        computeRequiredViewAcks(old_view, view, req.source_rank);
+        computeBarrierAckSet(old_view, view, req.group_id);
 
-    if (required_acks.empty()) {
-        // Best-effort: broadcast + reply immediately.
-        result.effects.push_back(
-            ViewUpdateEffect{view, {}, ProposalAckRoute{propose_id}});
-        result.effects.push_back(ReplyViewUpdateEffect{
-            propose_id, {ViewUpdateStatus::Applied, view.epoch, {}, ""}});
-    } else {
-        // Strict Barrier: store pending, let Host broadcast, wait for ACKs.
-        pending_proposal_acks_[propose_id] = PendingProposal{
-            propose_id,
-            req.group_id,
-            {ViewUpdateStatus::Applied, view.epoch, {}, ""},
-            std::unordered_set<GlobalRank>(required_acks.begin(),
-                                           required_acks.end()),
-            std::chrono::steady_clock::now() + kProposeTimeout,
-        };
-        result.effects.push_back(ViewUpdateEffect{
-            view, required_acks, ProposalAckRoute{propose_id}});
-    }
+    // required_acks always includes the proposer (online + active in old
+    // view), so the set is never empty in normal operation.
+    pending_barriers_[req.group_id][view.epoch] = PendingViewUpdateBarrier{
+        req.group_id, view.epoch,
+        std::unordered_set<GlobalRank>(required_acks.begin(),
+                                       required_acks.end()),
+        std::chrono::steady_clock::now() + kProposeTimeout,
+        PendingViewUpdateBarrier::ProposalCommit{
+            propose_id, {ViewUpdateStatus::Applied, view.epoch, {}, ""}}};
+    result.effects.push_back(ViewUpdateEffect{view});
 
     return result;
 }
@@ -398,17 +321,9 @@ CoordinatorApplyResult<PublishEndpointResponse>
 CentralizedCoordinatorStateMachine::handlePublishEndpoint(
     const PublishEndpointRequest& req) {
     CoordinatorApplyResult<PublishEndpointResponse> result;
-    if (!rankInRange(req.rank)) {
+    if (!hasValidSession(req.rank, req.agent_session_epoch)) {
         result.response.success = false;
-        result.response.reject_reason = "rank out of valid range";
-        return result;
-    }
-    auto& info = ranks_[req.rank];
-
-    if (info.state == RankState::OFFLINE ||
-        info.agent_session_epoch != req.agent_session_epoch) {
-        result.response.success = false;
-        result.response.reject_reason = "stale agent session epoch";
+        result.response.reject_reason = "rank out of range or stale session";
         return result;
     }
 
@@ -436,13 +351,8 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
                   << " group_status=" << static_cast<int>(view.status);
 
         if (member.isMember() && view.status == GroupStatus::Ready) {
-            // Group already activated -> push best-effort view update so that
-            // all members (including existing survivors) see the new endpoint
-            // for a replacement/extension rank before it is activated.
             view.epoch++;
-            result.effects.push_back(
-                ViewUpdateEffect{view, {}, GeneralAckRoute{}});
-            flushPendingSyncs(ep.group_id, result.effects);
+            result.effects.push_back(ViewUpdateEffect{view});
             LOG(INFO) << "[COORD] handlePublishEndpoint pushed view update"
                       << " group=" << ep.group_id << " epoch=" << view.epoch;
         }
@@ -455,10 +365,9 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
 
 // transferObservation  - update link_status from data-plane evidence
 //
-// The link_status is updated immediately so subsequent reports and link-state
-// events see the latest connectivity snapshot.  However, the coordinator does
-// NOT recompute the authoritative healthy set here.  Instead it opens (or
-// extends) a fault_reconciliation_window; the membership decision is deferred
+// The link_status is updated immediately. However, the coordinator does
+// NOT recompute the authoritative healthy set here.  Instead it opens a
+//  fault_reconciliation_window; the membership decision is deferred
 // until the window closes.  This gives multiple survivors time to report the
 // same failure and prevents a single fast reporter from causing a premature
 // auto-deactivation that hides the failure from slower survivors.
@@ -467,15 +376,13 @@ CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleTransferObservation(
     const TransferObservationReport& req) {
     CoordinatorApplyResult<void> result;
-    if (!rankInRange(req.reporter_rank)) return result;
+    if (!hasValidSession(req.reporter_rank, req.agent_session_epoch)) {
+        return result;
+    }
     auto& reporter = ranks_[req.reporter_rank];
 
-    if (reporter.agent_session_epoch != req.agent_session_epoch) {
-        return result;  // stale reporter
-    }
-
     // Determine authoritative epoch for the reported group.  Reports for
-    // unknown groups or from an already-sealed view are dropped.
+    // unknown groups or from an already-reconciled view are dropped.
     auto view_it = group_views_.find(req.group_id);
     if (view_it == group_views_.end()) return result;
     uint64_t current_epoch = view_it->second.epoch;
@@ -488,54 +395,57 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
         return result;
     }
 
-    // Open or extend the fault reconciliation window.  The actual membership
-    // decision is deferred until checkTimeouts() closes the window.  A single
-    // global deadline batches all groups that observe the same physical fault,
-    // but each group records its own entry epoch so that multi-group scenarios
-    // do not suffer from epoch skew.
+    // 1. Apply observation to link_status.  Returns true if any peer failed.
+    bool has_negative = applyLinkStatusUpdate(reporter, req.attempted_ranks,
+                                             req.succeeded_ranks,
+                                             req.failed_ranks_hint);
+
+    // 2. Only open the fault reconciliation window when at least one peer
+    //    was reported as failed.  Positive-only (link-up) observations do
+    //    not indicate a fault and should not trigger auto-deactivation.
+    if (!has_negative) return result;
+
+    openReconciliationWindow(req.group_id, req.epoch);
+    return result;
+}
+
+void CentralizedCoordinatorStateMachine::openReconciliationWindow(
+    GroupId group_id, uint64_t report_epoch) {
     if (!reconciliation_ctx_.active) {
         reconciliation_ctx_.active = true;
         reconciliation_ctx_.deadline =
             std::chrono::steady_clock::now() + fault_reconciliation_window_;
         reconciliation_ctx_.groups_in_window.clear();
     }
-
-    // Record the group and the epoch at which it entered the window.  A group's
-    // authoritative epoch must remain constant for the lifetime of the window.
-    // If a concurrent manual proposal advances the epoch while the window is
-    // still open, we adopt the newer epoch so the window can still seal the
-    // current authoritative view.  Reports older than the recorded entry epoch
-    // are dropped as they belong to a view that has already been superseded.
-    auto it = reconciliation_ctx_.groups_in_window.find(req.group_id);
+    auto it = reconciliation_ctx_.groups_in_window.find(group_id);
     if (it == reconciliation_ctx_.groups_in_window.end()) {
-        reconciliation_ctx_.groups_in_window[req.group_id] = req.epoch;
-    } else if (req.epoch > it->second) {
-        LOG(INFO) << "[COORD] handleTransferObservation adopted newer epoch"
-                  << " group=" << req.group_id
+        reconciliation_ctx_.groups_in_window[group_id] = report_epoch;
+    } else if (report_epoch > it->second) {
+        LOG(INFO) << "[COORD] openReconciliationWindow adopted newer epoch"
+                  << " group=" << group_id
                   << " old_window_epoch=" << it->second
-                  << " new_window_epoch=" << req.epoch;
-        it->second = req.epoch;
-    } else if (req.epoch < it->second) {
-        LOG(INFO) << "[COORD] handleTransferObservation dropped obsolete report"
-                  << " reporter=" << req.reporter_rank
-                  << " group=" << req.group_id << " report_epoch=" << req.epoch
-                  << " window_epoch=" << it->second;
-        return result;
+                  << " new_window_epoch=" << report_epoch;
+        it->second = report_epoch;
     }
+    // report_epoch < it->second: stale, silently ignored.
+}
 
-    if (reporter.link_status.size() != static_cast<size_t>(max_world_size_)) {
-        reporter.link_status.resize(max_world_size_, 0);
-    }
-
+bool CentralizedCoordinatorStateMachine::applyLinkStatusUpdate(
+    RankInfo& reporter, const std::vector<uint8_t>& attempted,
+    const std::vector<uint8_t>& succeeded,
+    const std::vector<uint8_t>& failed) {
+    bool has_negative = false;
     for (int32_t peer = 0; peer < max_world_size_; ++peer) {
-        if (!req.attempted_ranks[peer]) continue;
-        if (req.succeeded_ranks[peer]) reporter.link_status[peer] = 1;
-        if (req.failed_ranks_hint[peer]) {
+        if (peer >= static_cast<int32_t>(attempted.size()) || !attempted[peer])
+            continue;
+        if (peer < static_cast<int32_t>(succeeded.size()) && succeeded[peer])
+            reporter.link_status[peer] = 1;
+        if (peer < static_cast<int32_t>(failed.size()) && failed[peer]) {
             reporter.link_status[peer] = 0;
+            has_negative = true;
         }
     }
-
-    return result;
+    return has_negative;
 }
 
 // handleLinkStateChange - per-peer link state change from LinkManager events
@@ -544,16 +454,10 @@ CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleLinkStateChange(
     const LinkStateChangeReport& req) {
     CoordinatorApplyResult<void> result;
-    if (!rankInRange(req.reporter_rank)) return result;
+    if (!hasValidSession(req.reporter_rank, req.agent_session_epoch))
+        return result;
     if (!rankInRange(req.peer)) return result;
     auto& reporter = ranks_[req.reporter_rank];
-
-    if (reporter.agent_session_epoch != req.agent_session_epoch)
-        return result;  // stale reporter
-
-    if (reporter.link_status.size() != static_cast<size_t>(max_world_size_)) {
-        reporter.link_status.resize(max_world_size_, 0);
-    }
 
     reporter.link_status[req.peer] = req.is_up ? 1 : 0;
     reporter.link_status[req.reporter_rank] = 1;  // self is always connected
@@ -573,115 +477,62 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
     uint64_t sync_id, const SyncAfterFailureRequest& req) {
     CoordinatorApplyResult<void> result;
 
-    // 1. Validate.
-    if (!rankInRange(req.reporter_rank)) {
-        result.effects.push_back(ReplySyncEffect{
-            sync_id,
-            {SyncAfterFailureStatus::kRejected, 0, "rank out of range"}});
+    if (!hasValidSession(req.reporter_rank, req.agent_session_epoch)) {
+        result.effects.push_back(
+            ReplySyncEffect{sync_id,
+                            {SyncAfterFailureStatus::Rejected, 0,
+                             "rank out of range or stale session"}});
         return result;
     }
     auto& reporter = ranks_[req.reporter_rank];
-    if (reporter.state == RankState::OFFLINE ||
-        reporter.agent_session_epoch != req.agent_session_epoch) {
-        result.effects.push_back(ReplySyncEffect{
-            sync_id,
-            {SyncAfterFailureStatus::kRejected, 0, "stale session epoch"}});
-        return result;
-    }
 
     auto view_it = group_views_.find(req.group_id);
     if (view_it == group_views_.end()) {
         result.effects.push_back(ReplySyncEffect{
             sync_id,
-            {SyncAfterFailureStatus::kRejected, 0, "group not found"}});
+            {SyncAfterFailureStatus::Rejected, 0, "group not found"}});
         return result;
     }
 
-    // 2. Apply piggybacked observation inline.
+    // Apply piggybacked observation inline.
     if (req.has_observation) {
-        if (reporter.link_status.size() !=
-            static_cast<size_t>(max_world_size_)) {
-            reporter.link_status.resize(max_world_size_, 0);
-        }
-        for (int32_t peer = 0; peer < max_world_size_; ++peer) {
-            if (!req.attempted_ranks[peer]) continue;
-            if (req.succeeded_ranks[peer]) reporter.link_status[peer] = 1;
-            if (req.failed_ranks_hint[peer]) {
-                reporter.link_status[peer] = 0;
-                if (rankInRange(peer) &&
-                    ranks_[peer].state != RankState::OFFLINE) {
-                    ranks_[peer].link_status.assign(max_world_size_, 0);
-                    ranks_[peer].link_status[peer] = 1;
-                }
-            }
-        }
+        bool has_negative = applyLinkStatusUpdate(
+            reporter, req.attempted_ranks, req.succeeded_ranks,
+            req.failed_ranks_hint);
 
-        if (!reconciliation_ctx_.active) {
-            reconciliation_ctx_.active = true;
-            reconciliation_ctx_.deadline =
-                std::chrono::steady_clock::now() + fault_reconciliation_window_;
-            reconciliation_ctx_.groups_in_window.clear();
-        }
-        auto win_it = reconciliation_ctx_.groups_in_window.find(req.group_id);
-        if (win_it == reconciliation_ctx_.groups_in_window.end()) {
-            reconciliation_ctx_.groups_in_window[req.group_id] =
-                req.observation_epoch;
-        } else if (req.observation_epoch > win_it->second) {
-            win_it->second = req.observation_epoch;
+        if (has_negative) {
+            openReconciliationWindow(req.group_id, req.observation_epoch);
         }
     }
 
-    // Re-fetch after possible state changes.
-    view_it = group_views_.find(req.group_id);
-    if (view_it == group_views_.end()) {
-        result.effects.push_back(ReplySyncEffect{
-            sync_id,
-            {SyncAfterFailureStatus::kRejected, 0, "group not found"}});
-        return result;
-    }
     uint64_t current_epoch = view_it->second.epoch;
-
-    // 3. Epoch guard.
-    if (req.current_epoch > current_epoch) {
-        result.effects.push_back(
-            ReplySyncEffect{sync_id,
-                            {SyncAfterFailureStatus::kRejected, 0,
-                             "epoch ahead of coordinator"}});
-        return result;
-    }
-
     if (req.current_epoch < current_epoch) {
-        auto group_it = pending_syncs_.find(req.group_id);
-        if (group_it != pending_syncs_.end()) {
-            auto rank_it = group_it->second.find(req.reporter_rank);
-            if (rank_it != group_it->second.end()) {
-                rank_it->second.push_back(sync_id);
-                return result;  // defer — no ReplySyncEffect
-            }
-        }
-        result.effects.push_back(ReplySyncEffect{
-            sync_id, buildSyncAfterFailureResponse(req.group_id)});
+        // Caller is behind the coordinator.  Defer the reply until the caller
+        // ACKs the current ViewUpdate, so get_peer_state() reflects the
+        // decision before sync_after_failure() returns.
+        pending_syncs_[req.group_id][req.reporter_rank].push_back(sync_id);
+        result.effects.push_back(ViewUpdateEffect{view_it->second});
         return result;
     }
 
-    // 4. req.current_epoch == current_epoch.
     if (reconciliation_ctx_.active &&
         reconciliation_ctx_.groups_in_window.count(req.group_id)) {
         pending_syncs_[req.group_id][req.reporter_rank].push_back(sync_id);
         return result;
     }
 
-    // 5. No window, epoch matches → no pending decision.
+    // No window, epoch matches -> no pending decision.
     result.effects.push_back(ReplySyncEffect{
-        sync_id, {SyncAfterFailureStatus::kNoChange, current_epoch, ""}});
+        sync_id, {SyncAfterFailureStatus::NoChange, current_epoch, ""}});
     return result;
 }
 
 // handleViewUpdateAck - unified ACK handler for all ViewUpdate pushes.
 CoordinatorApplyResult<void>
-CentralizedCoordinatorStateMachine::handleViewUpdateAck(
-    GroupId group_id, GlobalRank rank, uint64_t epoch, bool applied,
-    const ViewUpdateAckRoute& route) {
+CentralizedCoordinatorStateMachine::handleViewUpdateAck(GroupId group_id,
+                                                        GlobalRank rank,
+                                                        uint64_t epoch,
+                                                        bool applied) {
     CoordinatorApplyResult<void> result;
 
     if (!applied) return result;
@@ -690,33 +541,15 @@ CentralizedCoordinatorStateMachine::handleViewUpdateAck(
     if (view_it == group_views_.end()) return result;
     if (epoch != view_it->second.epoch) return result;  // stale ACK
 
-    // 1. Proposal 2PC — carry the propose_id to resolve the right proposal.
-    if (auto* p = std::get_if<ProposalAckRoute>(&route)) {
-        auto it = pending_proposal_acks_.find(p->propose_id);
-        if (it != pending_proposal_acks_.end()) {
-            it->second.waiting_acks.erase(rank);
-            if (it->second.waiting_acks.empty()) {
-                result.effects.push_back(ReplyViewUpdateEffect{
-                    p->propose_id, it->second.eventual_response});
-                pending_proposal_acks_.erase(it);
-            }
-        }
-    }
-
-    // 2. Bootstrap 2PC — only during BootstrapSyncing.
-    auto ack_it = pending_bootstrap_acks_.find(group_id);
-    if (ack_it != pending_bootstrap_acks_.end()) {
-        ack_it->second.erase(rank);
-        checkGroupTransitions(result.effects);
-    }
-
-    // 3. Sync-after-failure callers waiting on this ACK.
+    // 1. Resolve sync-after-failure callers waiting on this ACK.
     {
         auto it = pending_syncs_.find(group_id);
         if (it != pending_syncs_.end()) {
             auto rank_it = it->second.find(rank);
             if (rank_it != it->second.end()) {
-                auto resp = buildSyncAfterFailureResponse(group_id);
+                SyncAfterFailureResponse resp;
+                resp.status = SyncAfterFailureStatus::DecisionApplied;
+                resp.new_epoch = view_it->second.epoch;
                 for (uint64_t sync_id : rank_it->second) {
                     result.effects.push_back(ReplySyncEffect{sync_id, resp});
                 }
@@ -728,11 +561,23 @@ CentralizedCoordinatorStateMachine::handleViewUpdateAck(
         }
     }
 
+    // 2. Decrement any pending ViewUpdate barrier matching this epoch.
+    auto group_it = pending_barriers_.find(group_id);
+    if (group_it != pending_barriers_.end()) {
+        auto epoch_it = group_it->second.find(epoch);
+        if (epoch_it != group_it->second.end()) {
+            auto& barrier = epoch_it->second;
+            barrier.waiting_acks.erase(rank);
+            if (barrier.waiting_acks.empty()) {
+                commitBarrier(std::move(barrier), {}, result.effects);
+                group_it->second.erase(epoch_it);
+            }
+        }
+    }
+
     return result;
 }
 
-// checkTimeouts — heartbeat timeout + proposal ACK timeout + fault
-// reconciliation window.
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::checkTimeouts() {
     CoordinatorApplyResult<void> result;
@@ -741,69 +586,59 @@ CentralizedCoordinatorStateMachine::checkTimeouts() {
     // Heartbeat timeout
     for (int rank = 0; rank < max_world_size_; ++rank) {
         auto& info = ranks_[rank];
-        if (info.state == RankState::OFFLINE) continue;
+        if (info.state == RankState::Offline) continue;
         if (now - info.last_heartbeat > kHeartbeatTimeout) {
             transitionToOffline(rank, result.effects);
         }
     }
 
-    // Propose ACK timeout (Strict Barrier & Prune)
-    for (auto it = pending_proposal_acks_.begin();
-         it != pending_proposal_acks_.end();) {
-        if (now > it->second.deadline) {
-            auto& pending = it->second;
-            pending.eventual_response.status =
-                ViewUpdateStatus::AppliedWithDroppedRanks;
-            for (GlobalRank rank : pending.waiting_acks) {
-                transitionToOffline(rank, result.effects);
-                pending.eventual_response.dropped_ranks.push_back(rank);
+    // Pending ViewUpdate barrier timeouts
+    for (auto& [group_id, inner] : pending_barriers_) {
+        for (auto it = inner.begin(); it != inner.end();) {
+            auto& barrier = it->second;
+            if (!barrier.deadline.has_value() || now <= *barrier.deadline) {
+                ++it;
+                continue;
             }
-            result.effects.push_back(ReplyViewUpdateEffect{
-                pending.propose_id, pending.eventual_response});
-            it = pending_proposal_acks_.erase(it);
-        } else {
-            ++it;
+            // Deadline passed: remaining waiting ranks are treated as dropped.
+            std::vector<GlobalRank> dropped(barrier.waiting_acks.begin(),
+                                            barrier.waiting_acks.end());
+            commitBarrier(std::move(barrier), dropped, result.effects);
+            it = inner.erase(it);
         }
     }
 
     // Fault reconciliation window.
     if (reconciliation_ctx_.active && now >= reconciliation_ctx_.deadline) {
         reconciliation_ctx_.active = false;
-        auto groups_to_seal = std::move(reconciliation_ctx_.groups_in_window);
+        auto groups_to_reconcile = std::move(reconciliation_ctx_.groups_in_window);
         reconciliation_ctx_.groups_in_window.clear();
 
         updateRankStates(result.effects);
         applyAutoDeactivate(result.effects);
 
-        for (const auto& [group_id, entry_epoch] : groups_to_seal) {
+        for (const auto& [group_id, entry_epoch] : groups_to_reconcile) {
             auto it = group_views_.find(group_id);
             if (it == group_views_.end()) {
-                flushPendingSyncs(group_id, result.effects);
+                // Group was destroyed while the window was open.
+                rejectPendingSyncs(group_id, "group was destroyed",
+                                   result.effects);
                 continue;
             }
             GroupView& view = it->second;
 
             if (view.epoch != entry_epoch) {
-                flushPendingSyncs(group_id, result.effects);
+                // A newer decision has already advanced the epoch; pending
+                // syncs will be resolved when those newer ViewUpdates are
+                // ACKed.
                 continue;
             }
 
             view.epoch++;
 
-            auto sync_it = pending_syncs_.find(group_id);
-            if (sync_it != pending_syncs_.end()) {
-                std::vector<GlobalRank> ack_ranks;
-                for (const auto& [rank, ids] : sync_it->second) {
-                    ack_ranks.push_back(rank);
-                }
-                result.effects.push_back(
-                    ViewUpdateEffect{view, ack_ranks, GeneralAckRoute{}});
-            } else {
-                result.effects.push_back(
-                    ViewUpdateEffect{view, {}, GeneralAckRoute{}});
-            }
+            result.effects.push_back(ViewUpdateEffect{view});
 
-            LOG(INFO) << "[COORD] sealed group=" << group_id
+            LOG(INFO) << "[COORD] reconciled group=" << group_id
                       << " epoch=" << view.epoch;
         }
 
@@ -819,7 +654,7 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
     GlobalRank rank, std::vector<CoordinatorEffect>& effects) {
     LOG(INFO) << "[COORD] transitionToOffline rank=" << rank
               << " state=" << static_cast<int>(ranks_[rank].state);
-    ranks_[rank].state = RankState::OFFLINE;
+    ranks_[rank].state = RankState::Offline;
     ranks_[rank].link_status.assign(max_world_size_, 0);
 
     // Clear this rank's connectivity from all peers.
@@ -828,28 +663,18 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
             peer.link_status[rank] = 0;
     }
 
-    // Mark the failed rank as inactive in every group it still belongs to.
-    // For auto_deactivate=off groups, skip — the application controls
-    // membership via manual deactivate_rank / recover_ranks calls.
-    std::vector<GroupId> groups_to_erase;
+    // For auto_deactivate=true groups, mark the failed rank as inactive.
     for (auto& [group_id, view] : group_views_) {
-        if (!rankInRange(rank)) continue;
-        auto& member = view.members[rank];
-        if (member.status != GroupMemberStatus::kActive) continue;
         if (!view.auto_deactivate) continue;
+        auto& member = view.members[rank];
+        if (member.status != GroupMemberStatus::Active) continue;
 
-        member.status = GroupMemberStatus::kInactive;
+        member.status = GroupMemberStatus::Inactive;
         member.agent_session_epoch = std::nullopt;
         member.endpoint = std::nullopt;
         view.epoch++;
-        effects.push_back(ViewUpdateEffect{view, {}, GeneralAckRoute{}});
-        flushPendingSyncs(group_id, effects);
-        if (canEraseGroup(view)) {
-            groups_to_erase.push_back(group_id);
-        }
-    }
-    for (GroupId group_id : groups_to_erase) {
-        eraseGroup(group_id, effects);
+        rejectPendingSyncs(group_id, rank, "rank went offline", effects);
+        effects.push_back(ViewUpdateEffect{view});
     }
 
     effects.push_back(makeRankStateEffect(rank));
@@ -858,13 +683,11 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
     checkGroupTransitions(effects);
 }
 
-// Private: authoritative HEALTHY computation
-
 bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
     GlobalRank a, GlobalRank b) const {
     if (a == b) return true;
-    if (ranks_[a].state == RankState::OFFLINE ||
-        ranks_[b].state == RankState::OFFLINE)
+    if (ranks_[a].state == RankState::Offline ||
+        ranks_[b].state == RankState::Offline)
         return false;
     return static_cast<size_t>(b) < ranks_[a].link_status.size() &&
            static_cast<size_t>(a) < ranks_[b].link_status.size() &&
@@ -873,15 +696,15 @@ bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
 
 std::vector<GlobalRank> CentralizedCoordinatorStateMachine::extendHealthySet()
     const {
-    // Step 1: Collect current HEALTHY ranks.
+    //  Collect current HEALTHY ranks.
     std::vector<GlobalRank> result;
     for (int i = 0; i < max_world_size_; ++i) {
-        if (ranks_[i].state == RankState::HEALTHY) {
+        if (ranks_[i].state == RankState::Healthy) {
             result.push_back(i);
         }
     }
 
-    // Step 2: Evict the least-connected rank until the set is a clique.
+    // Evict the least-connected rank until the set is a clique.
     // (Focuses strictly on connection density; naturally terminates on
     // singletons).
     while (true) {
@@ -909,14 +732,13 @@ std::vector<GlobalRank> CentralizedCoordinatorStateMachine::extendHealthySet()
                      result.end());
     }
 
-    // Step 2.5: Enforce business rule - evict isolated singletons.
-    // (Clears the path so Step 3 can bootstrap other healthy candidates).
+    // Evict isolated singletons
     if (result.size() == 1) {
         GlobalRank singleton = result[0];
         bool has_connections = false;
         for (int other = 0; other < max_world_size_; ++other) {
             if (other == singleton) continue;
-            if (ranks_[other].state == RankState::OFFLINE) continue;
+            if (ranks_[other].state == RankState::Offline) continue;
             if (isMutuallyConnected(singleton, other)) {
                 has_connections = true;
                 break;
@@ -927,9 +749,9 @@ std::vector<GlobalRank> CentralizedCoordinatorStateMachine::extendHealthySet()
         }
     }
 
-    // Step 3: Extend with new mutually-connected candidates.
+    // Extend with new mutually-connected candidates.
     for (int i = 0; i < max_world_size_; ++i) {
-        if (ranks_[i].state == RankState::OFFLINE) continue;
+        if (ranks_[i].state == RankState::Offline) continue;
         if (std::find(result.begin(), result.end(), i) != result.end())
             continue;
         bool connected_to_all = true;
@@ -959,18 +781,18 @@ void CentralizedCoordinatorStateMachine::updateRankStates(
 
     // Update per-rank HEALTHY / SYNCED state.
     for (int i = 0; i < max_world_size_; ++i) {
-        if (ranks_[i].state == RankState::OFFLINE) continue;
+        if (ranks_[i].state == RankState::Offline) continue;
 
         bool in_healthy = std::find(healthy_set.begin(), healthy_set.end(),
                                     i) != healthy_set.end();
 
-        if (in_healthy && ranks_[i].state != RankState::HEALTHY) {
+        if (in_healthy && ranks_[i].state != RankState::Healthy) {
             LOG(INFO) << "[COORD] rank=" << i << " transitioning to HEALTHY";
-            ranks_[i].state = RankState::HEALTHY;
+            ranks_[i].state = RankState::Healthy;
             effects.push_back(makeRankStateEffect(i));
-        } else if (!in_healthy && ranks_[i].state == RankState::HEALTHY) {
+        } else if (!in_healthy && ranks_[i].state == RankState::Healthy) {
             LOG(INFO) << "[COORD] rank=" << i << " transitioning to SYNCED";
-            ranks_[i].state = RankState::SYNCED;
+            ranks_[i].state = RankState::Synced;
             effects.push_back(makeRankStateEffect(i));
         }
     }
@@ -993,7 +815,7 @@ void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
             bool in_healthy = std::find(healthy_set.begin(), healthy_set.end(),
                                         i) != healthy_set.end();
             if (!in_healthy) {
-                view.members[i].status = GroupMemberStatus::kInactive;
+                view.members[i].status = GroupMemberStatus::Inactive;
                 view.members[i].agent_session_epoch = std::nullopt;
                 view.members[i].endpoint = std::nullopt;
                 deactivated_ranks.push_back(i);
@@ -1003,8 +825,11 @@ void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
         }
         if (!deactivated_ranks.empty()) {
             view.epoch++;
-            effects.push_back(ViewUpdateEffect{view, {}, GeneralAckRoute{}});
-            flushPendingSyncs(group_id, effects);
+            for (GlobalRank deactivated_rank : deactivated_ranks) {
+                rejectPendingSyncs(group_id, deactivated_rank,
+                                   "rank auto-deactivated", effects);
+            }
+            effects.push_back(ViewUpdateEffect{view});
             LOG(INFO) << "[COORD] auto_deactivate view update group="
                       << group_id << " epoch=" << view.epoch;
         }
@@ -1058,22 +883,22 @@ bool CentralizedCoordinatorStateMachine::isActivatableSet(
 
 bool CentralizedCoordinatorStateMachine::isRankActivatable(
     GroupId group_id, GlobalRank rank,
-    const std::vector<GlobalRank>& peer_ranks) const {
+    const std::vector<GlobalRank>& future_active) const {
     if (!rankInRange(rank)) {
         LOG(INFO) << "[COORD] isRankActivatable group=" << group_id
                   << " rank=" << rank << " false: out of range";
         return false;
     }
-    if (ranks_[rank].state != RankState::HEALTHY) {
+    if (ranks_[rank].state != RankState::Healthy) {
         LOG(INFO) << "[COORD] isRankActivatable group=" << group_id
                   << " rank=" << rank << " false: rank_state="
                   << static_cast<int>(ranks_[rank].state)
                   << " (expected HEALTHY="
-                  << static_cast<int>(RankState::HEALTHY) << ")";
+                  << static_cast<int>(RankState::Healthy) << ")";
         return false;
     }
 
-    for (GlobalRank other : peer_ranks) {
+    for (GlobalRank other : future_active) {
         if (other == rank) continue;
         if (!isMutuallyConnected(rank, other)) {
             LOG(INFO) << "[COORD] isRankActivatable group=" << group_id
@@ -1128,17 +953,17 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
     for (auto& [group_id, view] : group_views_) {
         if (view.status == GroupStatus::Bootstrapping) {
             // Collect all active ranks.
-            std::vector<GlobalRank> peer_ranks;
+            std::vector<GlobalRank> active;
             bool has_any_active = false;
             for (int i = 0; i < max_world_size_; ++i) {
                 if (!view.members[i].isActive()) continue;
                 has_any_active = true;
-                peer_ranks.push_back(i);
+                active.push_back(i);
             }
 
             bool all_ready = true;
-            for (GlobalRank r : peer_ranks) {
-                if (!isRankActivatable(group_id, r, peer_ranks)) {
+            for (GlobalRank r : active) {
+                if (!isRankActivatable(group_id, r, active)) {
                     all_ready = false;
                     break;
                 }
@@ -1146,42 +971,38 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
 
             if (has_any_active && all_ready) {
                 // All active ranks have endpoints and are HEALTHY.
-                // Transition to BootstrapSyncing and initiate 2PC.
+                // Transition to BootstrapSyncing and initiate a barrier.
                 view.status = GroupStatus::BootstrapSyncing;
                 view.epoch++;
 
-                auto acks_needed =
-                    computeRequiredViewAcks(view, view, kInvalidGlobalRank);
-                pending_bootstrap_acks_[group_id] =
-                    std::unordered_set<GlobalRank>(acks_needed.begin(),
-                                                   acks_needed.end());
+                auto acks_needed = computeBarrierAckSet(
+                    view, view, group_id);
+                if (acks_needed.empty()) {
+                    // No online active rank needs to ACK; become Ready
+                    // immediately.
+                    view.status = GroupStatus::Ready;
+                    view.epoch++;
+                    effects.push_back(ViewUpdateEffect{view});
+                    LOG(INFO) << "[COORD] group=" << group_id
+                              << " transitioned to Ready epoch=" << view.epoch;
+                } else {
+                    pending_barriers_[group_id][view.epoch] =
+                        PendingViewUpdateBarrier{
+                            group_id, view.epoch,
+                            std::unordered_set<GlobalRank>(acks_needed.begin(),
+                                                           acks_needed.end()),
+                            std::nullopt,
+                            PendingViewUpdateBarrier::BootstrapCommit{}};
 
-                effects.push_back(
-                    ViewUpdateEffect{view, acks_needed, GeneralAckRoute{}});
-                LOG(INFO) << "[COORD] group=" << group_id
-                          << " transitioned to BootstrapSyncing epoch="
-                          << view.epoch;
-            }
-        } else if (view.status == GroupStatus::BootstrapSyncing) {
-            // If a peer dies during this phase, its ACK never arrives.
-            // The group stays in BootstrapSyncing; waitUntilGroupReady()
-            // will time out on the dead peer's Agent.
-            auto it = pending_bootstrap_acks_.find(group_id);
-            if (it == pending_bootstrap_acks_.end()) continue;
-            auto& pending = it->second;
-
-            if (pending.empty()) {
-                // All ranks have ACKed.  Transition to Ready.
-                view.status = GroupStatus::Ready;
-                view.epoch++;
-                pending_bootstrap_acks_.erase(it);
-                effects.push_back(
-                    ViewUpdateEffect{view, {}, GeneralAckRoute{}});
-                flushPendingSyncs(group_id, effects);
-                LOG(INFO) << "[COORD] group=" << group_id
-                          << " transitioned to Ready epoch=" << view.epoch;
+                    effects.push_back(ViewUpdateEffect{view});
+                    LOG(INFO) << "[COORD] group=" << group_id
+                              << " transitioned to BootstrapSyncing epoch="
+                              << view.epoch;
+                }
             }
         }
+        // BootstrapSyncing → Ready is committed from handleViewUpdateAck /
+        // commitBarrier when all required ACKs arrive.  No active work here.
     }
 }
 
@@ -1221,7 +1042,7 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
         view.rank_order = group.rank_order;
         view.members.resize(max_world_size_);
         for (GlobalRank r : group.rank_order) {
-            view.members[r].status = GroupMemberStatus::kActive;
+            view.members[r].status = GroupMemberStatus::Active;
         }
         view.status = GroupStatus::Bootstrapping;
         group_views_[group_id] = std::move(view);
@@ -1233,8 +1054,7 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
     // Group already exists -> validate that the new rank_order is compatible
     // with the existing one.  The first backend to declare the group sets the
     // initial rank_order; later backends must agree on all overlapping
-    // positions.  rank_order extension and member activation are handled
-    // exclusively through proposeViewUpdate (activate_rank / recover_ranks).
+    // positions.
     const auto& existing_order = group_views_[group_id].rank_order;
     const auto& new_order = group.rank_order;
 
@@ -1248,25 +1068,19 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
         }
     }
 
-    // Note: if new_order is longer than existing_order, the extra ranks are
+    // If new_order is longer than existing_order, the extra ranks are
     // not activated here.  They must be activated via a subsequent
     // proposeViewUpdate (activate_rank / recover_ranks) from an existing
-    // active member.  Until then, the extension backend operates in local-only
-    // mode (its own rank is masked out of collectives by activeRanks).
+    // active member.
     //
     // However, extend the existing rank_order with the new ranks now so that
-    // every member's ViewUpdate already carries the correct local→global
-    // mapping.  getPeerState() relies on rank_order to resolve in-group ranks,
-    // and without this extension an existing member would read garbage/identity
-    // for the joiner's slot and never see member=1.
+    // every member's ViewUpdate carries the correct rank_order (local->global
+    // mapping).  getPeerState() relies on rank_order to resolve in-group ranks.
     if (new_order.size() > existing_order.size()) {
-        auto& ext_order = group_views_[group_id].rank_order;
-        for (size_t i = existing_order.size(); i < new_order.size(); ++i) {
-            ext_order.push_back(new_order[i]);
-        }
+        group_views_[group_id].rank_order = new_order;
         LOG(INFO) << "[COORD] registerGroup extended rank_order for group="
                   << group_id << " old_size=" << existing_order.size()
-                  << " new_size=" << ext_order.size();
+                  << " new_size=" << new_order.size();
     }
 
     // The joining rank needs to be able to receive view updates from the
@@ -1274,8 +1088,8 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
     // so that pushViewUpdate() will deliver the authoritative view to it.
     auto& view = group_views_[group_id];
     if (rankInRange(joining_rank) &&
-        view.members[joining_rank].status == GroupMemberStatus::kNone) {
-        view.members[joining_rank].status = GroupMemberStatus::kInactive;
+        view.members[joining_rank].status == GroupMemberStatus::None) {
+        view.members[joining_rank].status = GroupMemberStatus::Inactive;
         LOG(INFO) << "[COORD] registerGroup promoted joining_rank="
                   << joining_rank << " to Inactive in group=" << group_id
                   << " view_epoch=" << view.epoch;
@@ -1287,7 +1101,7 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
     // Because the Coordinator executor is serialized, multiple simultaneous
     // joiners are naturally ordered into sequential pushes.
     if (view.status == GroupStatus::Ready) {
-        effects.push_back(ViewUpdateEffect{view, {}, GeneralAckRoute{}});
+        effects.push_back(ViewUpdateEffect{view});
         LOG(INFO) << "[COORD] registerGroup pushed Ready view group="
                   << group_id << " epoch=" << view.epoch;
     }
@@ -1302,50 +1116,37 @@ bool CentralizedCoordinatorStateMachine::canEraseGroup(
     const GroupView& view) const {
     return std::all_of(view.members.begin(), view.members.end(),
                        [](const GroupMember& m) {
-                           return m.status == GroupMemberStatus::kNone ||
-                                  m.status == GroupMemberStatus::kLeft;
+                           return m.status == GroupMemberStatus::None ||
+                                  m.status == GroupMemberStatus::Left;
                        });
 }
 
 void CentralizedCoordinatorStateMachine::eraseGroup(
     GroupId group_id, std::vector<CoordinatorEffect>& effects) {
-    // Erase pending bootstrap state if present.
-    pending_bootstrap_acks_.erase(group_id);
-
-    // Erase any pending proposals for this group so replies are not sent
-    // after the group is gone.
-    for (auto it = pending_proposal_acks_.begin();
-         it != pending_proposal_acks_.end();) {
-        if (it->second.group_id == group_id) {
-            effects.push_back(ReplyViewUpdateEffect{
-                it->first,
-                {ViewUpdateStatus::Rejected, 0, {}, "group was destroyed"}});
-            it = pending_proposal_acks_.erase(it);
-        } else {
-            ++it;
+    // Erase any pending ViewUpdate barriers for this group so replies are not
+    // sent after the group is gone.
+    auto it = pending_barriers_.find(group_id);
+    if (it != pending_barriers_.end()) {
+        for (auto& [epoch, barrier] : it->second) {
+            if (auto* pc =
+                    std::get_if<PendingViewUpdateBarrier::ProposalCommit>(
+                        &barrier.commit)) {
+                effects.push_back(
+                    ReplyProposalEffect{pc->propose_id,
+                                        {ViewUpdateStatus::Rejected,
+                                         0,
+                                         {},
+                                         "group was destroyed"}});
+            }
+            // Bootstrap barriers need no reply.
         }
+        pending_barriers_.erase(it);
     }
+
+    // Reject any pending sync-after-failure requests: the group is gone.
+    rejectPendingSyncs(group_id, "group was destroyed", effects);
 
     group_views_.erase(group_id);
-}
-
-std::vector<GlobalRank>
-CentralizedCoordinatorStateMachine::computeRequiredViewAcks(
-    const GroupView& old_view, const GroupView& new_view,
-    GlobalRank proposer) const {
-    // All online ranks that are active in EITHER old or new view must ACK.
-    // This ensures newly-activated ranks have received the view, and
-    // deactivated ranks know they're removed.
-    std::set<GlobalRank> required;
-    for (int i = 0; i < max_world_size_; ++i) {
-        if (i == proposer) continue;
-        if (ranks_[i].state == RankState::OFFLINE) continue;
-        if (old_view.members[i].isActive() || new_view.members[i].isActive()) {
-            required.insert(i);
-        }
-    }
-
-    return std::vector<GlobalRank>(required.begin(), required.end());
 }
 
 // Effect factories
@@ -1357,31 +1158,116 @@ CoordinatorEffect CentralizedCoordinatorStateMachine::makeRankStateEffect(
         RankStateUpdatePush{rank, static_cast<uint8_t>(ranks_[rank].state)}};
 }
 
-// flushPendingSyncs - resolve all pending syncs for a group.
-void CentralizedCoordinatorStateMachine::flushPendingSyncs(
-    GroupId group_id, std::vector<CoordinatorEffect>& effects) {
-    auto it = pending_syncs_.find(group_id);
-    if (it == pending_syncs_.end()) return;
+// commitBarrier - a pending ViewUpdate barrier has collected all required ACKs
+// (or its deadline passed with dropped ranks).  Execute the source-specific
+// commit action and emit the corresponding effects.
+void CentralizedCoordinatorStateMachine::commitBarrier(
+    PendingViewUpdateBarrier barrier, const std::vector<GlobalRank>& dropped,
+    std::vector<CoordinatorEffect>& effects) {
+    std::visit(
+        overloaded{
+            [&](const PendingViewUpdateBarrier::ProposalCommit& commit) {
+                auto response = commit.eventual_response;
+                if (!dropped.empty()) {
+                    response.status = ViewUpdateStatus::AppliedWithDroppedRanks;
+                    response.dropped_ranks = dropped;
+                    for (GlobalRank rank : dropped) {
+                        transitionToOffline(rank, effects);
+                    }
+                }
+                effects.push_back(
+                    ReplyProposalEffect{commit.propose_id, response});
+            },
+            [&](const PendingViewUpdateBarrier::BootstrapCommit&) {
+                auto it = group_views_.find(barrier.group_id);
+                if (it == group_views_.end()) return;
+                GroupView& view = it->second;
+                view.status = GroupStatus::Ready;
+                view.epoch++;
+                effects.push_back(ViewUpdateEffect{view});
+                LOG(INFO) << "[COORD] group=" << barrier.group_id
+                          << " transitioned to Ready epoch=" << view.epoch;
+            },
+        },
+        barrier.commit);
+}
 
-    auto resp = buildSyncAfterFailureResponse(group_id);
-    for (auto& [rank, sync_ids] : it->second) {
+// rejectPendingSyncs - reject pending syncs for a specific rank in a group.
+void CentralizedCoordinatorStateMachine::rejectPendingSyncs(
+    GroupId group_id, GlobalRank rank, const std::string& reason,
+    std::vector<CoordinatorEffect>& effects) {
+    auto group_it = pending_syncs_.find(group_id);
+    if (group_it == pending_syncs_.end()) return;
+
+    auto rank_it = group_it->second.find(rank);
+    if (rank_it == group_it->second.end()) return;
+
+    SyncAfterFailureResponse resp;
+    resp.status = SyncAfterFailureStatus::Rejected;
+    resp.reject_reason = reason;
+    auto view_it = group_views_.find(group_id);
+    if (view_it != group_views_.end()) {
+        resp.new_epoch = view_it->second.epoch;
+    }
+
+    for (uint64_t sync_id : rank_it->second) {
+        effects.push_back(ReplySyncEffect{sync_id, resp});
+    }
+    group_it->second.erase(rank_it);
+    if (group_it->second.empty()) {
+        pending_syncs_.erase(group_it);
+    }
+}
+
+// rejectPendingSyncs - reject all pending syncs for a group.
+void CentralizedCoordinatorStateMachine::rejectPendingSyncs(
+    GroupId group_id, const std::string& reason,
+    std::vector<CoordinatorEffect>& effects) {
+    auto group_it = pending_syncs_.find(group_id);
+    if (group_it == pending_syncs_.end()) return;
+
+    SyncAfterFailureResponse resp;
+    resp.status = SyncAfterFailureStatus::Rejected;
+    resp.reject_reason = reason;
+    auto view_it = group_views_.find(group_id);
+    if (view_it != group_views_.end()) {
+        resp.new_epoch = view_it->second.epoch;
+    }
+
+    for (auto& [rank, sync_ids] : group_it->second) {
         for (uint64_t sync_id : sync_ids) {
             effects.push_back(ReplySyncEffect{sync_id, resp});
         }
     }
-    pending_syncs_.erase(it);
+    pending_syncs_.erase(group_it);
 }
 
-SyncAfterFailureResponse
-CentralizedCoordinatorStateMachine::buildSyncAfterFailureResponse(
+// computeBarrierAckSet -- ranks that must ACK before a proposal/bootstrap
+// barrier can commit.  Includes all online ranks active in either old or new
+// view plus ranks with pending sync-after-failure calls.
+// The proposer (if any) is included: the ViewUpdate push is processed on the
+// proposer's executor thread independently of the calling thread that is
+// blocked in proposeViewUpdate, so there is no deadlock.
+std::unordered_set<GlobalRank>
+CentralizedCoordinatorStateMachine::computeBarrierAckSet(
+    const GroupView& old_view, const GroupView& new_view,
     GroupId group_id) const {
-    SyncAfterFailureResponse resp;
-    auto it = group_views_.find(group_id);
-    if (it != group_views_.end()) {
-        resp.status = SyncAfterFailureStatus::kDecisionApplied;
-        resp.new_epoch = it->second.epoch;
+    std::unordered_set<GlobalRank> acks;
+    for (int i = 0; i < max_world_size_; ++i) {
+        if (ranks_[i].state == RankState::Offline) continue;
+        if (old_view.members[i].isActive() || new_view.members[i].isActive()) {
+            acks.insert(i);
+        }
     }
-    return resp;
+    auto sync_it = pending_syncs_.find(group_id);
+    if (sync_it != pending_syncs_.end()) {
+        for (const auto& [rank, ids] : sync_it->second) {
+            if (rankInRange(rank) && ranks_[rank].state != RankState::Offline) {
+                acks.insert(rank);
+            }
+        }
+    }
+    return acks;
 }
 
 }  // namespace mooncake

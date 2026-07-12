@@ -350,7 +350,7 @@ MooncakeBackend::MooncakeBackend(
     initial_group.rank_order = std::move(initial_rank_order);
     initial_group.members.resize(ctx_.max_world_size);
     for (GlobalRank r : initial_group.rank_order) {
-        initial_group.members[r].status = GroupMemberStatus::kActive;
+        initial_group.members[r].status = GroupMemberStatus::Active;
     }
     bool auto_deactivate = options_ ? options_->autoDeactivateOnFailure_ : true;
 
@@ -369,13 +369,13 @@ MooncakeBackend::MooncakeBackend(
 }
 
 MooncakeBackend::~MooncakeBackend() {
-    shutdown();
-    // Ensure this backend is removed from backends_ before destruction.
-    // Blocks until the executor thread has erased the raw pointer and sent
-    // the unregisterGroup RPC to the Coordinator.
+    // Ensure this backend is removed from backends_ BEFORE shutdown.
+    // Blocks until the executor thread has erased the raw pointer so that
+    // in-flight ViewUpdates cannot find a backend with freed resources.
     if (meta_) {
         agent_.unregisterGroup(meta_->group_id);
     }
+    shutdown();
 }
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
@@ -1128,6 +1128,10 @@ SyncAfterFailureResponse MooncakeBackend::syncAfterFailure() {
 }
 
 void MooncakeBackend::applyViewChange(const GroupView& view) {
+    // Guard against shutdown having freed activeRanks before this backend
+    // was removed from backends_ (defense-in-depth).
+    if (!meta_ || !meta_->activeRanks) return;
+
     // Ignore stale views that arrive out of order (e.g. a delayed Ready
     // re-broadcast arriving after the activation view).
     auto current_epoch = meta_->epoch.load(std::memory_order_acquire);
@@ -1139,12 +1143,10 @@ void MooncakeBackend::applyViewChange(const GroupView& view) {
         return;
     }
 
-    // Membership boundary (activation/deactivation): reset the
-    // collective sequence so that all ranks, including joiners and
-    // replacements, agree on the double-buffer parity.
+    // Membership boundary (activation/deactivation): track whether the
+    // epoch changed so downstream logic can react.
     bool epoch_changed = false;
     if (meta_->epoch.load(std::memory_order_acquire) != view.epoch) {
-        meta_->taskCount = 0;
         epoch_changed = true;
     }
 

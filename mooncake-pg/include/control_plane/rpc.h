@@ -36,7 +36,7 @@ struct RankConnectionMetadata {
 
 struct RegisterAgentResponse {
     bool success = false;
-    std::string error_msg;
+    std::string reject_reason;
     std::vector<RankState> all_rank_states;
     std::vector<GroupView> groups;
     std::vector<RankConnectionMetadata> rank_connections;
@@ -74,7 +74,7 @@ struct ProposeViewUpdateRequest {
     GlobalRank source_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
     std::vector<GlobalRank> requested_ranks;  // ranks to activate/deactivate
-    bool is_activate = false;
+    bool is_activation = false;
 };
 
 struct ProposeViewUpdateResponse {
@@ -149,14 +149,14 @@ struct SyncAfterFailureRequest {
 };
 
 enum class SyncAfterFailureStatus : uint8_t {
-    kDecisionApplied =
+    DecisionApplied =
         0,          // Decision made and applied (ViewUpdate ACKed by caller)
-    kNoChange = 1,  // No pending decision, epoch matches, no window open
-    kRejected = 2,  // Invalid request (stale session, group not found, etc.)
+    NoChange = 1,  // No pending decision, epoch matches, no window open
+    Rejected = 2,  // Invalid request (stale session, group not found, etc.)
 };
 
 struct SyncAfterFailureResponse {
-    SyncAfterFailureStatus status = SyncAfterFailureStatus::kNoChange;
+    SyncAfterFailureStatus status = SyncAfterFailureStatus::NoChange;
     uint64_t new_epoch = 0;
     std::string reject_reason;
 };
@@ -202,26 +202,15 @@ struct PushEffect {
     Push push;
 };
 
-// Unified ViewUpdate ACK route.  Every epoch-changing ViewUpdate requires
-// ACKs from its required_acks set.  When those ACKs arrive a single handler
-// (handleViewUpdateAck) checks all pending state — bootstrap 2PC, proposal
-// 2PC, and sync-after-failure callers — and resolves whatever matches.
-//
-// Proposal ACKs carry the propose_id that originated the push so the
-// handler can resolve the correct proposal.
-struct GeneralAckRoute {};
-struct ProposalAckRoute {
-    uint64_t propose_id = 0;
-};
-using ViewUpdateAckRoute = std::variant<GeneralAckRoute, ProposalAckRoute>;
-
+// ViewUpdateEffect tells the Host to push a view update to the group members.
+// Every online member receives the push via callAsync and ACKs back through
+// handleViewUpdateAck.  The State Machine matches ACKs to pending barriers
+// (proposal / bootstrap) and sync-after-failure waiters.
 struct ViewUpdateEffect {
     GroupView view;
-    std::vector<GlobalRank> required_acks;
-    ViewUpdateAckRoute ack_route = GeneralAckRoute{};
 };
 
-struct ReplyViewUpdateEffect {
+struct ReplyProposalEffect {
     uint64_t propose_id = 0;
     ProposeViewUpdateResponse response;
 };
@@ -233,7 +222,7 @@ struct ReplySyncEffect {
 
 using CoordinatorEffect =
     std::variant<PushEffect<RankStateUpdatePush>, ViewUpdateEffect,
-                 ReplyViewUpdateEffect, PushEffect<PeerJoinedPush>,
+                 ReplyProposalEffect, PushEffect<PeerJoinedPush>,
                  ReplySyncEffect>;
 
 // Agent effects

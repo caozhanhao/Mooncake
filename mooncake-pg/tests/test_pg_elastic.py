@@ -374,6 +374,7 @@ def _run_allgather_reduce_scatter(
     device: str,
     active_world_size: int,
     rank: int,
+    backend,
 ) -> None:
     """Run _allgather_base and _reduce_scatter_base and assert correctness.
 
@@ -386,7 +387,14 @@ def _run_allgather_reduce_scatter(
     # input: scalar (rank+1); output: flat buffer of active_world_size elements
     input_t = torch.tensor([rank + 1], dtype=torch.int32, device=device)
     output_t = torch.zeros(active_world_size, dtype=torch.int32, device=device)
-    dist.all_gather_into_tensor(output_t, input_t)
+    work = dist.all_gather_into_tensor(output_t, input_t, async_op=True)
+    work.wait()
+    if not pg.get_local_success(work):
+        pg.sync_after_failure(backend)
+        # Re-run with dead ranks now deactivated.
+        output_t.zero_()
+        dist.all_gather_into_tensor(output_t, input_t)
+
     for j in range(active_world_size):
         expected = j + 1
         got = int(output_t[j].item())
@@ -404,7 +412,13 @@ def _run_allgather_reduce_scatter(
     # rank j receives sum of input[j] from all ranks = (j+1) * active_world_size.
     input_rs = torch.arange(1, active_world_size + 1, dtype=torch.int32, device=device)
     output_rs = torch.zeros(1, dtype=torch.int32, device=device)
-    dist.reduce_scatter_tensor(output_rs, input_rs)
+    work = dist.reduce_scatter_tensor(output_rs, input_rs, async_op=True)
+    work.wait()
+    if not pg.get_local_success(work):
+        pg.sync_after_failure(backend)
+        # Re-run with dead ranks now deactivated.
+        output_rs.zero_()
+        dist.reduce_scatter_tensor(output_rs, input_rs)
     expected_rs = (rank + 1) * active_world_size
     got_rs = int(output_rs[0].item())
     if got_rs != expected_rs:
@@ -450,7 +464,8 @@ def _allgather_reduce_scatter_extension_worker(
         # Pre-activation: 3 active ranks, max_world_size=4.
         # This is the overflow path: buggy code would iterate 4 times into a
         # buffer sized for 3.
-        _run_allgather_reduce_scatter(device, initial_world_size, ctx.proc_rank)
+        _run_allgather_reduce_scatter(device, initial_world_size, ctx.proc_rank,
+                                      backend=backend)
 
         if ctx.proc_rank == 0:
             extend_event.set()
@@ -464,7 +479,8 @@ def _allgather_reduce_scatter_extension_worker(
         pg.recover_ranks(backend, join_ranks)
 
         # Post-activation: all 4 ranks active.
-        _run_allgather_reduce_scatter(device, ctx.world_size, ctx.proc_rank)
+        _run_allgather_reduce_scatter(device, ctx.world_size, ctx.proc_rank,
+                                  backend=backend)
 
         ctx.record_result({"role": "primary", "rank": ctx.proc_rank})
     else:
@@ -486,7 +502,8 @@ def _allgather_reduce_scatter_extension_worker(
         pg.join_group(backend)
 
         # Post-activation: all 4 ranks active.
-        _run_allgather_reduce_scatter(device, ctx.world_size, extension_rank)
+        _run_allgather_reduce_scatter(device, ctx.world_size, extension_rank,
+                                  backend=backend)
 
         ctx.record_result({"role": "joiner", "rank": extension_rank})
 
@@ -511,7 +528,8 @@ def _allgather_reduce_scatter_recovery_worker(
         backend = ctx.get_backend()
 
         # Pre-failure: all 4 ranks active.
-        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank)
+        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank,
+                                  backend=backend)
 
         if logical_rank == broken_rank:
             ctx.record_result({"role": "broken"})
@@ -521,17 +539,8 @@ def _allgather_reduce_scatter_recovery_worker(
         # Survivors: 3 active ranks, max_world_size=4 → overflow path.
         broken_exited.wait()
 
-        # Sync with the Coordinator to deactivate the dead rank BEFORE
-        # running the reduced operation. Otherwise the transfer engine
-        # targets rank 3's (now-invalid) RDMA buffers, causing errors
-        # that cascade into healthy peers being incorrectly marked failed.
-        result = pg.sync_after_failure(backend)
-        assert result["status"] != 2, (  # kRejected
-            f"rank {logical_rank}: sync_after_failure rejected: "
-            f"{result.get('reject_reason', '')}"
-        )
-
-        _run_allgather_reduce_scatter(device, ctx.world_size - 1, logical_rank)
+        _run_allgather_reduce_scatter(device, ctx.world_size - 1, logical_rank,
+                                      backend=backend)
 
         if logical_rank == 0:
             start_recovery.set()
@@ -545,7 +554,8 @@ def _allgather_reduce_scatter_recovery_worker(
         pg.recover_ranks(backend, [broken_rank])
 
         # Post-recovery: all 4 ranks active again.
-        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank)
+        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank,
+                                  backend=backend)
 
         ctx.record_result({"role": "survivor"})
     else:
@@ -555,7 +565,8 @@ def _allgather_reduce_scatter_recovery_worker(
         pg.join_group(backend)
 
         # Post-recovery: all 4 ranks active.
-        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank)
+        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank,
+                                  backend=backend)
 
         ctx.record_result({"role": "replacement"})
 

@@ -47,7 +47,7 @@ class RpcClient;
 //                              | runEffects()                      |
 //                              |  RankStateUpdatePush -> broadcast |
 //                              |  ViewUpdatePush -> callAsync      |
-//                              |  ReplyViewUpdateEffect -> reply   |
+//                              |  ReplyProposalEffect -> reply   |
 //                              +-----------------------------------+
 //
 
@@ -124,7 +124,7 @@ class CoordinatorHost {
                               SyncAfterFailureRequest req);
 
     void postViewUpdateAck(GroupId group_id, GlobalRank rank, uint64_t epoch,
-                           bool applied, ViewUpdateAckRoute route);
+                           bool applied);
 
    private:
     CentralizedCoordinatorStateMachine state_machine_;
@@ -142,7 +142,7 @@ class CoordinatorHost {
     // Host maintains the propose_id -> RPC context mapping.
     // 2PC state is inside CentralizedCoordinatorStateMachine; Host just stores
     // the RPC context for replying when the state machine emits
-    // ReplyViewUpdateEffect.
+    // ReplyProposalEffect.
     uint64_t next_propose_id_{1};
     std::unordered_map<uint64_t, coro_rpc::context<ProposeViewUpdateResponse>>
         pending_rpcs_;

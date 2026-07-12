@@ -298,25 +298,25 @@ void AgentHost::publishLocalEndpoint(GroupEndpointPublication endpoint) {
 // Agent interface: Membership proposals (synchronous)
 
 ProposeViewUpdateResponse AgentHost::proposeViewUpdateInternal(
-    GroupId group_id, const std::vector<GlobalRank>& ranks, bool is_activate) {
+    GroupId group_id, const std::vector<GlobalRank>& ranks, bool is_activation) {
     ProposeViewUpdateRequest req;
     req.group_id = group_id;
     req.source_rank = rank_;
     req.agent_session_epoch = agent_.getAgentSessionEpoch();
     req.requested_ranks = ranks;
-    req.is_activate = is_activate;
+    req.is_activation = is_activation;
     return rpc_client_->call<&CoordinatorRpcService::proposeViewUpdate>(
         coordinator_addr_, req);
 }
 
 ProposeViewUpdateResponse AgentHost::proposeActivate(
     GroupId group_id, const std::vector<GlobalRank>& ranks) {
-    return proposeViewUpdateInternal(group_id, ranks, /*is_activate=*/true);
+    return proposeViewUpdateInternal(group_id, ranks, /*is_activation=*/true);
 }
 
 ProposeViewUpdateResponse AgentHost::proposeDeactivate(
     GroupId group_id, const std::vector<GlobalRank>& ranks) {
-    return proposeViewUpdateInternal(group_id, ranks, /*is_activate=*/false);
+    return proposeViewUpdateInternal(group_id, ranks, /*is_activation=*/false);
 }
 
 // Agent interface: Transfer observation (thread-safe)
@@ -427,11 +427,15 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
         // agent_.groups_, which is only safe to access from the executor.
         auto old_view = agent_.getGroupView(group_id);
         std::vector<GlobalRank> newly_activated;
-        for (size_t igr = 0; igr < push.view.rank_order.size(); ++igr) {
-            GlobalRank gr = push.view.rank_order[igr];
-            if (!old_view.members[gr].isActive() &&
-                push.view.members[gr].isActive()) {
-                newly_activated.push_back(gr);
+        // If the group was already erased, old_view.members is empty;
+        // handleViewUpdate will return early with no effects.
+        if (!old_view.members.empty()) {
+            for (size_t igr = 0; igr < push.view.rank_order.size(); ++igr) {
+                GlobalRank gr = push.view.rank_order[igr];
+                if (!old_view.members[gr].isActive() &&
+                    push.view.members[gr].isActive()) {
+                    newly_activated.push_back(gr);
+                }
             }
         }
 
@@ -572,7 +576,7 @@ void AgentHost::startAgentRegistration() {
                         }
                         LOG(ERROR)
                             << "AgentHost: registerAgent failed: "
-                            << resp.error_msg
+                            << resp.reject_reason
                             << " (will retry after heartbeat interval; if this "
                                "persists, the Coordinator may be rejecting a "
                                "replacement rank before the old one times out)"

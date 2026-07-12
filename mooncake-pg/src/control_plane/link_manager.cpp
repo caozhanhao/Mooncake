@@ -98,8 +98,8 @@ void LinkManager::init(GlobalRank rank, int max_world_size,
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         auto& link = peers_[rank_];
-        link.state = PeerLinkState::CONNECTED;
-        link.candidate = false;
+        link.state = PeerLinkState::Connected;
+        link.is_candidate = false;
         link.target_id = engine_->openSegment(local_server_name_);
         self_target_id = link.target_id.value();
     }
@@ -107,7 +107,7 @@ void LinkManager::init(GlobalRank rank, int max_world_size,
     // Write read model for self.
     publishLinkUp(rank_, self_target_id);
     read_state_[rank_].rank_state.store(
-        static_cast<uint8_t>(RankState::HEALTHY), std::memory_order_release);
+        static_cast<uint8_t>(RankState::Healthy), std::memory_order_release);
 
     // Start poller thread.
     poller_running_.store(true, std::memory_order_release);
@@ -136,8 +136,8 @@ void LinkManager::shutdown() {
             engine_->freeBatchID(link.warmup_batch_id.value());
             link.warmup_batch_id = std::nullopt;
         }
-        link.state = PeerLinkState::IDLE;
-        link.candidate = false;
+        link.state = PeerLinkState::Idle;
+        link.is_candidate = false;
     }
 
     // Release warmup regions.
@@ -168,7 +168,7 @@ void LinkManager::enablePeerProbe(GlobalRank peer,
     auto& link = peers_[peer];
     link.server_name = server_name;
     link.warmup_recv_addr = warmup_recv_addr;
-    link.candidate = true;
+    link.is_candidate = true;
     link.skip_warmup = skip_warmup_;
 
     // Reset probe backoff so connection attempt starts promptly.
@@ -191,7 +191,7 @@ void LinkManager::stopReconnect(GlobalRank peer) {
     if (!rankInRange(peer)) return;
 
     std::lock_guard<std::mutex> lock(peers_mutex_);
-    peers_[peer].candidate = false;
+    peers_[peer].is_candidate = false;
 }
 
 bool LinkManager::isConnected(GlobalRank peer) const {
@@ -238,7 +238,7 @@ std::optional<PeerReadHandle> LinkManager::resolvePeer(GlobalRank peer) const {
 bool LinkManager::isRankReady(GlobalRank peer) const {
     if (!rankInRange(peer)) return false;
     return read_state_[peer].rank_state.load(std::memory_order_acquire) ==
-               static_cast<uint8_t>(RankState::HEALTHY) &&
+               static_cast<uint8_t>(RankState::Healthy) &&
            read_state_[peer].link_connected.load(std::memory_order_acquire) !=
                0;
 }
@@ -246,7 +246,7 @@ bool LinkManager::isRankReady(GlobalRank peer) const {
 bool LinkManager::isRankHealthy(GlobalRank peer) const {
     if (!rankInRange(peer)) return false;
     return read_state_[peer].rank_state.load(std::memory_order_acquire) ==
-           static_cast<uint8_t>(RankState::HEALTHY);
+           static_cast<uint8_t>(RankState::Healthy);
 }
 
 void LinkManager::refreshPeerSegment(GlobalRank peer) {
@@ -257,7 +257,7 @@ void LinkManager::refreshPeerSegment(GlobalRank peer) {
     auto& link = peers_[peer];
 
     // Only meaningful for connected peers.
-    if (link.state != PeerLinkState::CONNECTED) return;
+    if (link.state != PeerLinkState::Connected) return;
     if (!link.target_id.has_value()) return;
 
     // Close the old segment (stale rkey) and open a fresh one.
@@ -317,9 +317,9 @@ void LinkManager::tearDownPeerLink(GlobalRank peer, bool stop_reconnect) {
     // WAITING_PEER_WARMUP while the peer is already CONNECTED.
     if (stop_reconnect && warmup_recv_region_) warmup_recv_region_[peer] = 0;
 
-    link.state = PeerLinkState::IDLE;
+    link.state = PeerLinkState::Idle;
     if (stop_reconnect) {
-        link.candidate = false;
+        link.is_candidate = false;
     }
 
     // Immediately clear the worker read model so worker threads stop
@@ -354,8 +354,8 @@ void LinkManager::pollerLoop() {
                 if (peer == rank_) continue;
 
                 auto& link = peers_[peer];
-                if (!link.candidate) continue;
-                if (link.state == PeerLinkState::CONNECTED) continue;
+                if (!link.is_candidate) continue;
+                if (link.state == PeerLinkState::Connected) continue;
                 if (now < link.next_probe_time) continue;
 
                 // Schedule next probe attempt with short delay.
@@ -384,7 +384,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
     auto& link = peers_[peer];
 
     switch (link.state) {
-        case PeerLinkState::IDLE: {
+        case PeerLinkState::Idle: {
             if (link.server_name.empty()) return false;
 
             auto segment_id = engine_->openSegment(link.server_name);
@@ -405,7 +405,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
             if (link.skip_warmup) {
                 // MNNVL fabric: connectivity is guaranteed, skip warmup
                 // handshake.
-                link.state = PeerLinkState::CONNECTED;
+                link.state = PeerLinkState::Connected;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
                 publishLinkUp(peer, segment_id);
                 emit(TELinkEvent{.kind = TELinkEvent::Kind::LinkUp,
@@ -431,17 +431,17 @@ bool LinkManager::probePeer(GlobalRank peer) {
                                             .length = sizeof(int32_t),
                                         }});
                 link.warmup_batch_id = batch_id;
-                link.state = PeerLinkState::WAITING_WARMUP_TRANSFER;
+                link.state = PeerLinkState::WaitingWarmupTransfer;
             } else {
                 // Wait for the peer to warmup us.
-                link.state = PeerLinkState::WAITING_PEER_WARMUP;
+                link.state = PeerLinkState::WaitingPeerWarmup;
             }
             return true;
         }
 
-        case PeerLinkState::WAITING_WARMUP_TRANSFER: {
+        case PeerLinkState::WaitingWarmupTransfer: {
             if (!link.warmup_batch_id.has_value()) {
-                link.state = PeerLinkState::IDLE;
+                link.state = PeerLinkState::Idle;
                 return false;
             }
 
@@ -451,7 +451,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
             if (status.s == TransferStatusEnum::COMPLETED) {
                 engine_->freeBatchID(link.warmup_batch_id.value());
                 link.warmup_batch_id = std::nullopt;
-                link.state = PeerLinkState::CONNECTED;
+                link.state = PeerLinkState::Connected;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
                 publishLinkUp(peer, link.target_id.value());
                 emit(TELinkEvent{.kind = TELinkEvent::Kind::LinkUp,
@@ -471,7 +471,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
                 link.warmup_batch_id = std::nullopt;
                 engine_->closeSegment(link.target_id.value());
                 link.target_id = std::nullopt;
-                link.state = PeerLinkState::IDLE;
+                link.state = PeerLinkState::Idle;
                 link.probe_backoff = std::min(link.probe_backoff * 2,
                                               PeerLink::kProbeBackoffMax);
                 return false;
@@ -480,15 +480,15 @@ bool LinkManager::probePeer(GlobalRank peer) {
             return false;
         }
 
-        case PeerLinkState::WAITING_PEER_WARMUP: {
+        case PeerLinkState::WaitingPeerWarmup: {
             if (!warmup_recv_region_) {
-                link.state = PeerLinkState::IDLE;
+                link.state = PeerLinkState::Idle;
                 return false;
             }
 
             if (*reinterpret_cast<volatile int32_t*>(
                     &warmup_recv_region_[peer])) {
-                link.state = PeerLinkState::CONNECTED;
+                link.state = PeerLinkState::Connected;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
                 publishLinkUp(peer, link.target_id.value());
                 emit(TELinkEvent{.kind = TELinkEvent::Kind::LinkUp,
@@ -500,8 +500,8 @@ bool LinkManager::probePeer(GlobalRank peer) {
             return false;
         }
 
-        case PeerLinkState::CONNECTED:
-        case PeerLinkState::EXPIRING:
+        case PeerLinkState::Connected:
+        case PeerLinkState::Expiring:
             break;
     }
 

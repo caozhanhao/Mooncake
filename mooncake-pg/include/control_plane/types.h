@@ -42,9 +42,9 @@ constexpr int kMaxNumRanks = 64;
 //        +--- or disconnect -------+-----> SYNCED
 //
 enum class RankState : uint8_t {
-    OFFLINE = 0,
-    SYNCED = 1,
-    HEALTHY = 2,
+    Offline = 0,
+    Synced = 1,
+    Healthy = 2,
 };
 
 // Group-level, per-(group_id, rank) buffer/sync/P2P addresses.
@@ -67,10 +67,10 @@ struct GroupEndpointInfo {
 
 // Membership state of one rank inside a single GroupView.
 enum class GroupMemberStatus : uint8_t {
-    kNone = 0,      // slot has never belonged to this group
-    kLeft = 1,      // rank explicitly left the group (called destroy_group)
-    kInactive = 2,  // deactivated
-    kActive = 3,    // rank is an active member
+    None = 0,      // slot has never belonged to this group
+    Left = 1,      // rank explicitly left the group (called destroy_group)
+    Inactive = 2,  // deactivated
+    Active = 3,    // rank is an active member
 };
 
 // Rank state inside a single GroupView.
@@ -80,17 +80,17 @@ enum class GroupMemberStatus : uint8_t {
 // while agent_session_epoch matches the rank's current session.  This makes
 // endpoint.has_value() authoritative for "endpoint present and fresh".
 struct GroupMember {
-    GroupMemberStatus status = GroupMemberStatus::kNone;
+    GroupMemberStatus status = GroupMemberStatus::None;
     std::optional<uint64_t>
         agent_session_epoch;  // session that published endpoint
     std::optional<GroupEndpointInfo> endpoint;
 
-    bool isActive() const { return status == GroupMemberStatus::kActive; }
+    bool isActive() const { return status == GroupMemberStatus::Active; }
     bool isMember() const {
-        return status == GroupMemberStatus::kActive ||
-               status == GroupMemberStatus::kInactive;
+        return status == GroupMemberStatus::Active ||
+               status == GroupMemberStatus::Inactive;
     }
-    bool hasLeft() const { return status == GroupMemberStatus::kLeft; }
+    bool hasLeft() const { return status == GroupMemberStatus::Left; }
     bool hasEndpoint() const { return endpoint.has_value(); }
 };
 

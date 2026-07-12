@@ -3,9 +3,11 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include "rpc.h"
@@ -56,9 +58,10 @@ class CoordinatorStateMachine {
         uint64_t sync_id, const SyncAfterFailureRequest& req) = 0;
 
     // ViewUpdate ACK processing.
-    virtual CoordinatorApplyResult<void> handleViewUpdateAck(
-        GroupId group_id, GlobalRank rank, uint64_t epoch, bool applied,
-        const ViewUpdateAckRoute& route) = 0;
+    virtual CoordinatorApplyResult<void> handleViewUpdateAck(GroupId group_id,
+                                                             GlobalRank rank,
+                                                             uint64_t epoch,
+                                                             bool applied) = 0;
 
     // Periodic.
     virtual CoordinatorApplyResult<void> checkTimeouts() = 0;
@@ -107,15 +110,16 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         uint64_t sync_id, const SyncAfterFailureRequest& req) override;
 
     // ViewUpdate ACK processing.
-    CoordinatorApplyResult<void> handleViewUpdateAck(
-        GroupId group_id, GlobalRank rank, uint64_t epoch, bool applied,
-        const ViewUpdateAckRoute& route) override;
+    CoordinatorApplyResult<void> handleViewUpdateAck(GroupId group_id,
+                                                     GlobalRank rank,
+                                                     uint64_t epoch,
+                                                     bool applied) override;
 
     // Periodic.
     CoordinatorApplyResult<void> checkTimeouts() override;
 
     RankState getRankState(GlobalRank rank) const {
-        if (!rankInRange(rank)) return RankState::OFFLINE;
+        if (!rankInRange(rank)) return RankState::Offline;
         return ranks_[rank].state;
     }
 
@@ -127,7 +131,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     int max_world_size_;
 
     struct RankInfo {
-        RankState state = RankState::OFFLINE;
+        RankState state = RankState::Offline;
         std::string agent_addr;
         std::string te_server_name;
         uint64_t agent_session_epoch = 0;
@@ -146,24 +150,28 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // Agent can detect endpoint changes.
     std::array<uint64_t, kMaxNumRanks> endpoint_epochs_{};
 
-    // Two independent 2PC flows share the same ViewUpdate ACK path:
-    //   1. Proposal 2PC (activate/deactivate) - keyed by propose_id
-    //   2. Bootstrap 2PC (initial group readiness) - keyed by group_id
-
-    // Proposal 2PC (activate/deactivate).  Maps propose_id -> pending state.
-    struct PendingProposal {
-        uint64_t propose_id = 0;
+    struct PendingViewUpdateBarrier {
         GroupId group_id;
-        ProposeViewUpdateResponse eventual_response;
+        uint64_t epoch = 0;
         std::unordered_set<GlobalRank> waiting_acks;
-        std::chrono::steady_clock::time_point deadline;
-    };
-    std::unordered_map<uint64_t, PendingProposal> pending_proposal_acks_;
+        std::optional<std::chrono::steady_clock::time_point> deadline;
 
-    // Bootstrap 2PC.  Maps group_id -> set of ranks whose ACK is still
-    // pending during the BootstrapSyncing phase.
-    std::unordered_map<GroupId, std::unordered_set<GlobalRank>>
-        pending_bootstrap_acks_;
+        struct ProposalCommit {
+            uint64_t propose_id = 0;
+            ProposeViewUpdateResponse eventual_response;
+        };
+        struct BootstrapCommit {};
+
+        std::variant<ProposalCommit, BootstrapCommit> commit = BootstrapCommit{};
+    };
+    std::unordered_map<GroupId,
+                       std::unordered_map<uint64_t, PendingViewUpdateBarrier>>
+        pending_barriers_;
+
+    // Helpers for barrier lifecycle.
+    void commitBarrier(PendingViewUpdateBarrier barrier,
+                       const std::vector<GlobalRank>& dropped,
+                       std::vector<CoordinatorEffect>& effects);
 
     // Fault reconciliation window.  Transfer observations update link_status
     // immediately, but the coordinator defers the membership decision until
@@ -182,14 +190,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     // Pending sync-after-failure requests.  Keyed by group_id, each entry maps
     // caller_rank -> list of sync_ids waiting for a decision for that group.
-    // Resolved when the caller ACKs the ViewUpdate that carries the decision
-    // via handleViewUpdateAck, or immediately via flushPendingSyncs when the
-    // epoch changes through a non-window path.
-    struct PendingSyncRequest {
-        uint64_t sync_id;
-        GlobalRank caller_rank;
-        uint64_t entry_epoch;
-    };
+    // Resolved ONLY when the caller ACKs the ViewUpdate that carries the
+    // decision (handleViewUpdateAck), or when the caller/group is removed and
+    // the sync is rejected.
     std::unordered_map<GroupId,
                        std::unordered_map<GlobalRank, std::vector<uint64_t>>>
         pending_syncs_;
@@ -209,6 +212,17 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // a ViewUpdate when at least one rank is pruned.
     void applyAutoDeactivate(std::vector<CoordinatorEffect>& effects);
 
+    // Open the fault reconciliation window and register a group for reconciliation.
+    // Stale epochs (report_epoch < recorded) are silently ignored.
+    void openReconciliationWindow(GroupId group_id, uint64_t report_epoch);
+
+    // Apply transfer observation bit-vectors to a reporter's link_status.
+    // Returns true when at least one peer was reported as failed.
+    bool applyLinkStatusUpdate(RankInfo& reporter,
+                               const std::vector<uint8_t>& attempted,
+                               const std::vector<uint8_t>& succeeded,
+                               const std::vector<uint8_t>& failed);
+
     // Bootstrap state machine driver.  Advances groups through:
     //   Bootstrapping -> BootstrapSyncing (when all active ranks are HEALTHY
     //                    and have published endpoints)
@@ -217,15 +231,20 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // Called after every state-changing operation.
     void checkGroupTransitions(std::vector<CoordinatorEffect>& effects);
 
-    // Resolve all pending syncs for `group_id` (or `group_id, rank`).
+    // Resolve (reject) pending syncs for `group_id` / `group_id, rank`.
     // Emits ReplySyncEffect for each pending sync_id.
-    void flushPendingSyncs(GroupId group_id,
-                           std::vector<CoordinatorEffect>& effects);
+    void rejectPendingSyncs(GroupId group_id, GlobalRank rank,
+                            const std::string& reason,
+                            std::vector<CoordinatorEffect>& effects);
+    void rejectPendingSyncs(GroupId group_id, const std::string& reason,
+                            std::vector<CoordinatorEffect>& effects);
 
-    // Build the response for a sync-after-failure request.
-    SyncAfterFailureResponse buildSyncAfterFailureResponse(
+    // Compute the ACK set for a ViewUpdate barrier (proposal / bootstrap).
+    std::unordered_set<GlobalRank> computeBarrierAckSet(
+        const GroupView& old_view, const GroupView& new_view,
         GroupId group_id) const;
 
+    // Build the response for a sync-after-failure request.
     bool isMutuallyConnected(GlobalRank a, GlobalRank b) const;
     // Preserve existing HEALTHY ranks that are still mutually connected,
     // then extend with new candidates that have full connectivity to all
@@ -235,11 +254,17 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     bool canEraseGroup(const GroupView& view) const;
     void eraseGroup(GroupId group_id, std::vector<CoordinatorEffect>& effects);
 
+    // Request validation: rank must be in range, online, and matching session.
+    bool hasValidSession(GlobalRank rank, uint64_t session_epoch) const {
+        return rankInRange(rank) && ranks_[rank].state != RankState::Offline &&
+               ranks_[rank].agent_session_epoch == session_epoch;
+    }
+
     bool rankInRange(GlobalRank rank) const {
         return 0 <= rank && rank < max_world_size_;
     }
     bool isRankActivatable(GroupId group_id, GlobalRank rank,
-                           const std::vector<GlobalRank>& peer_ranks) const;
+                           const std::vector<GlobalRank>& future_active) const;
     bool isActivatableSet(GroupId group_id,
                           const std::vector<GlobalRank>& new_ranks,
                           const GroupView& old_view) const;
@@ -248,10 +273,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                                   const GroupView& group, bool auto_deactivate,
                                   RegisterGroupResponse& response,
                                   std::vector<CoordinatorEffect>& effects);
-
-    std::vector<GlobalRank> computeRequiredViewAcks(const GroupView& old_view,
-                                                    const GroupView& new_view,
-                                                    GlobalRank proposer) const;
 
     // Effect factory helper.
     CoordinatorEffect makeRankStateEffect(GlobalRank rank);

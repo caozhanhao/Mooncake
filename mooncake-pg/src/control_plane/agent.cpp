@@ -13,10 +13,10 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     CHECK_LE(max_world_size_, kMaxNumRanks)
         << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
         << kMaxNumRanks << ")";
-    global_rank_states_.fill(RankState::OFFLINE);
+    global_rank_states_.fill(RankState::Offline);
     link_connected_.fill(false);
     last_reported_peer_status_.fill(false);
-    rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::OFFLINE));
+    rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::Offline));
 }
 
 // Group lifecycle
@@ -88,7 +88,7 @@ AgentApplyResult AgentStateMachine::handleRankStateUpdate(
     // Remote OFFLINE: the control plane is dead (process may have exited).
     // Tear down TE link AND stop candidate probe.
     if (push.rank != rank_ &&
-        push.new_state == static_cast<uint8_t>(RankState::OFFLINE)) {
+        push.new_state == static_cast<uint8_t>(RankState::Offline)) {
         effects.push_back(DisconnectLink{push.rank});
         effects.push_back(StopReconnect{push.rank});
     }
@@ -223,11 +223,11 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
 AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
     AgentApplyResult effects;
 
-    rank_state_ = RankState::OFFLINE;
-    global_rank_states_.fill(RankState::OFFLINE);
+    rank_state_ = RankState::Offline;
+    global_rank_states_.fill(RankState::Offline);
     link_connected_.fill(false);
     last_reported_peer_status_.fill(false);
-    rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::OFFLINE));
+    rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::Offline));
     for (auto& conn : rank_connections_) conn.reset();
 
     effects.push_back(DisconnectAllLinks{});
@@ -250,7 +250,7 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
     const TransferObservationEvent& event) {
     AgentApplyResult effects;
 
-    if (rank_state_ == RankState::OFFLINE) return effects;
+    if (rank_state_ == RankState::Offline) return effects;
 
     TransferObservationReport req;
     req.group_id = event.group_id;

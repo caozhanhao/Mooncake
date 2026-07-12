@@ -60,6 +60,23 @@ class RpcClient {
     RpcClient() = default;
     ~RpcClient() = default;
 
+   private:
+    template <typename T>
+    static void setRpcError(T&, ...) {}  // fallback: do nothing
+
+    template <typename T>
+    static auto setRpcError(T& resp, const std::string& msg)
+        -> decltype(resp.reject_reason, void()) {
+        resp.reject_reason = msg;
+    }
+
+    template <typename T>
+    static auto setRpcError(T& resp, const std::string& msg)
+        -> decltype(resp.error_msg, void()) {
+        resp.error_msg = msg;
+    }
+
+   public:
     // Synchronous call.
     template <auto Func, typename Req>
     auto call(const std::string& addr, Req req,
@@ -72,13 +89,19 @@ class RpcClient {
         if (ec) {
             LOG(ERROR) << "RpcClient: call connect failed to " << addr << ": "
                        << ec.message();
-            return ResponseType{};
+            ResponseType resp{};
+            setRpcError(resp,
+                        "RPC connect failed: " + std::string(ec.message()));
+            return resp;
         }
         auto result =
             async_simple::coro::syncAwait(client->call_for<Func>(timeout, req));
         if (!result) {
             LOG(ERROR) << "RpcClient: call RPC failed: " << result.error().msg;
-            return ResponseType{};
+            ResponseType resp{};
+            setRpcError(resp,
+                        "RPC call failed: " + std::string(result.error().msg));
+            return resp;
         }
         return std::move(result.value());
     }
