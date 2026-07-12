@@ -127,7 +127,7 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
         if (push.view.members[r].hasEndpoint()) {
             new_epoch = push.view.members[r].endpoint->endpoint_epoch;
         }
-        if (old_epoch != 0 && new_epoch != 0 && new_epoch != old_epoch) {
+        if (new_epoch != 0 && new_epoch != old_epoch) {
             effects.push_back(RefreshPeerLink{r});
         }
     }
