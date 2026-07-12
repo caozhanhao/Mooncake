@@ -290,10 +290,6 @@ void LinkManager::tearDownPeerLink(GlobalRank peer, bool stop_reconnect) {
         link.is_candidate = false;
     }
 
-    // Immediately clear the worker read model so worker threads stop
-    // constructing new transfer requests to this peer.  The LinkDown
-    // event callback may also call publishLinkDown, but that is
-    // idempotent (atomic store 0).
     publishLinkDown(peer);
 
     emit(TELinkEvent{.kind = TELinkEvent::Kind::LinkDown, .peer = peer});

@@ -90,9 +90,7 @@ MooncakeBackend::MooncakeBackend(
       ctx_(ctx),
       options_(std::move(options)),
       isCpu_(isCpu),
-      agent_(agent),
-      member_bitmap_(ctx_.max_world_size),
-      endpoint_present_bitmap_(ctx_.max_world_size) {
+      agent_(agent) {
     const int rank = distBackendOpts.group_rank;
     const int size = distBackendOpts.group_size;
     const auto& globalRanks = distBackendOpts.global_ranks_in_group;
@@ -1012,23 +1010,7 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
     std::vector<bool> output;
     output.reserve(ranks.size());
     for (const int rank : ranks) {
-        TORCH_CHECK(rank >= 0 && rank < kMaxNumRanks, "Rank out of range");
-        // ranks are in-group (local) ranks; resolve to global rank via
-        // the rank_order mapping stored in this backend's GroupView.
-        GlobalRank global_rank = meta_->rank_order[rank];
-        // Guarantee that recover_ranks() will succeed: the peer must be a
-        // member of this group, have an endpoint published for the current
-        // session (the Coordinator tells us this via GroupMember::endpoint),
-        // and be Healthy in the Coordinator's view.  Local TE link state is
-        // intentionally excluded; the Coordinator's isActivatableSet() will
-        // retry if links are not yet mutually ready.
-        bool healthy = agent_.isRankHealthy(global_rank);
-        bool member =
-            member_bitmap_[global_rank].load(std::memory_order_acquire);
-        bool endpoint_present = endpoint_present_bitmap_[global_rank].load(
-            std::memory_order_acquire);
-        bool ready = healthy && member && endpoint_present;
-        output.push_back(ready);
+        output.push_back(agent_.maybeActivatable(meta_->group_id, rank));
     }
     return output;
 }
@@ -1146,26 +1128,6 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view) {
                 }
             }
         }
-    }
-
-    // Update the membership/endpoint-present bitmaps used by getPeerState().
-    // This lets callers wait until a replacement/extension rank has joined
-    // this group and published an endpoint before calling recover_ranks().
-    // TE link readiness is intentionally NOT part of this guarantee.
-    //
-    // member_bitmap_ is true for any rank that is currently a member of this
-    // group (active or inactive).  endpoint_present_bitmap_ is true when the
-    // Coordinator has told us that the rank has a valid endpoint for its
-    // current session (GroupMember::endpoint is set).  Because the Coordinator
-    // clears stale endpoints on session changes, this bitmap is authoritative.
-    for (int i = 0; i < ctx_.max_world_size; ++i) {
-        const auto& member = view.members[i];
-        bool is_member = member.isMember();
-        member_bitmap_[i].store(is_member, std::memory_order_release);
-
-        bool endpoint_present = member.hasEndpoint();
-        endpoint_present_bitmap_[i].store(endpoint_present,
-                                          std::memory_order_release);
     }
 
     // Keep the Python-visible activeRanksTensor in sync with the view.

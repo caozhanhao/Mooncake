@@ -97,6 +97,9 @@ class AgentInterface {
 
     // Process-level rank health (thread-safe).
     virtual bool isRankHealthy(GlobalRank rank) = 0;
+
+    // Best-effort: Healthy + isMember + hasEndpoint (thread-safe).
+    virtual bool maybeActivatable(GroupId group_id, InGroupRank rank) = 0;
 };
 
 class AgentHost;
@@ -163,6 +166,9 @@ class AgentHost : public AgentInterface {
     }
     bool isRankHealthy(GlobalRank rank) override {
         return agent_.getRankState(rank) == RankState::Healthy;
+    }
+    bool maybeActivatable(GroupId group_id, InGroupRank rank) override {
+        return agent_.maybeActivatable(group_id, rank);
     }
     void postPeerJoined(PeerJoinedPush push);
     void postRankStateUpdate(RankStateUpdatePush push);

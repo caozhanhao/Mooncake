@@ -66,9 +66,8 @@ class AgentStateMachine {
             global_rank_states_[rank].load(std::memory_order_acquire));
     }
 
-    // Per-group membership queries (thread-safe).
-    bool isGroupMember(GroupId group_id, GlobalRank rank) const;
-    bool hasGroupEndpoint(GroupId group_id, GlobalRank rank) const;
+    // Best-effort local estimate: Healthy && isMember && hasEndpoint.
+    bool maybeActivatable(GroupId group_id, InGroupRank rank) const;
 
    private:
     GlobalRank rank_;
@@ -84,12 +83,17 @@ class AgentStateMachine {
     std::vector<bool> last_reported_peer_status_;
     std::vector<std::optional<RankConnectionMetadata>> rank_connections_;
 
+    std::unordered_map<GroupId, std::vector<std::atomic<bool>>>
+        maybe_activatable_;
+
     CoordinatorConnection coordinator_connection_ =
         CoordinatorConnection::Disconnected;
 
     bool rankInRange(GlobalRank rank) const {
         return 0 <= rank && rank < max_world_size_;
     }
+
+    void updateMaybeActivatable(GroupId group_id, InGroupRank rank);
 };
 
 }  // namespace mooncake

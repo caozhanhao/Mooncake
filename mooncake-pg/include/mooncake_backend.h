@@ -336,16 +336,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     int max_group_size_ =
         0;  // per-group capacity (max active members for this group)
 
-    // Per-rank membership/endpoint-present bitmaps for this group, updated from
-    // the authoritative GroupView.  getPeerState() uses them to guarantee that
-    // a peer is ready to be activated: it must be a group member (Inactive or
-    // Active), have an endpoint published for the current session (the
-    // Coordinator tells us this via GroupMember::endpoint), and be Healthy in
-    // the Coordinator's view.  We intentionally do NOT require the local TE
-    // link to be up here.
-    std::vector<std::atomic<bool>> member_bitmap_;
-    std::vector<std::atomic<bool>> endpoint_present_bitmap_;
-
     // P2P async infrastructure
     // p2p_proxy_ is created in MooncakeBackend, but can live longer than
     // MooncakeBackend. Because it is shared in P2PDeviceWorker, which must

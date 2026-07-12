@@ -83,6 +83,16 @@ AgentApplyResult AgentStateMachine::handleRankStateUpdate(
         rank_state_ = static_cast<RankState>(push.new_state);
     }
 
+    // Health changed: refresh maybe_activatable_ for this rank in all groups.
+    for (const auto& [group_id, view] : groups_) {
+        for (size_t igr = 0; igr < view.rank_order.size(); ++igr) {
+            if (view.rank_order[igr] == push.rank) {
+                updateMaybeActivatable(group_id, igr);
+                break;
+            }
+        }
+    }
+
     // Remote Offline: tear down TE link AND stop candidate probe.
     if (push.rank != rank_ &&
         push.new_state == static_cast<uint8_t>(RankState::Offline)) {
@@ -146,6 +156,11 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
 
     it->second = push.view;
 
+    // Update maybe_activatable_ for each member rank.
+    for (size_t igr = 0; igr < push.view.rank_order.size(); ++igr) {
+        updateMaybeActivatable(push.group_id, igr);
+    }
+
     effects.push_back(ApplyViewToBackend{push.group_id, push.view});
     return effects;
 }
@@ -206,6 +221,9 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
     // Populate groups (view includes rank_order and member state).
     for (const auto& gv : resp.groups) {
         groups_[gv.group_id] = gv;
+        for (size_t igr = 0; igr < gv.rank_order.size(); ++igr) {
+            updateMaybeActivatable(gv.group_id, igr);
+        }
         effects.push_back(ApplyViewToBackend{gv.group_id, gv});
     }
 
@@ -228,6 +246,7 @@ AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
 
     rank_state_ = RankState::Offline;
     groups_.clear();
+    maybe_activatable_.clear();
     global_rank_states_ =
         std::vector<std::atomic<uint8_t>>(max_world_size_);
     std::fill(link_connected_.begin(), link_connected_.end(), false);
@@ -288,6 +307,37 @@ void AgentStateMachine::mergeObservationEvent(
         acc.succeeded_ranks[peer] = next.succeeded_ranks[peer];
         acc.failed_ranks_hint[peer] = next.failed_ranks_hint[peer];
     }
+}
+
+bool AgentStateMachine::maybeActivatable(GroupId group_id,
+                                         InGroupRank rank) const {
+    auto it = maybe_activatable_.find(group_id);
+    if (it == maybe_activatable_.end()) return false;
+    if (static_cast<size_t>(rank) >= it->second.size()) return false;
+    return it->second[rank].load(std::memory_order_acquire);
+}
+
+void AgentStateMachine::updateMaybeActivatable(GroupId group_id,
+                                                InGroupRank rank) {
+    auto it = groups_.find(group_id);
+    if (it == groups_.end()) return;
+    const auto& view = it->second;
+    if (static_cast<size_t>(rank) >= view.rank_order.size()) return;
+    GlobalRank gr = view.rank_order[rank];
+    if (!rankInRange(gr)) return;
+
+    auto& v = maybe_activatable_[group_id];
+    if (v.size() < view.rank_order.size()) {
+        v = std::vector<std::atomic<bool>>(view.rank_order.size());
+    }
+
+    bool healthy = static_cast<RankState>(
+                       global_rank_states_[gr].load(
+                           std::memory_order_relaxed)) == RankState::Healthy;
+    bool member = view.members[gr].isMember();
+    bool endpoint = view.members[gr].hasEndpoint();
+
+    v[rank].store(healthy && member && endpoint, std::memory_order_release);
 }
 
 }  // namespace mooncake
