@@ -651,18 +651,21 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
     }
 
     // Mark the failed rank as inactive in every group it still belongs to.
+    // For auto_deactivate=off groups, skip — the application controls
+    // membership via manual deactivate_rank / recover_ranks calls.
     std::vector<GroupId> groups_to_erase;
     for (auto& [group_id, view] : group_views_) {
         if (!rankInValidRange(rank)) continue;
         auto& member = view.members[rank];
-        if (member.status == GroupMemberStatus::kActive) {
-            member.status = GroupMemberStatus::kInactive;
-            member.agent_session_epoch = std::nullopt;
-            member.endpoint = std::nullopt;
-            view.epoch++;
-            effects.push_back(ViewUpdateEffect{view, {}, GeneralAckRoute{}});
-            flushPendingSyncs(group_id, effects);
-        }
+        if (member.status != GroupMemberStatus::kActive) continue;
+        if (!group_auto_deactivate_[group_id]) continue;
+
+        member.status = GroupMemberStatus::kInactive;
+        member.agent_session_epoch = std::nullopt;
+        member.endpoint = std::nullopt;
+        view.epoch++;
+        effects.push_back(ViewUpdateEffect{view, {}, GeneralAckRoute{}});
+        flushPendingSyncs(group_id, effects);
         if (canEraseGroup(view)) {
             groups_to_erase.push_back(group_id);
         }

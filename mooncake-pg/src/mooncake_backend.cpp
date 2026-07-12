@@ -1097,10 +1097,11 @@ ProposeViewUpdateResponse MooncakeBackend::activateRanks(
 
 ProposeViewUpdateResponse MooncakeBackend::deactivateRanks(
     const std::vector<int>& ranks) {
+    // ranks are in-group (local) ranks; map to global ranks via rank_order.
     std::vector<GlobalRank> global_ranks;
     global_ranks.reserve(ranks.size());
     for (int r : ranks) {
-        global_ranks.push_back(r);
+        global_ranks.push_back(meta_->rank_order[r]);
     }
     auto resp = agent_.proposeDeactivate(meta_->group_id, global_ranks);
     if (resp.status == ViewUpdateStatus::Rejected) {
