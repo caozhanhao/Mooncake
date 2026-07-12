@@ -332,39 +332,22 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
     }
     auto& reporter = ranks_[req.reporter_rank];
 
-    for (const auto& obs : req.observations) {
-        auto view_it = group_views_.find(obs.group_id);
-        if (view_it == group_views_.end()) continue;
-        uint64_t current_epoch = view_it->second.epoch;
+    bool has_negative =
+        applyLinkStatusUpdate(reporter, req.attempted_ranks,
+                              req.succeeded_ranks, req.failed_ranks_hint);
 
-        if (obs.group_epoch < current_epoch) continue;
-
-        bool has_negative =
-            applyLinkStatusUpdate(reporter, obs.attempted_ranks,
-                                  obs.succeeded_ranks, obs.failed_ranks_hint);
-
-        if (has_negative) {
-            openReconciliationWindow(obs.group_id, obs.group_epoch);
-        }
+    if (has_negative) {
+        openReconciliationWindow();
     }
     return result;
 }
 
-void CentralizedCoordinatorStateMachine::openReconciliationWindow(
-    GroupId group_id, uint64_t report_epoch) {
+void CentralizedCoordinatorStateMachine::openReconciliationWindow() {
     if (!reconciliation_ctx_.active) {
         reconciliation_ctx_.active = true;
         reconciliation_ctx_.deadline =
             std::chrono::steady_clock::now() + fault_reconciliation_window_;
-        reconciliation_ctx_.groups_in_window.clear();
     }
-    auto it = reconciliation_ctx_.groups_in_window.find(group_id);
-    if (it == reconciliation_ctx_.groups_in_window.end()) {
-        reconciliation_ctx_.groups_in_window[group_id] = report_epoch;
-    } else if (report_epoch > it->second) {
-        it->second = report_epoch;
-    }
-    // report_epoch < it->second: stale, silently ignored.
 }
 
 bool CentralizedCoordinatorStateMachine::applyLinkStatusUpdate(
@@ -426,13 +409,13 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
 
     // Apply piggybacked observation inline.
     if (req.observation.has_value()) {
-        const auto& obs = *req.observation;
         bool has_negative =
-            applyLinkStatusUpdate(reporter, obs.attempted_ranks,
-                                  obs.succeeded_ranks, obs.failed_ranks_hint);
+            applyLinkStatusUpdate(reporter, req.observation->attempted_ranks,
+                                  req.observation->succeeded_ranks,
+                                  req.observation->failed_ranks_hint);
 
         if (has_negative) {
-            openReconciliationWindow(req.group_id, obs.group_epoch);
+            openReconciliationWindow();
         }
     }
 
@@ -446,8 +429,7 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
         return result;
     }
 
-    if (reconciliation_ctx_.active &&
-        reconciliation_ctx_.groups_in_window.count(req.group_id)) {
+    if (reconciliation_ctx_.active) {
         pending_syncs_[req.group_id][req.reporter_rank].push_back(sync_id);
         return result;
     }
@@ -541,38 +523,8 @@ CoordinatorApplyResult<void> CentralizedCoordinatorStateMachine::tick() {
     // Fault reconciliation window.
     if (reconciliation_ctx_.active && now >= reconciliation_ctx_.deadline) {
         reconciliation_ctx_.active = false;
-        auto groups_to_reconcile =
-            std::move(reconciliation_ctx_.groups_in_window);
-        reconciliation_ctx_.groups_in_window.clear();
-
         updateRankStates(result.effects);
         applyAutoDeactivate(result.effects);
-
-        for (const auto& [group_id, entry_epoch] : groups_to_reconcile) {
-            auto it = group_views_.find(group_id);
-            if (it == group_views_.end()) {
-                // Group was destroyed while the window was open.
-                rejectPendingSyncs(group_id, "group was destroyed",
-                                   result.effects);
-                continue;
-            }
-            GroupView& view = it->second;
-
-            if (view.epoch != entry_epoch) {
-                // A newer decision has already advanced the epoch; pending
-                // syncs will be resolved when those newer ViewUpdates are
-                // ACKed.
-                continue;
-            }
-
-            view.epoch++;
-
-            result.effects.push_back(ViewUpdateEffect{view});
-
-            LOG(INFO) << "[COORD] reconciled group=" << group_id
-                      << " epoch=" << view.epoch;
-        }
-
         checkGroupTransitions(result.effects);
     }
 

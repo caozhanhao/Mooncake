@@ -19,18 +19,10 @@
 
 namespace mooncake {
 
-// PeerReadHandle  - lock-free handle returned by resolvePeer().
-struct PeerReadHandle {
-    TransferMetadata::SegmentID target_id;
-};
-
-// TELinkEvent  - emitted when a physical TE link transitions up/down.
-
 struct TELinkEvent {
     enum class Kind { LinkUp, LinkDown };
     Kind kind = Kind::LinkDown;
     GlobalRank peer = kInvalidGlobalRank;
-    std::optional<TransferMetadata::SegmentID> target_id;
 };
 
 // Process-level manager for shared TE states.
@@ -38,36 +30,23 @@ class LinkManager {
    public:
     LinkManager() = default;
 
-    // Initialize.  Must be called once, before any backend uses it.
-    // Idempotent  - second call is a no-op.
     void init(GlobalRank rank, int max_world_size, TransferEngine* engine);
 
     bool isInitialized() const {
         return initialized_.load(std::memory_order_acquire);
     }
 
-    // Shut down the poller thread and release all TE connections.
     void shutdown();
 
     std::string localServerName() const;
 
-    // Return the local warmup recv region base address (0 if warmup is
-    // skipped, e.g. MNNVL fabric).  Published to peers via RegisterAgentRequest
-    // so they can RDMA-write the warmup handshake signal.
     uint64_t getWarmupRecvAddr() const;
 
-    // Mark a peer as a connection candidate and start low-frequency probe.
-    // Safe to call when the peer is already a candidate or connected.
     void enablePeerProbe(GlobalRank peer, const std::string& server_name,
                          uint64_t warmup_recv_addr = 0);
 
-    // Tear down the TE link to this peer but keep candidate=true so the
-    // peer will be re-probed.  Called on LinkDown events and explicit
-    // disconnect commands.
     void disconnect(GlobalRank peer);
 
-    // Stop candidate probe entirely.  Only called when the peer transitions
-    // to Offline (control-plane dead).
     void stopReconnect(GlobalRank peer);
 
     bool isConnected(GlobalRank peer) const;
@@ -75,25 +54,9 @@ class LinkManager {
     using EventCallback = std::function<void(TELinkEvent)>;
     void setEventCallback(EventCallback callback);
 
-    // Publish the Coordinator-authoritative RankState snapshot for all peers.
-    // Called by AgentHost from the executor thread.
-    void setRankStates(const std::vector<uint8_t>& states);
+    std::optional<TransferMetadata::SegmentID> resolvePeer(
+        GlobalRank peer) const;
 
-    // Check whether the TE link to peer is up.  Returns a handle with the
-    // remote SegmentID on success.  Does NOT check RankState or endpoint
-    // (endpoint is read directly from GroupView by the worker).
-    std::optional<PeerReadHandle> resolvePeer(GlobalRank peer) const;
-
-    // Check whether the peer is ready for group operations:
-    bool isRankReady(GlobalRank peer) const;
-
-    bool isRankHealthy(GlobalRank peer) const;
-
-    // Reopen the TE segment for `peer` without publishing link-up/link-down
-    // events.  The link_connected flag stays set throughout.  Used when the
-    // peer's memory registration changed (e.g. after destroy+reinit) and the
-    // cached segment ID needs a fresh rkey, but the control-plane link state
-    // should not be disturbed.
     void refreshPeerSegment(GlobalRank peer);
 
     void publishLinkUp(GlobalRank peer, TransferMetadata::SegmentID target_id);
@@ -109,8 +72,6 @@ class LinkManager {
         return 0 <= peer && peer < max_world_size_;
     }
 
-    // Resource state (mutex-protected)
-
     enum class PeerLinkState : uint8_t {
         Idle = 0,
         WaitingWarmupTransfer,
@@ -122,12 +83,11 @@ class LinkManager {
         PeerLinkState state = PeerLinkState::Idle;
         std::string server_name;
         bool is_candidate = false;
-        bool skip_warmup = false;  // MNNVL fabric  - warmup skipped
+        bool skip_warmup = false;
 
         std::optional<TransferMetadata::SegmentID> target_id;
         std::optional<BatchID> warmup_batch_id;
-        uint64_t warmup_recv_addr =
-            0;  // remote warmup recv region base address
+        uint64_t warmup_recv_addr = 0;
 
         // Low-frequency probe timing
         std::chrono::steady_clock::time_point next_probe_time;
@@ -141,13 +101,10 @@ class LinkManager {
     std::vector<PeerLink> peers_;
     mutable std::mutex peers_mutex_;
 
-    // Worker read model (atomic, lock-free)
-
     struct PeerReadState {
-        std::atomic<uint8_t> rank_state{0};      // RankState cast to uint8_t
         std::atomic<uint64_t> version{0};        // incremented on every link
-                                                 // state change; resolvePeer
-                                                 // uses it to detect torn reads
+                                                   // state change; resolvePeer
+                                                   // uses it to detect torn reads
         std::atomic<uint8_t> link_connected{0};  // 1 = TE link is up
         std::atomic<TransferMetadata::SegmentID>
             target_id{};  // remote segment handle
@@ -155,15 +112,12 @@ class LinkManager {
 
     std::vector<PeerReadState> read_state_;
 
-    // Poller infrastructure
-
     GlobalRank rank_ = kInvalidGlobalRank;
     int max_world_size_ = 0;
     TransferEngine* engine_ = nullptr;
     std::string local_server_name_;
 
-    // Warmup region  - process-level, allocated once in init().
-    // nullptr when skip_warmup_ is true (MNNVL fabric).
+    // Warmup region
     std::unique_ptr<int32_t[]> warmup_send_region_;
     std::unique_ptr<int32_t[]> warmup_recv_region_;
     bool skip_warmup_ = false;

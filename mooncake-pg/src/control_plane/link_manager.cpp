@@ -108,8 +108,6 @@ void LinkManager::init(GlobalRank rank, int max_world_size,
 
     // Write read model for self.
     publishLinkUp(rank_, self_target_id);
-    read_state_[rank_].rank_state.store(
-        static_cast<uint8_t>(RankState::Healthy), std::memory_order_release);
 
     // Start poller thread.
     poller_running_.store(true, std::memory_order_release);
@@ -207,48 +205,21 @@ void LinkManager::setEventCallback(EventCallback callback) {
     event_callback_ = std::move(callback);
 }
 
-void LinkManager::setRankStates(const std::vector<uint8_t>& states) {
-    for (size_t i = 0;
-         i < states.size() && i < static_cast<size_t>(max_world_size_); ++i) {
-        read_state_[i].rank_state.store(states[i], std::memory_order_release);
-    }
-}
-
-std::optional<PeerReadHandle> LinkManager::resolvePeer(GlobalRank peer) const {
+std::optional<TransferMetadata::SegmentID> LinkManager::resolvePeer(
+    GlobalRank peer) const {
     if (!rankInRange(peer)) return std::nullopt;
 
-    // Use a version counter to detect torn reads: if the link goes down and
-    // back up between reading link_connected and target_id, we could see a
-    // stale target_id.  Comparing versions before and after catches this.
     auto& rs = read_state_[peer];
 
     uint64_t v1 = rs.version.load(std::memory_order_acquire);
     if (rs.link_connected.load(std::memory_order_acquire) == 0)
         return std::nullopt;
-    PeerReadHandle handle;
-    handle.target_id = rs.target_id.load(std::memory_order_acquire);
+    auto target_id = rs.target_id.load(std::memory_order_acquire);
     uint64_t v2 = rs.version.load(std::memory_order_acquire);
 
-    // If version changed, the link state was modified during our read  -
-    // target_id may be from a different LinkUp cycle.  Treat as
-    // disconnected.
     if (v1 != v2) return std::nullopt;
 
-    return handle;
-}
-
-bool LinkManager::isRankReady(GlobalRank peer) const {
-    if (!rankInRange(peer)) return false;
-    return read_state_[peer].rank_state.load(std::memory_order_acquire) ==
-               static_cast<uint8_t>(RankState::Healthy) &&
-           read_state_[peer].link_connected.load(std::memory_order_acquire) !=
-               0;
-}
-
-bool LinkManager::isRankHealthy(GlobalRank peer) const {
-    if (!rankInRange(peer)) return false;
-    return read_state_[peer].rank_state.load(std::memory_order_acquire) ==
-           static_cast<uint8_t>(RankState::Healthy);
+    return target_id;
 }
 
 void LinkManager::refreshPeerSegment(GlobalRank peer) {
@@ -262,7 +233,6 @@ void LinkManager::refreshPeerSegment(GlobalRank peer) {
     if (link.state != PeerLinkState::Connected) return;
     if (!link.target_id.has_value()) return;
 
-    // Close the old segment (stale rkey) and open a fresh one.
     engine_->closeSegment(link.target_id.value());
     engine_->removeLocalSegment(link.server_name);
     link.target_id = engine_->openSegment(link.server_name);
@@ -401,14 +371,13 @@ bool LinkManager::probePeer(GlobalRank peer) {
             link.target_id = segment_id;
 
             if (link.skip_warmup) {
-                // MNNVL fabric: connectivity is guaranteed, skip warmup
-                // handshake.
                 link.state = PeerLinkState::Connected;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
                 publishLinkUp(peer, segment_id);
-                emit(TELinkEvent{.kind = TELinkEvent::Kind::LinkUp,
-                                 .peer = peer,
-                                 .target_id = segment_id});
+                emit(TELinkEvent{
+                    .kind = TELinkEvent::Kind::LinkUp,
+                    .peer = peer,
+                });
                 return true;
             }
 
@@ -452,9 +421,10 @@ bool LinkManager::probePeer(GlobalRank peer) {
                 link.state = PeerLinkState::Connected;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
                 publishLinkUp(peer, link.target_id.value());
-                emit(TELinkEvent{.kind = TELinkEvent::Kind::LinkUp,
-                                 .peer = peer,
-                                 .target_id = link.target_id});
+                emit(TELinkEvent{
+                    .kind = TELinkEvent::Kind::LinkUp,
+                    .peer = peer,
+                });
                 return true;
             }
 
@@ -489,9 +459,10 @@ bool LinkManager::probePeer(GlobalRank peer) {
                 link.state = PeerLinkState::Connected;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
                 publishLinkUp(peer, link.target_id.value());
-                emit(TELinkEvent{.kind = TELinkEvent::Kind::LinkUp,
-                                 .peer = peer,
-                                 .target_id = link.target_id});
+                emit(TELinkEvent{
+                    .kind = TELinkEvent::Kind::LinkUp,
+                    .peer = peer,
+                });
                 return true;
             }
             // Still waiting  - don't advance backoff.

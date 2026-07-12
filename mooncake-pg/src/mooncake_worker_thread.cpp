@@ -407,8 +407,7 @@ void MooncakeWorker::startWorker() {
                                 }
                                 group->backend->getAgent()
                                     .pushTransferObservation(
-                                        group->group_id, std::move(attempted),
-                                        std::move(failed),
+                                        std::move(attempted), std::move(failed),
                                         std::move(succeeded));
                             }
                         }

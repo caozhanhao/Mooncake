@@ -11,11 +11,9 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     CHECK_LE(max_world_size_, kMaxNumRanks)
         << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
         << kMaxNumRanks << ")";
-    global_rank_states_.assign(max_world_size_, RankState::Offline);
+    global_rank_states_ = std::vector<std::atomic<uint8_t>>(max_world_size_);
     link_connected_.assign(max_world_size_, false);
     last_reported_peer_status_.assign(max_world_size_, false);
-    rank_state_snapshot_.assign(max_world_size_,
-                                static_cast<uint8_t>(RankState::Offline));
     rank_connections_.resize(max_world_size_);
 }
 
@@ -79,17 +77,19 @@ AgentApplyResult AgentStateMachine::handleRankStateUpdate(
         return effects;
     }
 
-    global_rank_states_[push.rank] = static_cast<RankState>(push.new_state);
+    global_rank_states_[push.rank].store(push.new_state,
+                                          std::memory_order_release);
+    if (push.rank == rank_) {
+        rank_state_ = static_cast<RankState>(push.new_state);
+    }
 
-    // Remote Offline: the control plane is dead (process may have exited).
-    // Tear down TE link AND stop candidate probe.
+    // Remote Offline: tear down TE link AND stop candidate probe.
     if (push.rank != rank_ &&
         push.new_state == static_cast<uint8_t>(RankState::Offline)) {
         effects.push_back(DisconnectLink{push.rank});
         effects.push_back(StopReconnect{push.rank});
     }
 
-    syncRankStateSnapshot(effects);
     return effects;
 }
 
@@ -197,8 +197,11 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
         return effects;
     }
     for (int32_t r = 0; r < max_world_size_; ++r) {
-        global_rank_states_[r] = resp.all_rank_states[r];
+        global_rank_states_[r].store(
+            static_cast<uint8_t>(resp.all_rank_states[r]),
+            std::memory_order_release);
     }
+    rank_state_ = resp.all_rank_states[rank_];
 
     // Populate groups (view includes rank_order and member state).
     for (const auto& gv : resp.groups) {
@@ -217,7 +220,6 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
     }
 
     coordinator_connection_ = CoordinatorConnection::Connected;
-    syncRankStateSnapshot(effects);
     return effects;
 }
 
@@ -226,26 +228,21 @@ AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
 
     rank_state_ = RankState::Offline;
     groups_.clear();
-    std::fill(global_rank_states_.begin(), global_rank_states_.end(),
-              RankState::Offline);
+    global_rank_states_ =
+        std::vector<std::atomic<uint8_t>>(max_world_size_);
     std::fill(link_connected_.begin(), link_connected_.end(), false);
     std::fill(last_reported_peer_status_.begin(),
               last_reported_peer_status_.end(), false);
-    std::fill(rank_state_snapshot_.begin(), rank_state_snapshot_.end(),
-              static_cast<uint8_t>(RankState::Offline));
     for (auto& conn : rank_connections_) conn.reset();
 
     effects.push_back(DisconnectAllLinks{});
     effects.push_back(ClearAllPeerMetadata{});
-    PublishRankStateSnapshot snapshot;
-    snapshot.states.assign(rank_state_snapshot_.begin(),
-                           rank_state_snapshot_.begin() + max_world_size_);
-    effects.push_back(std::move(snapshot));
 
     return effects;
 }
 
-std::optional<GroupObservation> AgentStateMachine::processTransferObservation(
+std::optional<TransferObservationReport>
+AgentStateMachine::processTransferObservation(
     const TransferObservationEvent& event) {
     if (rank_state_ == RankState::Offline) return std::nullopt;
 
@@ -259,12 +256,11 @@ std::optional<GroupObservation> AgentStateMachine::processTransferObservation(
         return std::nullopt;
     }
 
-    GroupObservation obs;
-    obs.group_id = event.group_id;
-    obs.group_epoch = getGroupView(event.group_id).epoch;
-    obs.attempted_ranks.assign(max_world_size_, 0);
-    obs.failed_ranks_hint.assign(max_world_size_, 0);
-    obs.succeeded_ranks.assign(max_world_size_, 0);
+    TransferObservationReport report;
+    report.reporter_rank = rank_;
+    report.attempted_ranks.assign(max_world_size_, 0);
+    report.failed_ranks_hint.assign(max_world_size_, 0);
+    report.succeeded_ranks.assign(max_world_size_, 0);
 
     bool has_changed = false;
 
@@ -273,14 +269,14 @@ std::optional<GroupObservation> AgentStateMachine::processTransferObservation(
         bool current = event.succeeded_ranks[peer];
         if (current != last_reported_peer_status_[peer]) {
             last_reported_peer_status_[peer] = current;
-            obs.attempted_ranks[peer] = 1;
-            obs.succeeded_ranks[peer] = current ? 1 : 0;
-            obs.failed_ranks_hint[peer] = current ? 0 : 1;
+            report.attempted_ranks[peer] = 1;
+            report.succeeded_ranks[peer] = current ? 1 : 0;
+            report.failed_ranks_hint[peer] = current ? 0 : 1;
             has_changed = true;
         }
     }
 
-    if (has_changed) return obs;
+    if (has_changed) return report;
     return std::nullopt;
 }
 
@@ -291,27 +287,6 @@ void AgentStateMachine::mergeObservationEvent(
         acc.attempted_ranks[peer] = 1;
         acc.succeeded_ranks[peer] = next.succeeded_ranks[peer];
         acc.failed_ranks_hint[peer] = next.failed_ranks_hint[peer];
-    }
-}
-
-void AgentStateMachine::syncRankStateSnapshot(AgentApplyResult& effects) {
-    bool snapshot_changed = false;
-    for (int r = 0; r < max_world_size_; ++r) {
-        uint8_t new_val = static_cast<uint8_t>(global_rank_states_[r]);
-        if (rank_state_snapshot_[r] != new_val) {
-            rank_state_snapshot_[r] = new_val;
-            snapshot_changed = true;
-        }
-    }
-
-    // Update self rank_state_ to track the Coordinator-authoritative state.
-    rank_state_ = global_rank_states_[rank_];
-
-    if (snapshot_changed) {
-        PublishRankStateSnapshot snapshot;
-        snapshot.states.assign(rank_state_snapshot_.begin(),
-                               rank_state_snapshot_.begin() + max_world_size_);
-        effects.push_back(std::move(snapshot));
     }
 }
 

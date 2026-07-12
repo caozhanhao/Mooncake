@@ -86,7 +86,7 @@ class AgentInterface {
         GroupId group_id, const std::vector<GlobalRank>& ranks) = 0;
 
     virtual void pushTransferObservation(
-        GroupId group_id, std::vector<uint8_t> attempted_ranks,
+        std::vector<uint8_t> attempted_ranks,
         std::vector<uint8_t> failed_ranks_hint,
         std::vector<uint8_t> succeeded_ranks) = 0;
 
@@ -94,6 +94,9 @@ class AgentInterface {
 
     // Accessors.
     virtual uint64_t getAgentSessionEpoch() = 0;
+
+    // Process-level rank health (thread-safe).
+    virtual bool isRankHealthy(GlobalRank rank) = 0;
 };
 
 class AgentHost;
@@ -148,8 +151,7 @@ class AgentHost : public AgentInterface {
     ProposeViewUpdateResponse proposeDeactivate(
         GroupId group_id, const std::vector<GlobalRank>& ranks) override;
 
-    void pushTransferObservation(GroupId group_id,
-                                 std::vector<uint8_t> attempted_ranks,
+    void pushTransferObservation(std::vector<uint8_t> attempted_ranks,
                                  std::vector<uint8_t> failed_ranks_hint,
                                  std::vector<uint8_t> succeeded_ranks) override;
 
@@ -158,6 +160,9 @@ class AgentHost : public AgentInterface {
     // Accessors.
     uint64_t getAgentSessionEpoch() override {
         return agent_.getAgentSessionEpoch();
+    }
+    bool isRankHealthy(GlobalRank rank) override {
+        return agent_.getRankState(rank) == RankState::Healthy;
     }
     void postPeerJoined(PeerJoinedPush push);
     void postRankStateUpdate(RankStateUpdatePush push);
@@ -214,10 +219,9 @@ class AgentHost : public AgentInterface {
     // Accessed only from the executor thread.
     std::unordered_map<GroupId, MooncakeBackend*> backends_;
 
-    // Pending observations, merged on push by worker thread.
-    // Swapped out and processed by the executor thread.
-    std::unordered_map<GroupId, TransferObservationEvent> pending_observations_;
-    std::mutex pending_observations_mutex_;
+    // Pending observation, merged on push by worker thread.
+    std::optional<TransferObservationEvent> pending_observation_;
+    std::mutex pending_observation_mutex_;
 
     void startAgentRegistration();
     void tick();

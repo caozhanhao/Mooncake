@@ -109,18 +109,12 @@ struct UnregisterGroupRequest {
     uint64_t agent_session_epoch = 0;
 };
 
-struct GroupObservation {
-    GroupId group_id;
-    uint64_t group_epoch = 0;  // GroupView epoch at time of observation
-    std::vector<uint8_t> attempted_ranks;
-    std::vector<uint8_t> failed_ranks_hint;
-    std::vector<uint8_t> succeeded_ranks;
-};
-
 struct TransferObservationReport {
     GlobalRank reporter_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
-    std::vector<GroupObservation> observations;
+    std::vector<uint8_t> attempted_ranks;
+    std::vector<uint8_t> failed_ranks_hint;
+    std::vector<uint8_t> succeeded_ranks;
 };
 
 // Agent -> Coordinator: per-peer link state change, triggered by LinkManager
@@ -143,8 +137,8 @@ struct SyncAfterFailureRequest {
     uint64_t agent_session_epoch = 0;
     uint64_t current_epoch = 0;  // Agent's local GroupView epoch at call time
 
-    // Piggybacked observation (dedup'd by processTransferObservation).
-    std::optional<GroupObservation> observation;
+    // Piggybacked observation.
+    std::optional<TransferObservationReport> observation;
 };
 
 enum class SyncAfterFailureStatus : uint8_t {
@@ -234,10 +228,6 @@ struct DisconnectAllLinks {};
 
 struct ClearAllPeerMetadata {};
 
-struct PublishRankStateSnapshot {
-    std::vector<uint8_t> states;
-};
-
 struct ApplyViewToBackend {
     GroupId group_id;
     GroupView view;
@@ -267,9 +257,8 @@ struct NotifyRanksActivated {
 using AgentEffect =
     std::variant<EnablePeerProbe, DisconnectLink, StopReconnect,
                  ClearPeerMetadata, DisconnectAllLinks, ClearAllPeerMetadata,
-                 PublishRankStateSnapshot, ApplyViewToBackend,
-                 MarkBackendViewStale, NotifyTEUnreachable, RefreshPeerLink,
-                 NotifyGroupReady, NotifyRanksActivated>;
+                 ApplyViewToBackend, MarkBackendViewStale, NotifyTEUnreachable,
+                 RefreshPeerLink, NotifyGroupReady, NotifyRanksActivated>;
 
 // Results produced by the Coordinator/Agent state machine
 

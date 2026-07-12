@@ -283,19 +283,17 @@ ProposeViewUpdateResponse AgentHost::proposeDeactivate(
     return proposeViewUpdateInternal(group_id, ranks, /*is_activation=*/false);
 }
 
-void AgentHost::pushTransferObservation(GroupId group_id,
-                                        std::vector<uint8_t> attempted_ranks,
+void AgentHost::pushTransferObservation(std::vector<uint8_t> attempted_ranks,
                                         std::vector<uint8_t> failed_ranks,
                                         std::vector<uint8_t> succeeded_ranks) {
-    TransferObservationEvent event{group_id, std::move(attempted_ranks),
+    TransferObservationEvent event{std::move(attempted_ranks),
                                    std::move(failed_ranks),
                                    std::move(succeeded_ranks)};
-    std::lock_guard<std::mutex> lock(pending_observations_mutex_);
-    auto it = pending_observations_.find(group_id);
-    if (it == pending_observations_.end()) {
-        pending_observations_[group_id] = std::move(event);
+    std::lock_guard<std::mutex> lock(pending_observation_mutex_);
+    if (!pending_observation_.has_value()) {
+        pending_observation_ = std::move(event);
     } else {
-        agent_.mergeObservationEvent(it->second, event);
+        agent_.mergeObservationEvent(*pending_observation_, event);
     }
 }
 
@@ -306,11 +304,16 @@ SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
     req.agent_session_epoch = agent_.getAgentSessionEpoch();
 
     executor_.postAndWait([this, &req]() {
-        std::lock_guard<std::mutex> lock(pending_observations_mutex_);
-        auto it = pending_observations_.find(req.group_id);
-        if (it != pending_observations_.end()) {
-            req.observation = agent_.processTransferObservation(it->second);
-            pending_observations_.erase(it);
+        TransferObservationEvent ev;
+        {
+            std::lock_guard<std::mutex> lock(pending_observation_mutex_);
+            if (pending_observation_.has_value()) {
+                ev = std::move(*pending_observation_);
+                pending_observation_.reset();
+            }
+        }
+        if (!ev.attempted_ranks.empty()) {
+            req.observation = agent_.processTransferObservation(ev);
         }
         req.current_epoch = agent_.getGroupView(req.group_id).epoch;
     });
@@ -349,34 +352,16 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
 
 void AgentHost::postTELinkEvent(TELinkEvent event) {
     executor_.post([this, event = std::move(event)]() {
-        if (event.kind == TELinkEvent::Kind::LinkUp) {
-            if (event.target_id.has_value()) {
-                // LinkManager already updated the read model (publishLinkUp)
-                // before emitting this event  - just update the state machine.
-                runEffects(agent_.handleLinkStateChange(event.peer, true));
-            } else {
-                LOG(WARNING) << "AgentHost: LinkUp event for peer "
-                             << event.peer << " without target_id; ignoring.";
-                return;
-            }
-        } else {
-            // LinkDown: LinkManager already called publishLinkDown in
-            // tearDownPeerLink.  P2P reset is modeled as a
-            // ResetPeerP2PState effect from handleLinkStateChange.
-            runEffects(agent_.handleLinkStateChange(event.peer, false));
-        }
+        auto is_up = (event.kind == TELinkEvent::Kind::LinkUp);
+        runEffects(agent_.handleLinkStateChange(event.peer, is_up));
 
-        // Report the link state change event to the Coordinator so it can
-        // update the authoritative link_status.  This is event-driven (only
-        // fires on actual LinkUp/LinkDown transitions), avoiding the
-        // periodic-overwrite problem that heartbeat-based link_status had.
         if (rpc_client_ && !coordinator_addr_.empty()) {
             rpc_client_->send<&CoordinatorRpcService::reportLinkStateChange>(
                 coordinator_addr_,
                 LinkStateChangeReport{
                     .reporter_rank = rank_,
                     .peer = event.peer,
-                    .is_up = (event.kind == TELinkEvent::Kind::LinkUp),
+                    .is_up = is_up,
                     .agent_session_epoch = agent_.getAgentSessionEpoch(),
                 });
         }
@@ -475,26 +460,22 @@ void AgentHost::tick() {
         return;
     }
 
-    // Flush pending observations.
-    std::unordered_map<GroupId, TransferObservationEvent> batch;
+    // Flush pending observation.
+    TransferObservationEvent ev;
     {
-        std::lock_guard<std::mutex> lock(pending_observations_mutex_);
-        batch.swap(pending_observations_);
-    }
-    if (!batch.empty()) {
-        TransferObservationReport report;
-        report.reporter_rank = rank_;
-        report.agent_session_epoch = agent_.getAgentSessionEpoch();
-        for (auto& [group_id, ev] : batch) {
-            auto obs = agent_.processTransferObservation(ev);
-            if (obs.has_value()) {
-                report.observations.push_back(std::move(*obs));
-            }
+        std::lock_guard<std::mutex> lock(pending_observation_mutex_);
+        if (pending_observation_.has_value()) {
+            ev = std::move(*pending_observation_);
+            pending_observation_.reset();
         }
-        if (!report.observations.empty()) {
+    }
+    if (!ev.attempted_ranks.empty()) {
+        auto report = agent_.processTransferObservation(ev);
+        if (report.has_value()) {
+            report->agent_session_epoch = agent_.getAgentSessionEpoch();
             rpc_client_
                 ->send<&CoordinatorRpcService::reportTransferObservation>(
-                    coordinator_addr_, std::move(report));
+                    coordinator_addr_, std::move(*report));
         }
     }
 
@@ -546,9 +527,6 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                             link_manager_.publishLinkDown(i);
                         }
                     }
-                },
-                [this](const PublishRankStateSnapshot& e) {
-                    link_manager_.setRankStates(e.states);
                 },
                 [this](const ApplyViewToBackend& e) {
                     withBackend(e.group_id, [&](auto backend) {

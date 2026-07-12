@@ -178,8 +178,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     struct FaultReconciliationContext {
         bool active = false;
         std::chrono::steady_clock::time_point deadline;
-        // group_id -> epoch at which the group entered the window.
-        std::unordered_map<GroupId, uint64_t> groups_in_window;
     };
     FaultReconciliationContext reconciliation_ctx_;
     std::chrono::microseconds fault_reconciliation_window_;
@@ -212,10 +210,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     // --- Fault reconciliation ---
 
-    // Open the fault reconciliation window and register a group for
-    // reconciliation.  Stale epochs (report_epoch < recorded) are silently
-    // ignored.
-    void openReconciliationWindow(GroupId group_id, uint64_t report_epoch);
+    void openReconciliationWindow();
 
     // Apply transfer observation bit-vectors to a reporter's link_status.
     // Returns true when at least one peer was reported as failed.

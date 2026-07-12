@@ -1022,7 +1022,7 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
         // and be Healthy in the Coordinator's view.  Local TE link state is
         // intentionally excluded; the Coordinator's isActivatableSet() will
         // retry if links are not yet mutually ready.
-        bool healthy = ctx_.link_manager.isRankHealthy(global_rank);
+        bool healthy = agent_.isRankHealthy(global_rank);
         bool member =
             member_bitmap_[global_rank].load(std::memory_order_acquire);
         bool endpoint_present = endpoint_present_bitmap_[global_rank].load(
@@ -1137,7 +1137,7 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view) {
             {
                 auto handle = ctx_.link_manager.resolvePeer(global_rank);
                 if (handle) {
-                    meta_->segmentIDs[local_rank] = handle->target_id;
+                    meta_->segmentIDs[local_rank] = *handle;
                 } else {
                     LOG(ERROR) << "applyViewUpdate rank=" << meta_->globalRank
                                << ", TE link to peer=" << global_rank

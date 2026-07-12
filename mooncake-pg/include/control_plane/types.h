@@ -133,11 +133,9 @@ struct GroupView {
     std::vector<GroupMember> members;    // indexed by GlobalRank
 };
 
-// TransferObservationEvent — worker thread → Agent queue.
-// Bit-vectors are indexed by GlobalRank (size kMaxNumRanks).
-// Producers translate InGroupRank peers to GlobalRank via rank_order.
+// TransferObservationEvent — process-level, worker thread → Agent.
+// Bit-vectors are indexed by GlobalRank.
 struct TransferObservationEvent {
-    GroupId group_id;
     std::vector<uint8_t> attempted_ranks;
     std::vector<uint8_t> failed_ranks_hint;
     std::vector<uint8_t> succeeded_ranks;
