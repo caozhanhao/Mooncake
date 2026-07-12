@@ -150,7 +150,7 @@ struct SyncAfterFailureRequest {
 
 enum class SyncAfterFailureStatus : uint8_t {
     DecisionApplied =
-        0,          // Decision made and applied (ViewUpdate ACKed by caller)
+        0,         // Decision made and applied (ViewUpdate ACKed by caller)
     NoChange = 1,  // No pending decision, epoch matches, no window open
     Rejected = 2,  // Invalid request (stale session, group not found, etc.)
 };

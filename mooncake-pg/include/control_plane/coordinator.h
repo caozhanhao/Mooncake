@@ -162,7 +162,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         };
         struct BootstrapCommit {};
 
-        std::variant<ProposalCommit, BootstrapCommit> commit = BootstrapCommit{};
+        std::variant<ProposalCommit, BootstrapCommit> commit =
+            BootstrapCommit{};
     };
     std::unordered_map<GroupId,
                        std::unordered_map<uint64_t, PendingViewUpdateBarrier>>
@@ -204,7 +205,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                              std::vector<CoordinatorEffect>& effects);
 
     // Recompute the authoritative healthy set (max clique) and update
-    // ranks_[].state between HEALTHY and SYNCED.  Emits rank-state effects.
+    // ranks_[].state between Healthy and Synced.  Emits rank-state effects.
     void updateRankStates(std::vector<CoordinatorEffect>& effects);
 
     // For every auto_deactivate + Ready group, mark active ranks that are not
@@ -212,8 +213,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // a ViewUpdate when at least one rank is pruned.
     void applyAutoDeactivate(std::vector<CoordinatorEffect>& effects);
 
-    // Open the fault reconciliation window and register a group for reconciliation.
-    // Stale epochs (report_epoch < recorded) are silently ignored.
+    // Open the fault reconciliation window and register a group for
+    // reconciliation. Stale epochs (report_epoch < recorded) are silently
+    // ignored.
     void openReconciliationWindow(GroupId group_id, uint64_t report_epoch);
 
     // Apply transfer observation bit-vectors to a reporter's link_status.
@@ -224,7 +226,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                                const std::vector<uint8_t>& failed);
 
     // Bootstrap state machine driver.  Advances groups through:
-    //   Bootstrapping -> BootstrapSyncing (when all active ranks are HEALTHY
+    //   Bootstrapping -> BootstrapSyncing (when all active ranks are Healthy
     //                    and have published endpoints)
     //   BootstrapSyncing -> Ready (when all active ranks have ACKed)
     //
@@ -246,7 +248,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     // Build the response for a sync-after-failure request.
     bool isMutuallyConnected(GlobalRank a, GlobalRank b) const;
-    // Preserve existing HEALTHY ranks that are still mutually connected,
+    // Preserve existing Healthy ranks that are still mutually connected,
     // then extend with new candidates that have full connectivity to all
     // current members.
     std::vector<GlobalRank> extendHealthySet() const;

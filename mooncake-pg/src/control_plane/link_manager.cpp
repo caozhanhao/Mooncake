@@ -47,7 +47,6 @@ void LinkManager::init(GlobalRank rank, int max_world_size,
     // If already initialized, return.  Also reject init after shutdown
     // (re-init-after-shutdown is not supported  - create a new process).
     if (initialized_.exchange(true, std::memory_order_acq_rel)) {
-        LOG(WARNING) << "LinkManager::init() already initialized, returning";
         return;
     }
     if (shutdown_.load(std::memory_order_acquire)) {
@@ -93,7 +92,7 @@ void LinkManager::init(GlobalRank rank, int max_world_size,
         }
     }
 
-    // Bootstrap self: open local segment, mark CONNECTED.
+    // Bootstrap self: open local segment, mark Connected.
     TransferMetadata::SegmentID self_target_id{};
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
@@ -270,10 +269,6 @@ void LinkManager::refreshPeerSegment(GlobalRank peer) {
     read_state_[peer].target_id.store(link.target_id.value(),
                                       std::memory_order_relaxed);
     read_state_[peer].version.fetch_add(1, std::memory_order_release);
-
-    LOG(INFO) << "[LinkManager] refreshPeerSegment rank=" << rank_
-              << " peer=" << peer
-              << " new_target_id=" << link.target_id.value();
 }
 
 void LinkManager::publishLinkUp(GlobalRank peer,
@@ -314,7 +309,7 @@ void LinkManager::tearDownPeerLink(GlobalRank peer, bool stop_reconnect) {
     // for good (stop_reconnect).  For a reconnect teardown the flag must be
     // preserved: the peer may have already completed its write while we are
     // tearing down, and clearing it would leave us waiting forever in
-    // WAITING_PEER_WARMUP while the peer is already CONNECTED.
+    // WaitingPeerWarmup while the peer is already Connected.
     if (stop_reconnect && warmup_recv_region_) warmup_recv_region_[peer] = 0;
 
     link.state = PeerLinkState::Idle;

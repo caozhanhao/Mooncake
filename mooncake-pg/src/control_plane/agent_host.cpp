@@ -246,9 +246,6 @@ void AgentHost::registerGroup(const GroupView& group, bool auto_deactivate,
         auto resp = rpc_client_->call<&CoordinatorRpcService::registerGroup>(
             coordinator_addr_, std::move(req));
 
-        LOG(INFO) << "[AGENT] registerGroup rank=" << rank_
-                  << " group=" << group_id << " success=" << resp.success;
-
         if (!resp.success) {
             LOG(ERROR) << "AgentHost: registerGroup failed for group "
                        << group_id << ": " << resp.reject_reason;
@@ -266,8 +263,6 @@ void AgentHost::registerGroup(const GroupView& group, bool auto_deactivate,
 
 void AgentHost::unregisterGroup(GroupId group_id) {
     executor_.postAndWait([this, group_id]() {
-        LOG(INFO) << "[AGENT] unregisterGroup rank=" << rank_
-                  << " group=" << group_id;
         agent_.unregisterGroup(group_id);
         backends_.erase(group_id);
 
@@ -298,7 +293,8 @@ void AgentHost::publishLocalEndpoint(GroupEndpointPublication endpoint) {
 // Agent interface: Membership proposals (synchronous)
 
 ProposeViewUpdateResponse AgentHost::proposeViewUpdateInternal(
-    GroupId group_id, const std::vector<GlobalRank>& ranks, bool is_activation) {
+    GroupId group_id, const std::vector<GlobalRank>& ranks,
+    bool is_activation) {
     ProposeViewUpdateRequest req;
     req.group_id = group_id;
     req.source_rank = rank_;
@@ -416,9 +412,6 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                                ViewUpdatePush push) {
     auto group_id = push.group_id;
     auto epoch = push.view.epoch;
-    LOG(INFO) << "[AGENT] postViewUpdate rank=" << rank_
-              << " group=" << group_id << " epoch=" << epoch
-              << " status=" << static_cast<int>(push.view.status);
 
     executor_.post([this, ctx = std::move(ctx), push = std::move(push),
                     group_id, epoch]() mutable {
@@ -659,15 +652,10 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                         coordinator_addr_, e.request);
                 },
                 [this](const EnablePeerProbe& e) {
-                    LOG(INFO)
-                        << "[AGENT] EnablePeerProbe rank=" << rank_
-                        << " peer=" << e.rank << " server=" << e.te_server_name;
                     link_manager_.enablePeerProbe(e.rank, e.te_server_name,
                                                   e.warmup_recv_addr);
                 },
                 [this](const DisconnectLink& e) {
-                    LOG(INFO) << "[AGENT] DisconnectLink rank=" << rank_
-                              << " peer=" << e.peer;
                     link_manager_.disconnect(e.peer);
                 },
                 [this](const StopReconnect& e) {
@@ -695,7 +683,7 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                 },
                 [this](const ApplyViewToBackend& e) {
                     withBackend(e.group_id, [&](auto backend) {
-                        backend->applyViewChange(e.view);
+                        backend->applyViewUpdate(e.view);
                     });
                 },
                 [this](const MarkBackendViewStale& e) {

@@ -255,9 +255,6 @@ void CoordinatorHost::runEffects(
                     }
                 },
                 [this](const PushEffect<PeerJoinedPush>& e) {
-                    LOG(INFO) << "[COORD] broadcast PeerJoinedPush rank="
-                              << e.push.rank
-                              << " te_server_name=" << e.push.te_server_name;
                     for (int i = 0; i < max_world_size_; ++i) {
                         if (i != e.push.rank && state_machine_.getRankState(
                                                     i) != RankState::Offline) {

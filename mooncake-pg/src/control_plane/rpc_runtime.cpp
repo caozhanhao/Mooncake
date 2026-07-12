@@ -78,7 +78,6 @@ RpcClient::getOrCreateClient(std::shared_ptr<SharedState> state,
         auto it = state->clients.find(addr);
         if (it != state->clients.end()) co_return it->second;
 
-        LOG(INFO) << "RpcClient: connected to " << addr;
         state->clients[addr] = client;
         co_return client;
     }

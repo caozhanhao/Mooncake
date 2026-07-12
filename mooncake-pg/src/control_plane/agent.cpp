@@ -85,7 +85,7 @@ AgentApplyResult AgentStateMachine::handleRankStateUpdate(
 
     global_rank_states_[push.rank] = static_cast<RankState>(push.new_state);
 
-    // Remote OFFLINE: the control plane is dead (process may have exited).
+    // Remote Offline: the control plane is dead (process may have exited).
     // Tear down TE link AND stop candidate probe.
     if (push.rank != rank_ &&
         push.new_state == static_cast<uint8_t>(RankState::Offline)) {
@@ -108,10 +108,6 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
         return effects;
     }
 
-    LOG(INFO) << "[AGENT] handleViewUpdate rank=" << rank_
-              << " group=" << push.group_id << " epoch=" << push.view.epoch
-              << " #effects=1";
-
     // Detect coordinator-assigned endpoint_epoch changes.  A change means the
     // remote endpoint has been republished (e.g. replacement process) and the
     // LinkManager must drop the old link and re-probe with the new server info.
@@ -133,9 +129,6 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
                 effects.push_back(DisconnectLink{r});
                 effects.push_back(EnablePeerProbe{r, conn->te_server_name,
                                                   conn->warmup_recv_addr});
-                LOG(INFO) << "[AGENT] endpoint_epoch changed rank=" << rank_
-                          << " peer=" << r << " old_epoch=" << old_epoch
-                          << " new_epoch=" << new_epoch;
             }
         }
     }
@@ -291,18 +284,7 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
 
     if (has_changed) {
         effects.push_back(SendTransferObservation{std::move(req)});
-        LOG(INFO) << "[AGENT] processTransferObservation has_changed rank="
-                  << rank_ << " attempted=";
-        for (size_t peer = 0; peer < req.attempted_ranks.size(); ++peer) {
-            if (req.attempted_ranks[peer]) {
-                LOG(INFO) << "[AGENT]   peer=" << peer
-                          << " succeeded=" << (int)req.succeeded_ranks[peer]
-                          << " failed=" << (int)req.failed_ranks_hint[peer];
-            }
-        }
     } else {
-        LOG(INFO) << "[AGENT] processTransferObservation no_change rank="
-                  << rank_;
     }
 
     return effects;

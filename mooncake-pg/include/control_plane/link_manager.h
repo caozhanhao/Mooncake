@@ -67,7 +67,7 @@ class LinkManager {
     void disconnect(GlobalRank peer);
 
     // Stop candidate probe entirely.  Only called when the peer transitions
-    // to OFFLINE (control-plane dead).
+    // to Offline (control-plane dead).
     void stopReconnect(GlobalRank peer);
 
     bool isConnected(GlobalRank peer) const;

@@ -44,8 +44,8 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     auto& info = ranks_[req.rank];
 
     // Identity check
-    // If the rank is currently HEALTHY AND the request comes from a different
-    // process -> reject.  A failed / auto-deactivated rank (SYNCED or OFFLINE)
+    // If the rank is currently Healthy AND the request comes from a different
+    // process -> reject.  A failed / auto-deactivated rank (Synced or Offline)
     // may be replaced immediately; waiting for heartbeat timeout is not
     // required because the Coordinator has already removed it from the healthy
     // set.
@@ -55,14 +55,10 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     if (info.state == RankState::Healthy && !same_peer) {
         result.response.success = false;
         result.response.reject_reason =
-            "rank already registered and is HEALTHY; replacement must wait "
+            "rank already registered and is Healthy; replacement must wait "
             "for the old process to leave the healthy set.";
         return result;
     }
-
-    LOG(INFO) << "[COORD] registerAgent rank=" << req.rank
-              << " addr=" << req.agent_addr
-              << " session=" << req.agent_session_epoch;
 
     // A new session makes old endpoints invalid
     bool session_changed =
@@ -84,8 +80,6 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
                 *member.agent_session_epoch != req.agent_session_epoch) {
                 member.agent_session_epoch = std::nullopt;
                 member.endpoint = std::nullopt;
-                LOG(INFO) << "[COORD] registerAgent cleared stale endpoint"
-                          << " group=" << group_id << " rank=" << req.rank;
             }
         }
     }
@@ -95,7 +89,7 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
         EffectTarget{EffectTarget::Kind::BroadcastOnline},
         PeerJoinedPush{req.rank, info.te_server_name, info.warmup_recv_addr}});
 
-    // Transition to SYNCED.
+    // Transition to Synced.
     info.state = RankState::Synced;
     result.effects.push_back(makeRankStateEffect(req.rank));
 
@@ -171,22 +165,14 @@ CentralizedCoordinatorStateMachine::handleUnregisterGroup(
 
     auto it = group_views_.find(req.group_id);
     if (it == group_views_.end()) {
-        LOG(INFO) << "[COORD] unregisterGroup rank=" << req.rank
-                  << " group=" << req.group_id << " rejected: group not found";
         return result;
     }
 
     auto& view = it->second;
     auto& member = view.members[req.rank];
     if (member.hasLeft()) {
-        LOG(INFO) << "[COORD] unregisterGroup rank=" << req.rank
-                  << " group=" << req.group_id << " ignored: already left";
         return result;
     }
-
-    LOG(INFO) << "[COORD] unregisterGroup rank=" << req.rank
-              << " group=" << req.group_id
-              << " old_status=" << static_cast<int>(member.status);
 
     member.status = GroupMemberStatus::Left;
     member.agent_session_epoch = std::nullopt;
@@ -230,7 +216,7 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
             {ViewUpdateStatus::Rejected,
              view.epoch,
              {},
-             "source rank is OFFLINE or stale session epoch"}});
+             "source rank is Offline or stale session epoch"}});
         return result;
     }
 
@@ -252,16 +238,6 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
         for (GlobalRank rank : req.requested_ranks) {
             if (!view.members[rank].isActive()) changed = true;
         }
-
-        LOG(INFO) << "[COORD] handleProposeViewUpdate activate group="
-                  << req.group_id << " source=" << req.source_rank
-                  << " requested_ranks=[" <<
-            [&req]() {
-                std::string s;
-                for (auto r : req.requested_ranks) s += std::to_string(r) + " ";
-                return s;
-            }()
-                  << "] changed=" << changed << " epoch=" << view.epoch;
 
         if (changed &&
             !isActivatableSet(req.group_id, req.requested_ranks, view)) {
@@ -298,8 +274,7 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
 
     view.epoch++;
 
-    auto required_acks =
-        computeBarrierAckSet(old_view, view, req.group_id);
+    auto required_acks = computeBarrierAckSet(old_view, view, req.group_id);
 
     // required_acks always includes the proposer (online + active in old
     // view), so the set is never empty in normal operation.
@@ -337,24 +312,13 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
 
         auto& view = it->second;
         auto& member = view.members[req.rank];
-        bool had_endpoint = member.hasEndpoint();
         member.agent_session_epoch = req.agent_session_epoch;
         member.endpoint = ep.endpoint_info;
         member.endpoint->endpoint_epoch = ++endpoint_epochs_[req.rank];
 
-        LOG(INFO) << "[COORD] handlePublishEndpoint rank=" << req.rank
-                  << " group=" << ep.group_id
-                  << " had_endpoint=" << had_endpoint
-                  << " endpoint_epoch=" << member.endpoint->endpoint_epoch
-                  << " agent_session_epoch=" << req.agent_session_epoch
-                  << " is_member=" << member.isMember()
-                  << " group_status=" << static_cast<int>(view.status);
-
         if (member.isMember() && view.status == GroupStatus::Ready) {
             view.epoch++;
             result.effects.push_back(ViewUpdateEffect{view});
-            LOG(INFO) << "[COORD] handlePublishEndpoint pushed view update"
-                      << " group=" << ep.group_id << " epoch=" << view.epoch;
         }
     }
 
@@ -388,17 +352,13 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
     uint64_t current_epoch = view_it->second.epoch;
 
     if (req.epoch < current_epoch) {
-        LOG(INFO) << "[COORD] handleTransferObservation dropped stale report"
-                  << " reporter=" << req.reporter_rank
-                  << " group=" << req.group_id << " report_epoch=" << req.epoch
-                  << " current_epoch=" << current_epoch;
         return result;
     }
 
     // 1. Apply observation to link_status.  Returns true if any peer failed.
-    bool has_negative = applyLinkStatusUpdate(reporter, req.attempted_ranks,
-                                             req.succeeded_ranks,
-                                             req.failed_ranks_hint);
+    bool has_negative =
+        applyLinkStatusUpdate(reporter, req.attempted_ranks,
+                              req.succeeded_ranks, req.failed_ranks_hint);
 
     // 2. Only open the fault reconciliation window when at least one peer
     //    was reported as failed.  Positive-only (link-up) observations do
@@ -421,10 +381,6 @@ void CentralizedCoordinatorStateMachine::openReconciliationWindow(
     if (it == reconciliation_ctx_.groups_in_window.end()) {
         reconciliation_ctx_.groups_in_window[group_id] = report_epoch;
     } else if (report_epoch > it->second) {
-        LOG(INFO) << "[COORD] openReconciliationWindow adopted newer epoch"
-                  << " group=" << group_id
-                  << " old_window_epoch=" << it->second
-                  << " new_window_epoch=" << report_epoch;
         it->second = report_epoch;
     }
     // report_epoch < it->second: stale, silently ignored.
@@ -432,8 +388,7 @@ void CentralizedCoordinatorStateMachine::openReconciliationWindow(
 
 bool CentralizedCoordinatorStateMachine::applyLinkStatusUpdate(
     RankInfo& reporter, const std::vector<uint8_t>& attempted,
-    const std::vector<uint8_t>& succeeded,
-    const std::vector<uint8_t>& failed) {
+    const std::vector<uint8_t>& succeeded, const std::vector<uint8_t>& failed) {
     bool has_negative = false;
     for (int32_t peer = 0; peer < max_world_size_; ++peer) {
         if (peer >= static_cast<int32_t>(attempted.size()) || !attempted[peer])
@@ -462,9 +417,6 @@ CentralizedCoordinatorStateMachine::handleLinkStateChange(
     reporter.link_status[req.peer] = req.is_up ? 1 : 0;
     reporter.link_status[req.reporter_rank] = 1;  // self is always connected
 
-    LOG(INFO) << "[COORD] handleLinkStateChange reporter=" << req.reporter_rank
-              << " peer=" << req.peer << " is_up=" << req.is_up;
-
     updateRankStates(result.effects);
     applyAutoDeactivate(result.effects);
     checkGroupTransitions(result.effects);
@@ -489,16 +441,15 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
     auto view_it = group_views_.find(req.group_id);
     if (view_it == group_views_.end()) {
         result.effects.push_back(ReplySyncEffect{
-            sync_id,
-            {SyncAfterFailureStatus::Rejected, 0, "group not found"}});
+            sync_id, {SyncAfterFailureStatus::Rejected, 0, "group not found"}});
         return result;
     }
 
     // Apply piggybacked observation inline.
     if (req.has_observation) {
-        bool has_negative = applyLinkStatusUpdate(
-            reporter, req.attempted_ranks, req.succeeded_ranks,
-            req.failed_ranks_hint);
+        bool has_negative =
+            applyLinkStatusUpdate(reporter, req.attempted_ranks,
+                                  req.succeeded_ranks, req.failed_ranks_hint);
 
         if (has_negative) {
             openReconciliationWindow(req.group_id, req.observation_epoch);
@@ -611,7 +562,8 @@ CentralizedCoordinatorStateMachine::checkTimeouts() {
     // Fault reconciliation window.
     if (reconciliation_ctx_.active && now >= reconciliation_ctx_.deadline) {
         reconciliation_ctx_.active = false;
-        auto groups_to_reconcile = std::move(reconciliation_ctx_.groups_in_window);
+        auto groups_to_reconcile =
+            std::move(reconciliation_ctx_.groups_in_window);
         reconciliation_ctx_.groups_in_window.clear();
 
         updateRankStates(result.effects);
@@ -696,7 +648,7 @@ bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
 
 std::vector<GlobalRank> CentralizedCoordinatorStateMachine::extendHealthySet()
     const {
-    //  Collect current HEALTHY ranks.
+    //  Collect current Healthy ranks.
     std::vector<GlobalRank> result;
     for (int i = 0; i < max_world_size_; ++i) {
         if (ranks_[i].state == RankState::Healthy) {
@@ -779,7 +731,7 @@ void CentralizedCoordinatorStateMachine::updateRankStates(
     }
     LOG(INFO) << "[COORD] updateRankStates healthy_set=[" << healthy_str << "]";
 
-    // Update per-rank HEALTHY / SYNCED state.
+    // Update per-rank Healthy / Synced state.
     for (int i = 0; i < max_world_size_; ++i) {
         if (ranks_[i].state == RankState::Offline) continue;
 
@@ -787,11 +739,11 @@ void CentralizedCoordinatorStateMachine::updateRankStates(
                                     i) != healthy_set.end();
 
         if (in_healthy && ranks_[i].state != RankState::Healthy) {
-            LOG(INFO) << "[COORD] rank=" << i << " transitioning to HEALTHY";
+            LOG(INFO) << "[COORD] rank=" << i << " transitioning to Healthy";
             ranks_[i].state = RankState::Healthy;
             effects.push_back(makeRankStateEffect(i));
         } else if (!in_healthy && ranks_[i].state == RankState::Healthy) {
-            LOG(INFO) << "[COORD] rank=" << i << " transitioning to SYNCED";
+            LOG(INFO) << "[COORD] rank=" << i << " transitioning to Synced";
             ranks_[i].state = RankState::Synced;
             effects.push_back(makeRankStateEffect(i));
         }
@@ -858,26 +810,15 @@ bool CentralizedCoordinatorStateMachine::isActivatableSet(
     for (GlobalRank r : future_active) {
         future_active_str += std::to_string(r) + " ";
     }
-    LOG(INFO) << "[COORD] isActivatableSet group=" << group_id << " new_ranks=["
-              <<
-        [&new_ranks]() {
-            std::string s;
-            for (auto r : new_ranks) s += std::to_string(r) + " ";
-            return s;
-        }() << "] future_active=["
-              << future_active_str << "]";
 
     // Every rank in the future set must be activatable with respect to the
     // full future set.  This guarantees all-to-all mutual connectivity:
     // old <-> old, old <-> new, and new <-> new.
     for (GlobalRank r : future_active) {
         if (!isRankActivatable(group_id, r, future_active)) {
-            LOG(INFO) << "[COORD] isActivatableSet group=" << group_id
-                      << " rejected: rank=" << r << " not activatable";
             return false;
         }
     }
-    LOG(INFO) << "[COORD] isActivatableSet group=" << group_id << " accepted";
     return true;
 }
 
@@ -885,33 +826,21 @@ bool CentralizedCoordinatorStateMachine::isRankActivatable(
     GroupId group_id, GlobalRank rank,
     const std::vector<GlobalRank>& future_active) const {
     if (!rankInRange(rank)) {
-        LOG(INFO) << "[COORD] isRankActivatable group=" << group_id
-                  << " rank=" << rank << " false: out of range";
         return false;
     }
     if (ranks_[rank].state != RankState::Healthy) {
-        LOG(INFO) << "[COORD] isRankActivatable group=" << group_id
-                  << " rank=" << rank << " false: rank_state="
-                  << static_cast<int>(ranks_[rank].state)
-                  << " (expected HEALTHY="
-                  << static_cast<int>(RankState::Healthy) << ")";
         return false;
     }
 
     for (GlobalRank other : future_active) {
         if (other == rank) continue;
         if (!isMutuallyConnected(rank, other)) {
-            LOG(INFO) << "[COORD] isRankActivatable group=" << group_id
-                      << " rank=" << rank
-                      << " false: not mutually connected to peer=" << other;
             return false;
         }
     }
 
     auto group = group_views_.find(group_id);
     if (group == group_views_.end()) {
-        LOG(INFO) << "[COORD] isRankActivatable group=" << group_id
-                  << " rank=" << rank << " false: group not found";
         return false;
     }
 
@@ -923,18 +852,6 @@ bool CentralizedCoordinatorStateMachine::isRankActivatable(
         *member.agent_session_epoch == ranks_[rank].agent_session_epoch;
     bool result = member_ok && endpoint_ok && session_ok;
     if (!result) {
-        LOG(INFO) << "[COORD] isRankActivatable group=" << group_id
-                  << " rank=" << rank << " false: member_ok=" << member_ok
-                  << " endpoint_ok=" << endpoint_ok
-                  << " session_ok=" << session_ok
-                  << " member.status=" << static_cast<int>(member.status)
-                  << " member.has_endpoint=" << member.hasEndpoint()
-                  << " member.agent_session_epoch="
-                  << (member.agent_session_epoch.has_value()
-                          ? std::to_string(*member.agent_session_epoch)
-                          : "nullopt")
-                  << " rank.agent_session_epoch="
-                  << ranks_[rank].agent_session_epoch;
     }
     return result;
 }
@@ -943,7 +860,7 @@ bool CentralizedCoordinatorStateMachine::isRankActivatable(
 //
 // Group lifecycle:
 //   processGroupRegistration() creates a group in Bootstrapping status.  Once
-//   all active ranks have valid endpoints, are HEALTHY, and are mutually
+//   all active ranks have valid endpoints, are Healthy, and are mutually
 //   TE-connected, this function transitions to BootstrapSyncing and broadcasts
 //   a ViewUpdate to collect ACKs from all active ranks (a 2PC barrier).  Once
 //   all ACKs arrive, the group transitions to Ready. waitUntilGroupReady()
@@ -970,13 +887,12 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
             }
 
             if (has_any_active && all_ready) {
-                // All active ranks have endpoints and are HEALTHY.
+                // All active ranks have endpoints and are Healthy.
                 // Transition to BootstrapSyncing and initiate a barrier.
                 view.status = GroupStatus::BootstrapSyncing;
                 view.epoch++;
 
-                auto acks_needed = computeBarrierAckSet(
-                    view, view, group_id);
+                auto acks_needed = computeBarrierAckSet(view, view, group_id);
                 if (acks_needed.empty()) {
                     // No online active rank needs to ACK; become Ready
                     // immediately.

@@ -139,7 +139,7 @@ void MooncakeWorker::startWorker() {
                         }
 
                         // Use cached segment ID from TransferGroupMeta.
-                        // Control plane syncs this via applyViewChange.
+                        // Control plane syncs this via applyViewUpdate.
                         TransferMetadata::SegmentID target_id =
                             group->segmentIDs[j];
 

@@ -36,10 +36,10 @@ constexpr int kMaxNumRanks = 64;
 //   registerAgent()         Coordinator computes TE HealthySet
 //        |                  (heartbeat + transfer observations)
 //        v                         |
-//   OFFLINE -> SYNCED ---------> HEALTHY
+//   Offline -> Synced ---------> Healthy
 //        ^                         |
 //        |   heartbeat timeout     |   excluded from HealthySet
-//        +--- or disconnect -------+-----> SYNCED
+//        +--- or disconnect -------+-----> Synced
 //
 enum class RankState : uint8_t {
     Offline = 0,
@@ -99,7 +99,7 @@ struct GroupMember {
 //   registerGroup()
 //          |
 //          v
-//   Bootstrapping  -- all active ranks HEALTHY + have endpoints -->
+//   Bootstrapping  -- all active ranks Healthy + have endpoints -->
 //   BootstrapSyncing
 //       (waiting for       (Coordinator broadcasts ViewUpdate,
 //        publishEndpoint     waits for ACKs from all active ranks)
@@ -109,7 +109,7 @@ struct GroupMember {
 //                               (group usable for data-plane transfers)
 //
 //   Bootstrapping      - collecting endpoints and waiting for all active ranks
-//                        to become HEALTHY with valid endpoints.
+//                        to become Healthy with valid endpoints.
 //   BootstrapSyncing   - Coordinator initiated 2PC barrier; waiting for all
 //                        active ranks to ACK the initial ViewUpdate.
 //                        If a peer dies here, waitUntilGroupReady() hangs

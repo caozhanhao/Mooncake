@@ -281,7 +281,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // Atomically update the worker-visible group view (descriptor + members).
     // Called by AgentHost from the executor thread when a ViewUpdatePush
     // is received from the Coordinator.
-    void applyViewChange(const GroupView& view);
+    void applyViewUpdate(const GroupView& view);
 
     /// Returns the current GroupView epoch (monotonically increasing).
     /// Safe to call from any thread. Epoch starts at 0 (bootstrap) and
@@ -294,7 +294,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // Resets the per-backend P2PProxy state for the affected peer.
     void onPeerLinkReset(InGroupRank peer);
 
-    // Mark this backend's view as stale (called when Agent goes OFFLINE).
+    // Mark this backend's view as stale (called when Agent goes Offline).
     void markViewStale();
 
     /// Sync-after-failure: notify the Coordinator of a detected failure and
@@ -356,9 +356,9 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     // Per-rank membership/endpoint-present bitmaps for this group, updated from
     // the authoritative GroupView.  getPeerState() uses them to guarantee that
-    // a peer is ready to be activated: it must be a group member (kInactive or
-    // kActive), have an endpoint published for the current session (the
-    // Coordinator tells us this via GroupMember::endpoint), and be HEALTHY in
+    // a peer is ready to be activated: it must be a group member (Inactive or
+    // Active), have an endpoint published for the current session (the
+    // Coordinator tells us this via GroupMember::endpoint), and be Healthy in
     // the Coordinator's view.  We intentionally do NOT require the local TE
     // link to be up here.
     std::array<std::atomic<bool>, kMaxNumRanks> member_bitmap_{};
