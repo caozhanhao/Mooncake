@@ -183,7 +183,7 @@ void LinkManager::disconnect(GlobalRank peer) {
     if (!rankInRange(peer)) return;
 
     std::lock_guard<std::mutex> lock(peers_mutex_);
-    tearDownPeerLink(peer, /*stop_reconnect=*/false);
+    tearDownPeerLink(peer);
 }
 
 void LinkManager::stopReconnect(GlobalRank peer) {
@@ -260,7 +260,7 @@ void LinkManager::publishLinkDown(GlobalRank peer) {
     read_state_[peer].version.fetch_add(1, std::memory_order_release);
 }
 
-void LinkManager::tearDownPeerLink(GlobalRank peer, bool stop_reconnect) {
+void LinkManager::tearDownPeerLink(GlobalRank peer) {
     auto& link = peers_[peer];
 
     if (link.target_id.has_value()) {
@@ -268,7 +268,6 @@ void LinkManager::tearDownPeerLink(GlobalRank peer, bool stop_reconnect) {
         link.target_id = std::nullopt;
     }
 
-    // Remove the cached segment descriptor so the next openSegment() for this
     if (!link.server_name.empty()) {
         engine_->removeLocalSegment(link.server_name);
     }
@@ -278,17 +277,7 @@ void LinkManager::tearDownPeerLink(GlobalRank peer, bool stop_reconnect) {
         link.warmup_batch_id = std::nullopt;
     }
 
-    // Only clear the warmup handshake signal when the peer is going away
-    // for good (stop_reconnect).  For a reconnect teardown the flag must be
-    // preserved: the peer may have already completed its write while we are
-    // tearing down, and clearing it would leave us waiting forever in
-    // WaitingPeerWarmup while the peer is already Connected.
-    if (stop_reconnect && warmup_recv_region_) warmup_recv_region_[peer] = 0;
-
     link.state = PeerLinkState::Idle;
-    if (stop_reconnect) {
-        link.is_candidate = false;
-    }
 
     publishLinkDown(peer);
 
@@ -352,10 +341,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
             if (link.server_name.empty()) return false;
 
             auto segment_id = engine_->openSegment(link.server_name);
-            // openSegment returns (SegmentHandle)(-1) on failure (UINT64_MAX),
-            // which is truthy so a plain !segment_id check would miss it.
             if (segment_id == static_cast<SegmentHandle>(-1)) {
-                // openSegment failed  - backoff and retry.
                 LOG(WARNING)
                     << "[LINK] openSegment failed rank=" << rank_
                     << " peer=" << peer << " server_name=" << link.server_name;
@@ -440,7 +426,6 @@ bool LinkManager::probePeer(GlobalRank peer) {
                                               PeerLink::kProbeBackoffMax);
                 return false;
             }
-            // Still in flight  - don't advance backoff.
             return false;
         }
 
@@ -461,7 +446,6 @@ bool LinkManager::probePeer(GlobalRank peer) {
                 });
                 return true;
             }
-            // Still waiting  - don't advance backoff.
             return false;
         }
 

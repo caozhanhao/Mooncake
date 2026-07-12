@@ -66,6 +66,9 @@ class AgentStateMachine {
             global_rank_states_[rank].load(std::memory_order_acquire));
     }
 
+    // Thread-safe: rank is active in the given group per the Coordinator view.
+    bool isRankActive(GroupId group_id, InGroupRank rank) const;
+
     // Best-effort local estimate: Healthy && isMember && hasEndpoint.
     bool maybeActivatable(GroupId group_id, InGroupRank rank) const;
 
@@ -86,6 +89,8 @@ class AgentStateMachine {
     std::unordered_map<GroupId, std::vector<std::atomic<bool>>>
         maybe_activatable_;
 
+    std::unordered_map<GroupId, std::vector<std::atomic<bool>>> group_active_;
+
     CoordinatorConnection coordinator_connection_ =
         CoordinatorConnection::Disconnected;
 
@@ -94,6 +99,7 @@ class AgentStateMachine {
     }
 
     void updateMaybeActivatable(GroupId group_id, InGroupRank rank);
+    void updateActive(GroupId group_id, InGroupRank rank);
 };
 
 }  // namespace mooncake

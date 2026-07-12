@@ -95,8 +95,11 @@ class AgentInterface {
     // Accessors.
     virtual uint64_t getAgentSessionEpoch() = 0;
 
-    // Process-level rank health (thread-safe).
-    virtual bool isRankHealthy(GlobalRank rank) = 0;
+    // Thread-safe: process-level rank state.
+    virtual RankState getRankState(GlobalRank rank) = 0;
+
+    // Thread-safe: rank is active in the given group.
+    virtual bool isRankActive(GroupId group_id, InGroupRank rank) = 0;
 
     // Best-effort: Healthy + isMember + hasEndpoint (thread-safe).
     virtual bool maybeActivatable(GroupId group_id, InGroupRank rank) = 0;
@@ -164,8 +167,11 @@ class AgentHost : public AgentInterface {
     uint64_t getAgentSessionEpoch() override {
         return agent_.getAgentSessionEpoch();
     }
-    bool isRankHealthy(GlobalRank rank) override {
-        return agent_.getRankState(rank) == RankState::Healthy;
+    RankState getRankState(GlobalRank rank) override {
+        return agent_.getRankState(rank);
+    }
+    bool isRankActive(GroupId group_id, InGroupRank rank) override {
+        return agent_.isRankActive(group_id, rank);
     }
     bool maybeActivatable(GroupId group_id, InGroupRank rank) override {
         return agent_.maybeActivatable(group_id, rank);

@@ -18,12 +18,7 @@ namespace mooncake {
 // Generic single-threaded serialized executor.
 //
 // All tasks posted to this executor are processed sequentially on a single
-// dedicated thread.  The executor itself does no I/O and holds no locks
-// beyond the task queue  - it is purely a concurrency primitive.
-//
-// The optional tick callback fires after every batch of tasks (including
-// empty batches, thanks to the 50 ms wait timeout).  Hosts use this callback
-// for periodic work such as heartbeat timeout detection.
+// dedicated thread.
 //
 // Thread safety:
 //   - post() may be called from any thread.
@@ -35,14 +30,13 @@ class SerializedExecutor {
 
     ~SerializedExecutor() { shutdown(); }
 
-    // Start the executor thread.  Idempotent - second call is a no-op.
+    // Start the executor thread.
     void start() {
         if (running_.exchange(true, std::memory_order_acq_rel)) return;
         thread_ = std::thread([this] { loop(); });
     }
 
     // Gracefully stop the executor thread.  Blocks until the thread exits.
-    // Idempotent  - safe to call multiple times.
     //
     // Drains any tasks that were still in the queue when the loop exited so
     // that RPC contexts (held inside lambda captures) receive a response

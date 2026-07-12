@@ -533,11 +533,6 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                         backend->applyViewUpdate(e.view);
                     });
                 },
-                [this](const MarkBackendViewStale& e) {
-                    withBackend(e.group_id, [&](auto backend) {
-                        backend->markViewStale();
-                    });
-                },
                 [this](const NotifyGroupReady& e) {
                     auto it = group_ready_promises_.find(e.group_id);
                     if (it == group_ready_promises_.end()) return;

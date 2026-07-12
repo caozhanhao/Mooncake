@@ -391,6 +391,20 @@ c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::barrier(
     return owner_->barrier(opts);
 }
 
+void MooncakeBackend::prepareOp(c10d::OpType op) const {
+    TORCH_CHECK(agent_.getRankState(meta_->globalRank) != RankState::Offline,
+                "Rank ", meta_->globalRank,
+                " is Offline. Cannot perform operations.");
+    // P2P operations don't require the rank to be active in the group.
+    if (op != c10d::OpType::SEND && op != c10d::OpType::RECV) {
+        TORCH_CHECK(agent_.isRankActive(meta_->group_id,
+                                        static_cast<InGroupRank>(rank_)),
+                    "Rank ", meta_->globalRank,
+                    " is not active in this group. "
+                    "Cannot perform collective operations.");
+    }
+}
+
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     std::vector<at::Tensor>& tensors, int dstRank, int tag) {
     (void)tag;
@@ -399,6 +413,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
 
     TORCH_CHECK(dstRank >= 0 && dstRank < meta_->size,
                 "P2P send: dstRank out of range.");
+
+    prepareOp(c10d::OpType::SEND);
 
     auto contiguous = tensor.contiguous();
     auto status = std::make_shared<std::atomic<P2PProxy::OpStatus>>(
@@ -434,6 +450,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
     TORCH_CHECK(srcRank >= 0 && srcRank < meta_->size,
                 "P2P recv: srcRank out of range.");
 
+    prepareOp(c10d::OpType::RECV);
+
     auto target = tensor.is_contiguous() ? tensor : tensor.contiguous();
     auto status = std::make_shared<std::atomic<P2PProxy::OpStatus>>(
         P2PProxy::OpStatus::kPending);
@@ -467,6 +485,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
     size_t tensorSize = tensor.numel() * tensor.element_size();
     int64_t root = opts.rootRank + opts.rootTensor;
     bool isRoot = (root == rank_);
+    prepareOp(c10d::OpType::BROADCAST);
     auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
     if (isCpu_) {
         return worker_->putTaskCpu(
@@ -508,6 +527,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     TORCH_CHECK(opts.sparseIndices == std::nullopt, SPARSE_ERROR_MSG);
     auto tensor = tensors.back();
     size_t tensorSize = tensor.numel() * tensor.element_size();
+    prepareOp(c10d::OpType::ALLREDUCE);
     auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
     if (isCpu_) {
         auto numRanks = meta_->size;
@@ -554,6 +574,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     auto inputTensor = inputTensors.back();
     auto outputTensors_ = outputTensors.back();
     size_t tensorSize = inputTensor.numel() * inputTensor.element_size();
+    prepareOp(c10d::OpType::ALLGATHER);
     auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
     if (isCpu_) {
         return worker_->putTaskCpu(
@@ -594,6 +615,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     at::Tensor& outputBuffer, at::Tensor& inputBuffer,
     const c10d::AllgatherOptions& opts) {
     size_t tensorSize = inputBuffer.numel() * inputBuffer.element_size();
+    prepareOp(c10d::OpType::_ALLGATHER_BASE);
     auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
     if (isCpu_) {
         return worker_->putTaskCpu(
@@ -638,6 +660,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
     at::Tensor& outputBuffer, at::Tensor& inputBuffer,
     const c10d::ReduceScatterOptions& opts) {
     size_t tensorSize = outputBuffer.numel() * outputBuffer.element_size();
+    prepareOp(c10d::OpType::_REDUCE_SCATTER_BASE);
     auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
     if (isCpu_) {
         auto numRanks = meta_->size;
@@ -693,6 +716,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
     std::vector<at::Tensor>& inputTensors, const c10d::AllToAllOptions& opts) {
     size_t tensorSize =
         inputTensors[0].numel() * inputTensors[0].element_size();
+    prepareOp(c10d::OpType::ALLTOALL);
     auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
     if (isCpu_) {
         return worker_->putTaskCpu(
@@ -737,6 +761,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
 }
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     const c10d::BarrierOptions& opts) {
+    prepareOp(c10d::OpType::BARRIER);
     auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
     if (isCpu_) {
         return worker_->putTaskCpu(
@@ -763,6 +788,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
     size_t tensorSize = tensor.numel() * tensor.element_size();
     int64_t root = opts.rootRank + opts.rootTensor;
     bool isRoot = (root == rank_);
+    prepareOp(c10d::OpType::REDUCE);
     auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
     if (isCpu_) {
         auto numRanks = meta_->size;
@@ -816,6 +842,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
     }
     auto inputTensor = inputTensors.back();
     size_t tensorSize = inputTensor.numel() * inputTensor.element_size();
+    prepareOp(c10d::OpType::GATHER);
     auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
     if (isCpu_) {
         return worker_->putTaskCpu(
@@ -871,6 +898,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
     TORCH_CHECK(outputTensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
     auto outputTensor = outputTensors.back();
     size_t tensorSize = outputTensor.numel() * outputTensor.element_size();
+    prepareOp(c10d::OpType::SCATTER);
     auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
     if (isCpu_) {
         return worker_->putTaskCpu(
@@ -1067,12 +1095,9 @@ SyncAfterFailureResponse MooncakeBackend::syncAfterFailure() {
 }
 
 void MooncakeBackend::applyViewUpdate(const GroupView& view) {
-    // Guard against shutdown having freed activeRanks before this backend
-    // was removed from backends_ (defense-in-depth).
-    if (!meta_ || !meta_->activeRanks) return;
+    if (!meta_) return;
 
-    // Ignore stale views that arrive out of order (e.g. a delayed Ready
-    // re-broadcast arriving after the activation view).
+    // Ignore stale views that arrive out of order
     auto current_epoch = meta_->epoch.load(std::memory_order_acquire);
     if (view.epoch < current_epoch) {
         return;
@@ -1101,20 +1126,8 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view) {
         const auto& member = view.members[global_rank];
         meta_->activeRanks[local_rank] = member.isActive();
         if (member.endpoint.has_value()) {
-            const uint64_t old_endpoint_epoch =
-                meta_->segmentInfos[local_rank].endpoint_epoch;
             meta_->segmentInfos[local_rank] = *member.endpoint;
 
-            // If this peer republished its endpoint (e.g. after a world-group
-            // destroy+reinit or a fresh group creation), the TE segment cache
-            // may still hold stale rkeys from a previous group incarnation.
-            // Sync with the metadata server so the cached target_id resolves
-            // to fresh rkeys.  No disconnect/reconnect is needed — the
-            // control-plane link state must not be affected by group-level
-            // lifecycle operations.
-            if (old_endpoint_epoch != member.endpoint->endpoint_epoch) {
-                ctx_.engine->syncSegmentCache();
-            }
             // Resolve the peer and cache the current segment ID.
             {
                 auto handle = ctx_.link_manager.resolvePeer(global_rank);
@@ -1133,12 +1146,6 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view) {
     // Keep the Python-visible activeRanksTensor in sync with the view.
     syncActiveRanksTensor();
 
-    // activeSize stays at the total group capacity set in the constructor.
-    // activeRanks[] (updated above via syncActiveRanksTensor) controls
-    // which ranks actually participate in collectives.  This way getSize()
-    // always returns the init_process_group world_size, which PyTorch's
-    // new_group rank validation and other management APIs depend on.
-
     // Publish epoch AFTER all data-plane state (activeRanks, segmentInfos,
     // etc.) is updated.  This ensures that a thread observing the new epoch
     // via getCurrentEpoch() (acquire) sees the complete membership state.
@@ -1154,15 +1161,6 @@ void MooncakeBackend::onPeerLinkReset(InGroupRank peer) {
     }
     if (peer >= 0 && peer < meta_->size) {
         meta_->segmentIDs[peer] = static_cast<TransferMetadata::SegmentID>(-1);
-    }
-}
-
-void MooncakeBackend::markViewStale() {
-    // Mark all in-group slots as inactive so worker threads stop using them.
-    if (meta_ && meta_->activeRanks) {
-        for (int i = 0; i < meta_->size; ++i) {
-            meta_->activeRanks[i] = false;
-        }
     }
 }
 

@@ -103,8 +103,8 @@ class LinkManager {
 
     struct PeerReadState {
         std::atomic<uint64_t> version{0};        // incremented on every link
-                                                   // state change; resolvePeer
-                                                   // uses it to detect torn reads
+                                                 // state change; resolvePeer
+                                                 // uses it to detect torn reads
         std::atomic<uint8_t> link_connected{0};  // 1 = TE link is up
         std::atomic<TransferMetadata::SegmentID>
             target_id{};  // remote segment handle
@@ -136,7 +136,7 @@ class LinkManager {
 
     void pollerLoop();
     bool probePeer(GlobalRank peer);
-    void tearDownPeerLink(GlobalRank peer, bool stop_reconnect);
+    void tearDownPeerLink(GlobalRank peer);
     void emit(TELinkEvent event);
     void wakeup();
 

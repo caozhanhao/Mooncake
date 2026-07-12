@@ -294,25 +294,19 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // Resets the per-backend P2PProxy state for the affected peer.
     void onPeerLinkReset(InGroupRank peer);
 
-    // Mark this backend's view as stale (called when Agent goes Offline).
-    void markViewStale();
-
     /// Sync-after-failure: notify the Coordinator of a detected failure and
     /// block until a membership decision has been made and the Agent has
-    /// ACKed the resulting ViewUpdate.  After this returns, getPeerState()
-    /// reflects the Coordinator's authoritative decision.
+    /// ACKed the resulting ViewUpdate.
     SyncAfterFailureResponse syncAfterFailure();
 
     // Sync the activeRanksTensor on CPU/GPU from the current GroupView.
     void syncActiveRanksTensor();
 
-    // Build a GroupEndpointMetadata for this backend's current local endpoint.
-    // Called by AgentHost after (re-)registration to re-publish endpoints.
     GroupEndpointPublication buildEndpointMetadata() const;
 
-    // Throw if this rank is not yet active in the coordinator view. Collectives
-    // must not be issued before join_group()/recover_ranks() has activated us.
-    void ensureActive() const;
+    // Guard: checks that the rank is Healthy (always) and, for collectives,
+    // that it is active in this group.  Called at the top of every operation.
+    void prepareOp(c10d::OpType op) const;
 
     const GroupEndpointInfo& getLocalEndpointInfo() const {
         return meta_->segmentInfos[meta_->rank];

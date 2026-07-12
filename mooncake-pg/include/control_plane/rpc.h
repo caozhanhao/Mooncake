@@ -233,10 +233,6 @@ struct ApplyViewToBackend {
     GroupView view;
 };
 
-struct MarkBackendViewStale {
-    GroupId group_id;
-};
-
 struct NotifyTEUnreachable {
     GlobalRank peer = kInvalidGlobalRank;
 };
@@ -257,8 +253,8 @@ struct NotifyRanksActivated {
 using AgentEffect =
     std::variant<EnablePeerProbe, DisconnectLink, StopReconnect,
                  ClearPeerMetadata, DisconnectAllLinks, ClearAllPeerMetadata,
-                 ApplyViewToBackend, MarkBackendViewStale, NotifyTEUnreachable,
-                 RefreshPeerLink, NotifyGroupReady, NotifyRanksActivated>;
+                 ApplyViewToBackend, NotifyTEUnreachable, RefreshPeerLink,
+                 NotifyGroupReady, NotifyRanksActivated>;
 
 // Results produced by the Coordinator/Agent state machine
 
