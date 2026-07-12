@@ -221,7 +221,7 @@ def _extension_worker_with_subgroups(
         # WORLD: wait for joiners then recover
         wait_until(
             lambda: all(pg.get_peer_state(world_backend, join_ranks)),
-            timeout_s=60.0,
+            timeout_s=30.0,
             poll_interval_s=0.05,
             description=f"rank {ctx.proc_rank} waiting for WORLD joiners",
         )
@@ -231,7 +231,7 @@ def _extension_worker_with_subgroups(
         if ctx.proc_rank == 0:
             wait_until(
                 lambda: pg.get_peer_state(a_backend, [1])[0],
-                timeout_s=60.0,
+                timeout_s=30.0,
                 poll_interval_s=0.05,
                 description="rank 0 waiting for group_a joiner",
             )
@@ -241,7 +241,7 @@ def _extension_worker_with_subgroups(
         if ctx.proc_rank == 1:
             wait_until(
                 lambda: pg.get_peer_state(b_backend, [1])[0],
-                timeout_s=60.0,
+                timeout_s=30.0,
                 poll_interval_s=0.05,
                 description="rank 1 waiting for group_b joiner",
             )
@@ -250,7 +250,7 @@ def _extension_worker_with_subgroups(
         # group_c: both primaries wait for both joiners (local ranks 2,3)
         wait_until(
             lambda: all(pg.get_peer_state(c_backend, [2, 3])),
-            timeout_s=60.0,
+            timeout_s=30.0,
             poll_interval_s=0.05,
             description=f"rank {ctx.proc_rank} waiting for group_c joiners",
         )
@@ -849,7 +849,7 @@ class _ElasticMixin:
             broken_exited,
             start_recovery,
             nprocs=self.world_size + 1,
-            timeout_s=60.0,
+            timeout_s=30.0,
         )
 
         self.assert_no_errors(rows)
@@ -900,7 +900,7 @@ class _ElasticMixin:
             _extension_worker_with_subgroups,
             extend_event,
             nprocs=self.world_size,
-            timeout_s=60.0,
+            timeout_s=30.0,
         )
 
         self.assert_no_errors(rows)
@@ -921,7 +921,7 @@ class _ElasticMixin:
             _allgather_reduce_scatter_extension_worker,
             extend_event,
             nprocs=self.world_size,
-            timeout_s=60.0,
+            timeout_s=30.0,
         )
 
         self.assert_no_errors(rows)
@@ -946,7 +946,7 @@ class _ElasticMixin:
             broken_exited,
             start_recovery,
             nprocs=self.world_size + 1,
-            timeout_s=60.0,
+            timeout_s=30.0,
         )
 
         self.assert_no_errors(rows)

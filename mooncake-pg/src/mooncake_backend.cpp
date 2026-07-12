@@ -28,10 +28,7 @@ constexpr const char* REGISTER_BUFFER_ERROR_MSG =
     "Failed to register local memory.";
 constexpr const char* MULTI_DEVICE_ERROR_MSG =
     "Expecting one tensor only but got multiple.";
-constexpr const char* SYNC_OP_ERROR_MSG = "Expecting async op but got sync op.";
-constexpr const char* REDUCE_OP_ERROR_MSG = "Only support SUM.";
 constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
-constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 constexpr int kBarrierDummyTensorSize = 1;
 
 // PyTorch may reuse the same logical group_id (e.g. "0") when a process
@@ -73,14 +70,10 @@ static std::string makeMooncakeGroupId(c10d::DistributedBackendOptions& opts) {
                              std::to_string(dis(gen));
 
         opts.store->set(sync_key, unique);
-        LOG(INFO) << "[PG] assigned mooncake group_id=" << unique
-                  << " base=" << base;
     }
 
     opts.store->wait({sync_key});
     std::string unique = opts.store->get_to_str(sync_key);
-    LOG(INFO) << "[PG] resolved mooncake group_id=" << unique
-              << " base=" << base << " rank=" << opts.group_rank;
     return unique;
 }
 
@@ -945,12 +938,7 @@ void MooncakeBackend::shutdown() {
         cudaDeviceSynchronize();
     }
 
-    // Phase 4: Release resources if no hung operations
-    if (has_hung_operation) {
-        p2p_proxy_->abandonResources();
-    }
-
-    // Phase 4: Release resources if no hung operations
+    // Phase 4: Release resources
     if (has_hung_operation) {
         p2p_proxy_->abandonResources();
     }
@@ -1169,19 +1157,11 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view) {
     for (int i = 0; i < kMaxNumRanks; ++i) {
         const auto& member = view.members[i];
         bool is_member = member.isMember();
-        bool old_member = member_bitmap_[i].load(std::memory_order_acquire);
         member_bitmap_[i].store(is_member, std::memory_order_release);
 
         bool endpoint_present = member.hasEndpoint();
-        bool old_endpoint_present =
-            endpoint_present_bitmap_[i].load(std::memory_order_acquire);
         endpoint_present_bitmap_[i].store(endpoint_present,
                                           std::memory_order_release);
-
-        if (is_member != old_member ||
-            endpoint_present != old_endpoint_present ||
-            (i < max_group_size_ && (is_member || endpoint_present))) {
-        }
     }
 
     // Keep the Python-visible activeRanksTensor in sync with the view.

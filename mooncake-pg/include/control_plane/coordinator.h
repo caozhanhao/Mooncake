@@ -169,11 +169,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                        std::unordered_map<uint64_t, PendingViewUpdateBarrier>>
         pending_barriers_;
 
-    // Helpers for barrier lifecycle.
-    void commitBarrier(PendingViewUpdateBarrier barrier,
-                       const std::vector<GlobalRank>& dropped,
-                       std::vector<CoordinatorEffect>& effects);
-
     // Fault reconciliation window.  Transfer observations update link_status
     // immediately, but the coordinator defers the membership decision until
     // the window closes.  Because link_status is global (per-rank), a single
@@ -201,6 +196,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     static constexpr auto kProposeTimeout = std::chrono::seconds(2);
     static constexpr auto kHeartbeatTimeout = std::chrono::seconds(5);
 
+    // --- State transitions ---
+
     void transitionToOffline(GlobalRank rank,
                              std::vector<CoordinatorEffect>& effects);
 
@@ -213,8 +210,10 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // a ViewUpdate when at least one rank is pruned.
     void applyAutoDeactivate(std::vector<CoordinatorEffect>& effects);
 
+    // --- Fault reconciliation ---
+
     // Open the fault reconciliation window and register a group for
-    // reconciliation. Stale epochs (report_epoch < recorded) are silently
+    // reconciliation.  Stale epochs (report_epoch < recorded) are silently
     // ignored.
     void openReconciliationWindow(GroupId group_id, uint64_t report_epoch);
 
@@ -225,6 +224,17 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                                const std::vector<uint8_t>& succeeded,
                                const std::vector<uint8_t>& failed);
 
+    // --- Healthy set computation ---
+
+    bool isMutuallyConnected(GlobalRank a, GlobalRank b) const;
+
+    // Preserve existing Healthy ranks that are still mutually connected,
+    // then extend with new candidates that have full connectivity to all
+    // current members.
+    std::vector<GlobalRank> extendHealthySet() const;
+
+    // --- Group lifecycle ---
+
     // Bootstrap state machine driver.  Advances groups through:
     //   Bootstrapping -> BootstrapSyncing (when all active ranks are Healthy
     //                    and have published endpoints)
@@ -232,6 +242,37 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     //
     // Called after every state-changing operation.
     void checkGroupTransitions(std::vector<CoordinatorEffect>& effects);
+
+    bool processGroupRegistration(GlobalRank joining_rank,
+                                  const GroupView& group, bool auto_deactivate,
+                                  RegisterGroupResponse& response,
+                                  std::vector<CoordinatorEffect>& effects);
+
+    bool canEraseGroup(const GroupView& view) const;
+    void eraseGroup(GroupId group_id, std::vector<CoordinatorEffect>& effects);
+
+    // --- Activatable predicates ---
+
+    bool isActivatableSet(GroupId group_id,
+                          const std::vector<GlobalRank>& new_ranks,
+                          const GroupView& old_view) const;
+
+    bool isRankActivatable(GroupId group_id, GlobalRank rank,
+                           const std::vector<GlobalRank>& future_active) const;
+
+    // --- Barrier management ---
+
+    // Helpers for barrier lifecycle.
+    void commitBarrier(PendingViewUpdateBarrier barrier,
+                       const std::vector<GlobalRank>& dropped,
+                       std::vector<CoordinatorEffect>& effects);
+
+    // Compute the ACK set for a ViewUpdate barrier (proposal / bootstrap).
+    std::unordered_set<GlobalRank> computeBarrierAckSet(
+        const GroupView& old_view, const GroupView& new_view,
+        GroupId group_id) const;
+
+    // --- Sync-after-failure resolution ---
 
     // Resolve (reject) pending syncs for `group_id` / `group_id, rank`.
     // Emits ReplySyncEffect for each pending sync_id.
@@ -241,20 +282,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     void rejectPendingSyncs(GroupId group_id, const std::string& reason,
                             std::vector<CoordinatorEffect>& effects);
 
-    // Compute the ACK set for a ViewUpdate barrier (proposal / bootstrap).
-    std::unordered_set<GlobalRank> computeBarrierAckSet(
-        const GroupView& old_view, const GroupView& new_view,
-        GroupId group_id) const;
-
-    // Build the response for a sync-after-failure request.
-    bool isMutuallyConnected(GlobalRank a, GlobalRank b) const;
-    // Preserve existing Healthy ranks that are still mutually connected,
-    // then extend with new candidates that have full connectivity to all
-    // current members.
-    std::vector<GlobalRank> extendHealthySet() const;
-
-    bool canEraseGroup(const GroupView& view) const;
-    void eraseGroup(GroupId group_id, std::vector<CoordinatorEffect>& effects);
+    // --- Inline utilities ---
 
     // Request validation: rank must be in range, online, and matching session.
     bool hasValidSession(GlobalRank rank, uint64_t session_epoch) const {
@@ -265,18 +293,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     bool rankInRange(GlobalRank rank) const {
         return 0 <= rank && rank < max_world_size_;
     }
-    bool isRankActivatable(GroupId group_id, GlobalRank rank,
-                           const std::vector<GlobalRank>& future_active) const;
-    bool isActivatableSet(GroupId group_id,
-                          const std::vector<GlobalRank>& new_ranks,
-                          const GroupView& old_view) const;
 
-    bool processGroupRegistration(GlobalRank joining_rank,
-                                  const GroupView& group, bool auto_deactivate,
-                                  RegisterGroupResponse& response,
-                                  std::vector<CoordinatorEffect>& effects);
+    // --- Effect factories ---
 
-    // Effect factory helper.
     CoordinatorEffect makeRankStateEffect(GlobalRank rank);
 };
 

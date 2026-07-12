@@ -9,8 +9,6 @@
 
 namespace mooncake {
 
-// CoordinatorRpcServiceImpl
-
 void CoordinatorRpcServiceImpl::registerAgent(
     coro_rpc::context<RegisterAgentResponse> ctx, RegisterAgentRequest req) {
     host_.postRegisterAgent(std::move(ctx), std::move(req));
@@ -30,16 +28,15 @@ void CoordinatorRpcServiceImpl::unregisterGroup(UnregisterGroupRequest req) {
     host_.postUnregisterGroup(std::move(req));
 }
 
-void CoordinatorRpcServiceImpl::publishEndpoint(
-    coro_rpc::context<PublishEndpointResponse> ctx,
-    PublishEndpointRequest req) {
-    host_.postPublishEndpoint(std::move(ctx), std::move(req));
-}
-
 void CoordinatorRpcServiceImpl::proposeViewUpdate(
     coro_rpc::context<ProposeViewUpdateResponse> ctx,
     ProposeViewUpdateRequest req) {
     host_.postProposeViewUpdate(std::move(ctx), std::move(req));
+}
+void CoordinatorRpcServiceImpl::publishEndpoint(
+    coro_rpc::context<PublishEndpointResponse> ctx,
+    PublishEndpointRequest req) {
+    host_.postPublishEndpoint(std::move(ctx), std::move(req));
 }
 
 void CoordinatorRpcServiceImpl::reportLinkStateChange(
@@ -58,8 +55,6 @@ void CoordinatorRpcServiceImpl::syncAfterFailure(
     host_.postSyncAfterFailure(std::move(ctx), std::move(req));
 }
 
-// CoordinatorHost
-
 CoordinatorHost::CoordinatorHost(c10::intrusive_ptr<c10d::Store> store,
                                  const std::string& host_ip, int max_world_size,
                                  int64_t fault_reconciliation_window_us)
@@ -74,7 +69,6 @@ CoordinatorHost::CoordinatorHost(c10::intrusive_ptr<c10d::Store> store,
 CoordinatorHost::~CoordinatorHost() {}
 
 void CoordinatorHost::start() {
-    // Start RPC server.
     rpc_server_ = std::make_unique<RpcServer>(/*port=*/0, /*thread_num=*/2);
     rpc_impl_ = std::make_unique<CoordinatorRpcServiceImpl>(*this);
     rpc_server_
@@ -82,8 +76,8 @@ void CoordinatorHost::start() {
                           &CoordinatorRpcService::heartbeat,
                           &CoordinatorRpcService::registerGroup,
                           &CoordinatorRpcService::unregisterGroup,
-                          &CoordinatorRpcService::publishEndpoint,
                           &CoordinatorRpcService::proposeViewUpdate,
+                          &CoordinatorRpcService::publishEndpoint,
                           &CoordinatorRpcService::reportLinkStateChange,
                           &CoordinatorRpcService::reportTransferObservation,
                           &CoordinatorRpcService::syncAfterFailure>(
@@ -91,11 +85,9 @@ void CoordinatorHost::start() {
 
     rpc_server_->start();
 
-    // Write Coordinator address to Store for Agent discovery.
     std::string addr = rpc_server_->getListenAddr(host_ip_);
     store_->set("coordinator_addr", addr);
 
-    // Set up periodic tick.
     executor_.setTickCallback([this]() {
         auto result = state_machine_.checkTimeouts();
         runEffects(result.effects);
@@ -105,18 +97,14 @@ void CoordinatorHost::start() {
 }
 
 void CoordinatorHost::shutdown() {
-    // 1. Stop RPC server - no new requests accepted.
     if (rpc_server_) rpc_server_->shutdown();
-    // 2. Drain the executor - all posted tasks complete.
     executor_.shutdown();
-    // 3. Fail any pending 2PC proposals so clients don't hang.
     for (auto& [propose_id, ctx] : pending_rpcs_) {
         ctx.response_msg(ProposeViewUpdateResponse{
             ViewUpdateStatus::Rejected, 0, {}, "coordinator shutting down"});
     }
     pending_rpcs_.clear();
 
-    // 4. Fail any pending sync requests.
     for (auto& [sync_id, ctx] : pending_sync_ctxs_) {
         ctx.response_msg(SyncAfterFailureResponse{
             SyncAfterFailureStatus::Rejected, 0, "coordinator shutting down"});
@@ -161,17 +149,6 @@ void CoordinatorHost::postUnregisterGroup(UnregisterGroupRequest req) {
     });
 }
 
-void CoordinatorHost::postPublishEndpoint(
-    coro_rpc::context<PublishEndpointResponse> ctx,
-    PublishEndpointRequest req) {
-    executor_.post(
-        [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
-            auto result = state_machine_.handlePublishEndpoint(req);
-            ctx.response_msg(std::move(result.response));
-            runEffects(result.effects);
-        });
-}
-
 void CoordinatorHost::postProposeViewUpdate(
     coro_rpc::context<ProposeViewUpdateResponse> ctx,
     ProposeViewUpdateRequest req) {
@@ -182,6 +159,17 @@ void CoordinatorHost::postProposeViewUpdate(
         auto result = state_machine_.handleProposeViewUpdate(propose_id, req);
         runEffects(result.effects);
     });
+}
+
+void CoordinatorHost::postPublishEndpoint(
+    coro_rpc::context<PublishEndpointResponse> ctx,
+    PublishEndpointRequest req) {
+    executor_.post(
+        [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
+            auto result = state_machine_.handlePublishEndpoint(req);
+            ctx.response_msg(std::move(result.response));
+            runEffects(result.effects);
+        });
 }
 
 void CoordinatorHost::postTransferObservation(TransferObservationReport req) {

@@ -28,8 +28,6 @@ uint64_t generateInitialAgentSessionEpoch() {
 
 }  // namespace
 
-// AgentRpcServiceImpl
-
 void AgentRpcServiceImpl::onPeerJoined(PeerJoinedPush push) {
     host_.postPeerJoined(std::move(push));
 }
@@ -42,8 +40,6 @@ void AgentRpcServiceImpl::onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                                        ViewUpdatePush push) {
     host_.postViewUpdate(std::move(ctx), std::move(push));
 }
-
-// AgentHost
 
 AgentHost::AgentHost(c10::intrusive_ptr<c10d::Store> store,
                      const std::string& host_ip, GlobalRank rank,
@@ -61,11 +57,9 @@ AgentHost::AgentHost(c10::intrusive_ptr<c10d::Store> store,
 AgentHost::~AgentHost() { shutdown(); }
 
 void AgentHost::start() {
-    // Register LinkManager event callback.
     link_manager_.setEventCallback(
         [this](TELinkEvent event) { postTELinkEvent(std::move(event)); });
 
-    // Start Agent RPC server.
     rpc_server_ = std::make_unique<RpcServer>(/*port=*/0, /*thread_num=*/2);
     rpc_impl_ = std::make_unique<AgentRpcServiceImpl>(*this);
     rpc_server_->registerHandler<&AgentRpcService::onPeerJoined,
@@ -77,12 +71,6 @@ void AgentHost::start() {
         LOG(ERROR) << "AgentHost: failed to start RPC server rank=" << rank_;
     }
 
-    // Read Coordinator address from Store with backoff poll.
-    // We cannot guarantee the Coordinator is initialised before this
-    // Agent  - non-rank-0 processes may reach this point before rank 0
-    // has written the key.  wait() blocks the predicate thread until the
-    // key is set (or the Store connection fails), so we run it inside the
-    // BackoffWaiter predicate which catches exceptions and retries.
     BackoffWaiter waiter(BackoffWaiterConfig::constantSleep(
         AgentHost::kCoordinatorAddrPollInterval));
 
@@ -106,33 +94,19 @@ void AgentHost::start() {
                    << "s waiting for coordinator_addr in Store";
     }
 
-    // Set up periodic tick.
     executor_.setTickCallback([this]() { tick(); });
     executor_.start();
 
-    // Initial registration.
     executor_.post([this]() { startAgentRegistration(); });
 }
 
 void AgentHost::shutdown() {
-    // Stop RPC server first — no new pushes accepted, in-flight handlers
-    // are guaranteed to have finished posting to the executor.
     if (rpc_server_) rpc_server_->shutdown();
-    // Drain the executor next so that queued tasks (including unregisterGroup /
-    // unregisterGroup sends) finish before we tear down the RpcClient.
     executor_.shutdown();
-    // Mark RpcClient as shutting down last.  In-flight async coroutines on the
-    // global I/O executor may still fire after this point, but their connection
-    // errors are suppressed by the VLOG in rpc_runtime.h.
     if (rpc_client_) rpc_client_->shutdown();
-    // Drop the shared-state reference.  At this point the executor is stopped
-    // and in-flight coroutines have been told to drop, so no code path will
-    // dereference rpc_client_.
     if (rpc_client_) rpc_client_.reset();
     link_manager_.setEventCallback(nullptr);
 }
-
-// Agent interface: Bootstrap
 
 bool AgentHost::waitUntilRegistered(std::chrono::milliseconds timeout) {
     auto promise = std::make_shared<std::promise<void>>();
@@ -227,8 +201,6 @@ void AgentHost::waitUntilRankActive(GroupId group_id, GlobalRank rank,
     }
 }
 
-// Agent interface: Group management
-
 void AgentHost::registerGroup(const GroupView& group, bool auto_deactivate,
                               MooncakeBackend* backend) {
     executor_.postAndWait([this, group = group, auto_deactivate,
@@ -290,8 +262,6 @@ void AgentHost::publishLocalEndpoint(GroupEndpointPublication endpoint) {
     });
 }
 
-// Agent interface: Membership proposals (synchronous)
-
 ProposeViewUpdateResponse AgentHost::proposeViewUpdateInternal(
     GroupId group_id, const std::vector<GlobalRank>& ranks,
     bool is_activation) {
@@ -315,8 +285,6 @@ ProposeViewUpdateResponse AgentHost::proposeDeactivate(
     return proposeViewUpdateInternal(group_id, ranks, /*is_activation=*/false);
 }
 
-// Agent interface: Transfer observation (thread-safe)
-
 void AgentHost::pushTransferObservation(GroupId group_id,
                                         std::vector<uint8_t> attempted_ranks,
                                         std::vector<uint8_t> failed_ranks,
@@ -335,9 +303,6 @@ SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
     req.reporter_rank = rank_;
     req.agent_session_epoch = agent_.getAgentSessionEpoch();
 
-    // Step 1: Drain observation queue on the executor thread.
-    // Piggyback a pending observation for the target group, and send any
-    // observations for other groups normally.
     executor_.postAndWait([this, &req]() {
         TransferObservationEvent event;
         while (true) {
@@ -372,18 +337,11 @@ SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
         }
     });
 
-    // Step 2: Get current epoch (safe — executor serializes access).
     req.current_epoch = getGroupView(group_id).epoch;
 
-    // Step 3: Synchronous RPC.  Blocks the calling thread (not the executor)
-    // until the Coordinator replies.  The reply is gated on the ViewUpdate
-    // ACK from this Agent, so get_peer_state() reflects the decision when
-    // this returns.
     return rpc_client_->call<&CoordinatorRpcService::syncAfterFailure>(
         coordinator_addr_, req);
 }
-
-// Agent interface: Accessors
 
 GroupView AgentHost::getGroupView(GroupId group_id) {
     auto promise = std::make_shared<std::promise<GroupView>>();
@@ -393,8 +351,6 @@ GroupView AgentHost::getGroupView(GroupId group_id) {
     });
     return future.get();
 }
-
-// RPC push callbacks
 
 void AgentHost::postPeerJoined(PeerJoinedPush push) {
     executor_.post([this, push = std::move(push)]() {
@@ -468,8 +424,6 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
     });
 }
 
-// LinkManager event
-
 void AgentHost::postTELinkEvent(TELinkEvent event) {
     executor_.post([this, event = std::move(event)]() {
         if (event.kind == TELinkEvent::Kind::LinkUp) {
@@ -505,8 +459,6 @@ void AgentHost::postTELinkEvent(TELinkEvent event) {
         }
     });
 }
-
-// Internal: startAgentRegistration
 
 void AgentHost::startAgentRegistration() {
     // Avoid duplicate registration RPCs.  This also covers the case where a
@@ -584,8 +536,6 @@ void AgentHost::startAgentRegistration() {
         });
 }
 
-// Internal: tick
-
 void AgentHost::tick() {
     if (!rpc_client_) return;
 
@@ -639,8 +589,6 @@ void AgentHost::tick() {
             });
         });
 }
-
-// Internal: runEffects
 
 void AgentHost::runEffects(const AgentApplyResult& effects) {
     for (const auto& effect : effects) {

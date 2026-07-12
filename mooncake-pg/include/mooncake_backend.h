@@ -322,24 +322,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     const MooncakeProcessContext& getProcessContext() const { return ctx_; }
 
    private:
-    // Initialization helpers extracted from the constructor.
-    void initGroupParams(int rank, int size,
-                         const std::vector<GlobalRank>& globalRanks);
-    std::string determineMemoryLocation() const;
-    std::vector<GlobalRank> buildInitialRankOrder(
-        int size, const std::vector<GlobalRank>& globalRanks) const;
-    void logBackendInfo(
-        int rank, int size, const std::vector<GlobalRank>& globalRanks,
-        const std::vector<GlobalRank>& initial_rank_order) const;
-    void registerBuffers(const std::string& location);
-    void registerCpuSyncRegions();
-    void initWorkersAndProxy(int rank, int cuda_device_index);
-    void initGroupMeta(int rank, int size,
-                       const std::vector<GlobalRank>& initial_rank_order);
-    void storeLocalEndpointInfo();
-    void joinAndApplyInitialView(std::vector<GlobalRank> initial_rank_order);
-    void registerP2PShim();
-
     MooncakeProcessContext& ctx_;
     std::shared_ptr<MooncakeWorker> worker_;
     const c10::intrusive_ptr<MooncakeBackendOptions> options_;

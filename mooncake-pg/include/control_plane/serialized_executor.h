@@ -31,7 +31,7 @@ namespace mooncake {
 class SerializedExecutor {
    public:
     SerializedExecutor() = default;
-    explicit SerializedExecutor(std::string /*name*/) {}
+    explicit SerializedExecutor(std::string name) : name_(std::move(name)) {}
 
     ~SerializedExecutor() { shutdown(); }
 
@@ -64,13 +64,14 @@ class SerializedExecutor {
                 task();
             } catch (const std::exception& e) {
                 fprintf(stderr,
-                        "SerializedExecutor: unhandled exception in "
+                        "SerializedExecutor(%s): unhandled exception in "
                         "leftover task during shutdown: %s\n",
-                        e.what());
+                        name_.c_str(), e.what());
             } catch (...) {
                 fprintf(stderr,
-                        "SerializedExecutor: unhandled non-std exception "
-                        "in leftover task during shutdown\n");
+                        "SerializedExecutor(%s): unhandled non-std exception "
+                        "in leftover task during shutdown\n",
+                        name_.c_str());
             }
         }
     }
@@ -158,13 +159,14 @@ class SerializedExecutor {
                     // Log and swallow: a single bad task must not kill the
                     // loop.
                     fprintf(stderr,
-                            "SerializedExecutor: unhandled exception in "
+                            "SerializedExecutor(%s): unhandled exception in "
                             "task: %s\n",
-                            e.what());
+                            name_.c_str(), e.what());
                 } catch (...) {
                     fprintf(stderr,
-                            "SerializedExecutor: unhandled non-std exception "
-                            "in task\n");
+                            "SerializedExecutor(%s): unhandled non-std exception "
+                            "in task\n",
+                            name_.c_str());
                 }
             }
             if (tick_callback_) {
@@ -172,18 +174,20 @@ class SerializedExecutor {
                     tick_callback_();
                 } catch (const std::exception& e) {
                     fprintf(stderr,
-                            "SerializedExecutor: unhandled exception in "
+                            "SerializedExecutor(%s): unhandled exception in "
                             "tick callback: %s\n",
-                            e.what());
+                            name_.c_str(), e.what());
                 } catch (...) {
                     fprintf(stderr,
-                            "SerializedExecutor: unhandled non-std exception "
-                            "in tick callback\n");
+                            "SerializedExecutor(%s): unhandled non-std exception "
+                            "in tick callback\n",
+                            name_.c_str());
                 }
             }
         }
     }
 
+    std::string name_;
     std::thread thread_;
     std::atomic<bool> running_{false};
     std::mutex mutex_;

@@ -5,8 +5,6 @@
 
 namespace mooncake {
 
-// Constructor
-
 AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     : rank_(rank), max_world_size_(max_world_size) {
     CHECK_GT(max_world_size_, 0);
@@ -18,8 +16,6 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     last_reported_peer_status_.fill(false);
     rank_state_snapshot_.fill(static_cast<uint8_t>(RankState::Offline));
 }
-
-// Group lifecycle
 
 void AgentStateMachine::registerGroup(const GroupView& group,
                                       bool auto_deactivate) {
@@ -52,7 +48,7 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
 
     // If the TE server name changed (replacement process), tear down the
     // old link before probing the new one.  Without this the poller skips
-    // the peer because the old CONNECTED state lingers until the transport
+    // the peer because the old Connected state lingers until the transport
     // engine detects the peer failure, which can take seconds.
     auto old = rank_connections_[push.rank];
     if (old.has_value() && old->te_server_name != push.te_server_name) {
@@ -71,8 +67,6 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
         EnablePeerProbe{push.rank, push.te_server_name, push.warmup_recv_addr});
     return effects;
 }
-
-// handleRankStateUpdate  - Coordinator-authoritative state change
 
 AgentApplyResult AgentStateMachine::handleRankStateUpdate(
     const RankStateUpdatePush& push) {
@@ -233,12 +227,6 @@ AgentApplyResult AgentStateMachine::prepareCleanSlateRegister() {
     return effects;
 }
 
-// processTransferObservation  - report when observation differs from last
-//
-// Input bit-vectors are indexed by GlobalRank (producers translate through
-// rank_order before reporting).  We compare each attempted peer against
-// last_reported_peer_status_ and emit a TransferObservationReport when
-// anything changed.
 AgentApplyResult AgentStateMachine::processTransferObservation(
     const TransferObservationEvent& event) {
     AgentApplyResult effects;
@@ -284,7 +272,6 @@ AgentApplyResult AgentStateMachine::processTransferObservation(
 
     if (has_changed) {
         effects.push_back(SendTransferObservation{std::move(req)});
-    } else {
     }
 
     return effects;

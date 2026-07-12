@@ -410,19 +410,6 @@ void MooncakeWorker::startWorker() {
                                         group->group_id, std::move(attempted),
                                         std::move(failed),
                                         std::move(succeeded));
-                                LOG(INFO)
-                                    << "[WORKER] transfer observation pushed "
-                                    << " rank=" << group->globalRank
-                                    << " group=" << group->group_id;
-                                for (int j = 0; j < group->size; ++j) {
-                                    LOG(INFO)
-                                        << "[WORKER]   peer=" << j
-                                        << " global_peer="
-                                        << group->rank_order[j] << " attempted="
-                                        << (int)task.attemptedRanksHintHost[j]
-                                        << " failed="
-                                        << (int)task.failedRanksHintHost[j];
-                                }
                             }
                         }
 

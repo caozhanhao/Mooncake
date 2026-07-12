@@ -4,8 +4,6 @@
 
 namespace mooncake {
 
-// RpcServer
-
 RpcServer::RpcServer(uint16_t port, unsigned thread_num)
     : port_(port), thread_num_(thread_num) {
     server_ = std::make_unique<coro_rpc::coro_rpc_server>(thread_num_, port_);
@@ -43,8 +41,6 @@ void RpcServer::shutdown() {
         server_.reset();
     }
 }
-
-// RpcClient private helpers
 
 async_simple::coro::Lazy<std::shared_ptr<coro_rpc::coro_rpc_client>>
 RpcClient::getOrCreateClient(std::shared_ptr<SharedState> state,
@@ -94,8 +90,6 @@ std::unique_ptr<coro_rpc::coro_rpc_client> RpcClient::createSyncClient() {
     return std::make_unique<coro_rpc::coro_rpc_client>(
         coro_io::get_global_executor(), config);
 }
-
-// RpcClient public methods
 
 bool RpcClient::isConnected(const std::string& addr) const {
     std::lock_guard<std::mutex> lock(state_->mutex);

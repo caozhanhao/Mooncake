@@ -496,7 +496,6 @@ bool LinkManager::probePeer(GlobalRank peer) {
         }
 
         case PeerLinkState::Connected:
-        case PeerLinkState::Expiring:
             break;
     }
 

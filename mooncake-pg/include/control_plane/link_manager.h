@@ -116,7 +116,6 @@ class LinkManager {
         WaitingWarmupTransfer,
         WaitingPeerWarmup,
         Connected,
-        Expiring,
     };
 
     struct PeerLink {

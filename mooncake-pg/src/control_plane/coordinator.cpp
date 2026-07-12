@@ -11,8 +11,6 @@
 
 namespace mooncake {
 
-// Constructor
-
 CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
     int max_world_size, std::chrono::microseconds fault_reconciliation_window)
     : max_world_size_(max_world_size),
@@ -29,8 +27,6 @@ CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
         }
     }
 }
-
-// registerAgent
 
 CoordinatorApplyResult<RegisterAgentResponse>
 CentralizedCoordinatorStateMachine::handleRegisterAgent(
@@ -117,8 +113,6 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     return result;
 }
 
-// heartbeat
-
 CoordinatorApplyResult<HeartbeatResponse>
 CentralizedCoordinatorStateMachine::handleHeartbeat(
     const HeartbeatRequest& req) {
@@ -191,8 +185,49 @@ CentralizedCoordinatorStateMachine::handleUnregisterGroup(
     return result;
 }
 
-// handleProposeViewUpdate (activate / deactivate)
+CoordinatorApplyResult<PublishEndpointResponse>
+CentralizedCoordinatorStateMachine::handlePublishEndpoint(
+    const PublishEndpointRequest& req) {
+    CoordinatorApplyResult<PublishEndpointResponse> result;
+    if (!hasValidSession(req.rank, req.agent_session_epoch)) {
+        result.response.success = false;
+        result.response.reject_reason = "rank out of range or stale session";
+        return result;
+    }
 
+    for (const auto& ep : req.endpoints) {
+        auto it = group_views_.find(ep.group_id);
+        if (it == group_views_.end()) {
+            result.response.success = false;
+            result.response.reject_reason = "group not found";
+            return result;
+        }
+
+        auto& view = it->second;
+        auto& member = view.members[req.rank];
+        member.agent_session_epoch = req.agent_session_epoch;
+        member.endpoint = ep.endpoint_info;
+        member.endpoint->endpoint_epoch = ++endpoint_epochs_[req.rank];
+
+        if (member.isMember() && view.status == GroupStatus::Ready) {
+            view.epoch++;
+            result.effects.push_back(ViewUpdateEffect{view});
+        }
+    }
+
+    result.response.success = true;
+    checkGroupTransitions(result.effects);
+    return result;
+}
+
+// transferObservation  - update link_status from data-plane evidence
+//
+// The link_status is updated immediately. However, the coordinator does
+// NOT recompute the authoritative healthy set here.  Instead it opens a
+//  fault_reconciliation_window; the membership decision is deferred
+// until the window closes.  This gives multiple survivors time to report the
+// same failure and prevents a single fast reporter from causing a premature
+// auto-deactivation that hides the failure from slower survivors.
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     uint64_t propose_id, const ProposeViewUpdateRequest& req) {
@@ -290,51 +325,6 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     return result;
 }
 
-// publishEndpoint - endpoint registration
-
-CoordinatorApplyResult<PublishEndpointResponse>
-CentralizedCoordinatorStateMachine::handlePublishEndpoint(
-    const PublishEndpointRequest& req) {
-    CoordinatorApplyResult<PublishEndpointResponse> result;
-    if (!hasValidSession(req.rank, req.agent_session_epoch)) {
-        result.response.success = false;
-        result.response.reject_reason = "rank out of range or stale session";
-        return result;
-    }
-
-    for (const auto& ep : req.endpoints) {
-        auto it = group_views_.find(ep.group_id);
-        if (it == group_views_.end()) {
-            result.response.success = false;
-            result.response.reject_reason = "group not found";
-            return result;
-        }
-
-        auto& view = it->second;
-        auto& member = view.members[req.rank];
-        member.agent_session_epoch = req.agent_session_epoch;
-        member.endpoint = ep.endpoint_info;
-        member.endpoint->endpoint_epoch = ++endpoint_epochs_[req.rank];
-
-        if (member.isMember() && view.status == GroupStatus::Ready) {
-            view.epoch++;
-            result.effects.push_back(ViewUpdateEffect{view});
-        }
-    }
-
-    result.response.success = true;
-    checkGroupTransitions(result.effects);
-    return result;
-}
-
-// transferObservation  - update link_status from data-plane evidence
-//
-// The link_status is updated immediately. However, the coordinator does
-// NOT recompute the authoritative healthy set here.  Instead it opens a
-//  fault_reconciliation_window; the membership decision is deferred
-// until the window closes.  This gives multiple survivors time to report the
-// same failure and prevents a single fast reporter from causing a premature
-// auto-deactivation that hides the failure from slower survivors.
 
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleTransferObservation(
@@ -402,8 +392,6 @@ bool CentralizedCoordinatorStateMachine::applyLinkStatusUpdate(
     }
     return has_negative;
 }
-
-// handleLinkStateChange - per-peer link state change from LinkManager events
 
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleLinkStateChange(
@@ -600,8 +588,6 @@ CentralizedCoordinatorStateMachine::checkTimeouts() {
     return result;
 }
 
-// Private: state transitions
-
 void CentralizedCoordinatorStateMachine::transitionToOffline(
     GlobalRank rank, std::vector<CoordinatorEffect>& effects) {
     LOG(INFO) << "[COORD] transitionToOffline rank=" << rank
@@ -725,12 +711,6 @@ void CentralizedCoordinatorStateMachine::updateRankStates(
     std::vector<CoordinatorEffect>& effects) {
     auto healthy_set = extendHealthySet();
 
-    std::string healthy_str;
-    for (GlobalRank r : healthy_set) {
-        healthy_str += std::to_string(r) + " ";
-    }
-    LOG(INFO) << "[COORD] updateRankStates healthy_set=[" << healthy_str << "]";
-
     // Update per-rank Healthy / Synced state.
     for (int i = 0; i < max_world_size_; ++i) {
         if (ranks_[i].state == RankState::Offline) continue;
@@ -788,8 +768,6 @@ void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
     }
 }
 
-// Private: activatable predicates
-
 bool CentralizedCoordinatorStateMachine::isActivatableSet(
     GroupId group_id, const std::vector<GlobalRank>& new_ranks,
     const GroupView& old_view) const {
@@ -804,11 +782,6 @@ bool CentralizedCoordinatorStateMachine::isActivatableSet(
         if (!old_view.members[r].isActive()) {
             future_active.push_back(r);
         }
-    }
-
-    std::string future_active_str;
-    for (GlobalRank r : future_active) {
-        future_active_str += std::to_string(r) + " ";
     }
 
     // Every rank in the future set must be activatable with respect to the
@@ -850,21 +823,9 @@ bool CentralizedCoordinatorStateMachine::isRankActivatable(
     bool session_ok =
         member.agent_session_epoch.has_value() &&
         *member.agent_session_epoch == ranks_[rank].agent_session_epoch;
-    bool result = member_ok && endpoint_ok && session_ok;
-    if (!result) {
-    }
-    return result;
+    return member_ok && endpoint_ok && session_ok;
 }
 
-// checkGroupTransitions - bootstrap state machine driver.
-//
-// Group lifecycle:
-//   processGroupRegistration() creates a group in Bootstrapping status.  Once
-//   all active ranks have valid endpoints, are Healthy, and are mutually
-//   TE-connected, this function transitions to BootstrapSyncing and broadcasts
-//   a ViewUpdate to collect ACKs from all active ranks (a 2PC barrier).  Once
-//   all ACKs arrive, the group transitions to Ready. waitUntilGroupReady()
-//   unblocks only when status == Ready.
 void CentralizedCoordinatorStateMachine::checkGroupTransitions(
     std::vector<CoordinatorEffect>& effects) {
     for (auto& [group_id, view] : group_views_) {
@@ -899,8 +860,6 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                     view.status = GroupStatus::Ready;
                     view.epoch++;
                     effects.push_back(ViewUpdateEffect{view});
-                    LOG(INFO) << "[COORD] group=" << group_id
-                              << " transitioned to Ready epoch=" << view.epoch;
                 } else {
                     pending_barriers_[group_id][view.epoch] =
                         PendingViewUpdateBarrier{
@@ -911,14 +870,10 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                             PendingViewUpdateBarrier::BootstrapCommit{}};
 
                     effects.push_back(ViewUpdateEffect{view});
-                    LOG(INFO) << "[COORD] group=" << group_id
-                              << " transitioned to BootstrapSyncing epoch="
-                              << view.epoch;
                 }
             }
         }
-        // BootstrapSyncing → Ready is committed from handleViewUpdateAck /
-        // commitBarrier when all required ACKs arrive.  No active work here.
+        // BootstrapSyncing -> Ready is done in commitBarrier when all required ACKs arrive
     }
 }
 
@@ -994,32 +949,22 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
     // mapping).  getPeerState() relies on rank_order to resolve in-group ranks.
     if (new_order.size() > existing_order.size()) {
         group_views_[group_id].rank_order = new_order;
-        LOG(INFO) << "[COORD] registerGroup extended rank_order for group="
-                  << group_id << " old_size=" << existing_order.size()
-                  << " new_size=" << new_order.size();
     }
 
     // The joining rank needs to be able to receive view updates from the
-    // Coordinator, even if it is not yet active.  Promote kNone to kInactive
+    // Coordinator, even if it is not yet active.  Promote None to Inactive
     // so that pushViewUpdate() will deliver the authoritative view to it.
     auto& view = group_views_[group_id];
     if (rankInRange(joining_rank) &&
         view.members[joining_rank].status == GroupMemberStatus::None) {
         view.members[joining_rank].status = GroupMemberStatus::Inactive;
-        LOG(INFO) << "[COORD] registerGroup promoted joining_rank="
-                  << joining_rank << " to Inactive in group=" << group_id
-                  << " view_epoch=" << view.epoch;
     }
 
     // A Ready group that receives a registerGroup should push the authoritative
     // Ready view to all members (including the newly-joined inactive rank) so
     // that joining ranks can observe Ready and unblock waitUntilGroupReady().
-    // Because the Coordinator executor is serialized, multiple simultaneous
-    // joiners are naturally ordered into sequential pushes.
     if (view.status == GroupStatus::Ready) {
         effects.push_back(ViewUpdateEffect{view});
-        LOG(INFO) << "[COORD] registerGroup pushed Ready view group="
-                  << group_id << " epoch=" << view.epoch;
     }
 
     response.success = true;
@@ -1074,9 +1019,6 @@ CoordinatorEffect CentralizedCoordinatorStateMachine::makeRankStateEffect(
         RankStateUpdatePush{rank, static_cast<uint8_t>(ranks_[rank].state)}};
 }
 
-// commitBarrier - a pending ViewUpdate barrier has collected all required ACKs
-// (or its deadline passed with dropped ranks).  Execute the source-specific
-// commit action and emit the corresponding effects.
 void CentralizedCoordinatorStateMachine::commitBarrier(
     PendingViewUpdateBarrier barrier, const std::vector<GlobalRank>& dropped,
     std::vector<CoordinatorEffect>& effects) {
@@ -1101,14 +1043,11 @@ void CentralizedCoordinatorStateMachine::commitBarrier(
                 view.status = GroupStatus::Ready;
                 view.epoch++;
                 effects.push_back(ViewUpdateEffect{view});
-                LOG(INFO) << "[COORD] group=" << barrier.group_id
-                          << " transitioned to Ready epoch=" << view.epoch;
             },
         },
         barrier.commit);
 }
 
-// rejectPendingSyncs - reject pending syncs for a specific rank in a group.
 void CentralizedCoordinatorStateMachine::rejectPendingSyncs(
     GroupId group_id, GlobalRank rank, const std::string& reason,
     std::vector<CoordinatorEffect>& effects) {
@@ -1161,9 +1100,6 @@ void CentralizedCoordinatorStateMachine::rejectPendingSyncs(
 // computeBarrierAckSet -- ranks that must ACK before a proposal/bootstrap
 // barrier can commit.  Includes all online ranks active in either old or new
 // view plus ranks with pending sync-after-failure calls.
-// The proposer (if any) is included: the ViewUpdate push is processed on the
-// proposer's executor thread independently of the calling thread that is
-// blocked in proposeViewUpdate, so there is no deadlock.
 std::unordered_set<GlobalRank>
 CentralizedCoordinatorStateMachine::computeBarrierAckSet(
     const GroupView& old_view, const GroupView& new_view,

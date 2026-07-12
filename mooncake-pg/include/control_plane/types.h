@@ -27,7 +27,6 @@ using GroupId = std::string;  // process group ID (from PyTorch
                               // DistributedBackendOptions::group_id)
 
 constexpr GlobalRank kInvalidGlobalRank = -1;
-inline const GroupId kInvalidGroupId = "";
 constexpr int kMaxNumRanks = 64;
 
 // Process-level state for a rank.  All transitions are driven by the
