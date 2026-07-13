@@ -49,7 +49,6 @@ def _subgroup_create_destroy_worker(ctx: MooncakePGWorkerContext) -> None:
         # All ranks collectively create both groups
         even_group = dist.new_group(ranks=even_ranks, backend=ctx.backend_name)
         odd_group = dist.new_group(ranks=odd_ranks, backend=ctx.backend_name)
-        print("ok")
         # Each rank uses its respective group
         if rank in even_ranks and even_group is not None:
             tensor = torch.tensor([rank], dtype=torch.int32, device=device)
@@ -60,12 +59,10 @@ def _subgroup_create_destroy_worker(ctx: MooncakePGWorkerContext) -> None:
             dist.all_reduce(tensor, group=odd_group, op=dist.ReduceOp.SUM)
             subgroup_sum = int(tensor.cpu().item())
 
-        print("???")
         # Verify world group still works after subgroup operations
         world_tensor = torch.tensor([1], dtype=torch.int32, device=device)
         dist.all_reduce(world_tensor, op=dist.ReduceOp.SUM)
 
-        print("??xxx")
         ctx.record_result({
             "subgroup_sum": subgroup_sum,
             "world_sum": int(world_tensor.cpu().item()),

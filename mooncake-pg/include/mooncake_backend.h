@@ -25,7 +25,11 @@
 namespace mooncake {
 
 static constexpr size_t kDefaultCollectiveTimeoutUs = 100000;  // 100 ms
-static constexpr int64_t kDefaultP2PTimeoutUs = 3000000;       // 3 s
+static constexpr int64_t kDefaultP2PTimeoutUs = 3000000;        // 3 s
+static constexpr int64_t kDefaultFaultReconciliationWindowUs =
+    4 * kDefaultCollectiveTimeoutUs;  // 400 ms — must be &gt; collective_timeout_us
+                                       // so timeout-based failure reporters
+                                       // contribute before the window expires
 
 class AgentInterface;
 class AgentHost;
@@ -36,10 +40,10 @@ struct MooncakeProcessContext {
     // === Configuration (Python setters may modify before first backend) ===
     TransferEngine* external_engine = nullptr;
     std::string host_ip = "127.0.0.1";
-    size_t collective_timeout_us =
-        kDefaultCollectiveTimeoutUs;
+    size_t collective_timeout_us = kDefaultCollectiveTimeoutUs;
     int64_t p2p_timeout_us = kDefaultP2PTimeoutUs;
-    int64_t fault_reconciliation_window_us = 50000;  // 50 ms
+    int64_t fault_reconciliation_window_us =
+        kDefaultFaultReconciliationWindowUs;
 
     // When true, Work::wait() implicitly calls syncAfterFailure() after
     // a peer failure is detected, so that failed ranks are deactivated
@@ -299,6 +303,11 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // Called by AgentHost when a TE link to `peer` (InGroupRank) goes down.
     // Resets the per-backend P2PProxy state for the affected peer.
     void onPeerLinkReset(InGroupRank peer);
+
+    /// Called by NotifyLinkRefreshed effect: refresh the cached TE segment
+    /// ID for `local` (InGroupRank) from the shared LinkManager.
+    /// If the link is not up, segmentID is set to -1.
+    void refreshSegmentID(InGroupRank local);
 
     /// Sync-after-failure: notify the Coordinator of a detected failure and
     /// block until a membership decision has been made and the Agent has

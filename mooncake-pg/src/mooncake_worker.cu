@@ -18,9 +18,7 @@ namespace mooncake {
 __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
                                   uint64_t submitSequence, void* meta,
-                                  Task* tasks, int* failedRanksHintHostPtr,
-                                  int* attemptedRanksHintHostPtr,
-                                  size_t taskId) {
+                                  Task* tasks, size_t taskId) {
     // Copy task into slot
     tasks[taskId].opType = opType;
     tasks[taskId].tensorSize = tensorSize;
@@ -28,8 +26,6 @@ __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
     tasks[taskId].bufferOffset = bufferOffset;
     tasks[taskId].submitSequence = submitSequence;
     tasks[taskId].transferGroupMeta = meta;
-    tasks[taskId].failedRanksHintHost = failedRanksHintHostPtr;
-    tasks[taskId].attemptedRanksHintHost = attemptedRanksHintHostPtr;
 
     // Publish task metadata before notifying the host worker thread.
     __threadfence_system();
@@ -145,19 +141,16 @@ namespace mooncake {
 void launchEnqueueTaskKernel(int opType, size_t tensorSize,
                              int64_t broadcastRoot, int bufferOffset,
                              uint64_t submitSequence, void* meta, Task* tasks,
-                             int* failedRanksHintHostPtr,
-                             int* attemptedRanksHintHostPtr, size_t taskId,
-                             cudaStream_t stream) {
-    enqueueTaskKernel<<<1, 1, 0, stream>>>(
-        opType, tensorSize, broadcastRoot, bufferOffset, submitSequence, meta,
-        tasks, failedRanksHintHostPtr, attemptedRanksHintHostPtr, taskId);
+                             size_t taskId, cudaStream_t stream) {
+    enqueueTaskKernel<<<1, 1, 0, stream>>>(opType, tensorSize, broadcastRoot,
+                                           bufferOffset, submitSequence, meta,
+                                           tasks, taskId);
 }
 
 #define DEF_LAUNCH_REDUCE(scalar_t, suffix)                                   \
     void launchReduceKernel_##suffix(                                         \
         scalar_t* dst, const scalar_t* src, size_t numElements,               \
-        size_t numRanks, int op, bool* activeRanks,                           \
-        cudaStream_t stream) {                                                \
+        size_t numRanks, int op, bool* activeRanks, cudaStream_t stream) {    \
         reduceKernel<<<64, 256, 0, stream>>>(dst, src, numElements, numRanks, \
                                              op, activeRanks);                \
     }
@@ -177,13 +170,13 @@ void launchReduceKernel_bf16(void* dst, const void* src, size_t numElements,
                              size_t numRanks, int op, bool* activeRanks,
                              cudaStream_t stream) {
 #ifdef __MUSA__
-    reduceKernel<<<64, 256, 0, stream>>>(
-        (mt_bfloat16*)dst, (const mt_bfloat16*)src, numElements, numRanks, op,
-        activeRanks);
+    reduceKernel<<<64, 256, 0, stream>>>((mt_bfloat16*)dst,
+                                         (const mt_bfloat16*)src, numElements,
+                                         numRanks, op, activeRanks);
 #else
-    reduceKernel<<<64, 256, 0, stream>>>(
-        (at::BFloat16*)dst, (const at::BFloat16*)src, numElements, numRanks, op,
-        activeRanks);
+    reduceKernel<<<64, 256, 0, stream>>>((at::BFloat16*)dst,
+                                         (const at::BFloat16*)src, numElements,
+                                         numRanks, op, activeRanks);
 #endif
 }
 

@@ -16,16 +16,15 @@ namespace mooncake {
 struct TransferGroupMeta;
 class MooncakeWorker;
 
-// Per-operation failedRanksHint / attemptedRanks buffer (non-copyable, movable).
+// Per-operation failedRanksHint / attemptedRanks buffer (non-copyable,
+// movable).
 //
-// local_success: true iff ALL attempted peers succeeded in this operation.
-//   Set by the Work handle on wait() completion.
+// Both tensors are CPU tensors backed by Torch's refcounted storage.  The
+// worker thread holds a copy of each tensor to keep the memory alive until
+// the task completes, even if the Work handle is destroyed early.
 struct FailedRanksHint {
     at::Tensor tensor;
     at::Tensor attempted_tensor;
-
-    // Set to true on wait() if no peer failed this operation locally.
-    bool local_success = false;
 
     FailedRanksHint() = default;
     FailedRanksHint(at::Tensor tensor_in, at::Tensor attempted_tensor_in)
@@ -41,8 +40,17 @@ struct FailedRanksHint {
 
     int* data() { return tensor.data_ptr<int>(); }
     int* attemptedData() { return attempted_tensor.data_ptr<int>(); }
+    const int* data() const { return tensor.data_ptr<int>(); }
 
-    static FailedRanksHint allocate(int n, bool isCpu);
+    bool isLocalSuccess(int size) const {
+        const int* d = data();
+        for (int i = 0; i < size; ++i) {
+            if (d[i] != 0) return false;
+        }
+        return true;
+    }
+
+    static FailedRanksHint allocate(int n);
 };
 
 // Collective Work handles
@@ -61,8 +69,8 @@ class MooncakeWorkCpu : public ::c10d::Work {
 
     bool wait(std::chrono::milliseconds timeout) override;
 
-    at::Tensor getFailedRanksHint() const { return failedRanksHint_.tensor; }
-    bool getLocalSuccess() const { return failedRanksHint_.local_success; }
+    at::Tensor getFailedRanksHint() const;
+    bool getLocalSuccess() const;
 
    private:
     c10::intrusive_ptr<c10::ivalue::Future> future_;
@@ -125,7 +133,7 @@ class MooncakeP2PWork : public ::c10d::Work {
     bool isSuccess() const override;
     bool wait(std::chrono::milliseconds timeout) override;
     at::Tensor getFailedRanksHint() const { return failedRanksHint_.tensor; }
-    bool getLocalSuccess() const { return isSuccess(); }
+    bool getLocalSuccess() const;
 
    private:
     std::shared_ptr<std::atomic<Status>> status_;

@@ -87,8 +87,7 @@ class AgentInterface {
 
     virtual void pushTransferObservation(
         std::vector<uint8_t> attempted_ranks,
-        std::vector<uint8_t> failed_ranks_hint,
-        std::vector<uint8_t> succeeded_ranks) = 0;
+        std::vector<uint8_t> failed_ranks_hint) = 0;
 
     virtual SyncAfterFailureResponse syncAfterFailure(GroupId group_id) = 0;
 
@@ -157,9 +156,9 @@ class AgentHost : public AgentInterface {
     ProposeViewUpdateResponse proposeDeactivate(
         GroupId group_id, const std::vector<GlobalRank>& ranks) override;
 
-    void pushTransferObservation(std::vector<uint8_t> attempted_ranks,
-                                 std::vector<uint8_t> failed_ranks_hint,
-                                 std::vector<uint8_t> succeeded_ranks) override;
+    void pushTransferObservation(
+        std::vector<uint8_t> attempted_ranks,
+        std::vector<uint8_t> failed_ranks_hint) override;
 
     SyncAfterFailureResponse syncAfterFailure(GroupId group_id) override;
 

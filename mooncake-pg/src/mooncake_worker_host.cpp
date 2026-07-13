@@ -194,13 +194,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     std::weak_ptr<std::function<void()>> weakProcessNextChunk =
         processNextChunk;
 
-    int* failedRanksHintPtr = failed_ranks_hint.data();
-    int* attemptedRanksHintPtr = failed_ranks_hint.attemptedData();
+    auto failed_t = failed_ranks_hint.tensor;
+    auto attempted_t = failed_ranks_hint.attempted_tensor;
 
     *processNextChunk = [this, weakProcessNextChunk, state, opType, tensorSize,
                          chunkSize, broadcastRoot, meta, tensorToBuffer,
-                         bufferToTensor, future, failedRanksHintPtr,
-                         attemptedRanksHintPtr]() {
+                         bufferToTensor, future, failed_t, attempted_t]() {
         auto processNextChunk = weakProcessNextChunk.lock();
 
         if (state->currentPos >= tensorSize) {
@@ -211,6 +210,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         int taskId = cpuTaskCount % 2;
         TORCH_CHECK(!tasks_[taskId].active);
 
+        task_failed_tensor_[taskId] = failed_t;
+        task_attempted_tensor_[taskId] = attempted_t;
+
         size_t realSize = std::min(chunkSize, tensorSize - state->currentPos);
         int bufferOffset = meta->taskCount % 2;
         tasks_[taskId].opType = (int)opType;
@@ -218,8 +220,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         tasks_[taskId].broadcastRoot = broadcastRoot;
         tasks_[taskId].bufferOffset = bufferOffset;
         tasks_[taskId].transferGroupMeta = meta.get();
-        tasks_[taskId].failedRanksHintHost = failedRanksHintPtr;
-        tasks_[taskId].attemptedRanksHintHost = attemptedRanksHintPtr;
         tensorToBuffer(
             (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
             state->currentPos, realSize);
@@ -272,6 +272,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     event_start->record(issue_stream);
     event_start->block(enq_stream);
 
+    auto failed_t = failed_ranks_hint.tensor;
+    auto attempted_t = failed_ranks_hint.attempted_tensor;
+
     std::vector<CudaTaskSubmissionToken> submitted_tasks;
     submitted_tasks.reserve((tensorSize + chunkSize - 1) / chunkSize);
     for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
@@ -288,10 +291,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             pos, realSize, enq_stream);
 
         hasCallback_[taskId] = false;
-        launchEnqueueTaskKernel(
-            (int)opType, realSize, broadcastRoot, bufferOffset, taskSequence,
-            meta.get(), tasks_device_, failed_ranks_hint.data(),
-            failed_ranks_hint.attemptedData(), taskId, enq_stream.stream());
+
+        task_failed_tensor_[taskId] = failed_t;
+        task_attempted_tensor_[taskId] = attempted_t;
+
+        launchEnqueueTaskKernel((int)opType, realSize, broadcastRoot,
+                                bufferOffset, taskSequence, meta.get(),
+                                tasks_device_, taskId, enq_stream.stream());
         bufferToTensor(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
             pos, realSize, enq_stream);

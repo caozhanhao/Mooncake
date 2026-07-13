@@ -17,9 +17,7 @@ namespace mooncake {
 __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
                                   uint64_t submitSequence, void* meta,
-                                  Task* tasks, int* failedRanksHintHostPtr,
-                                  int* attemptedRanksHintHostPtr,
-                                  size_t taskId);
+                                  Task* tasks, size_t taskId);
 
 template <typename scalar_t>
 __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
@@ -36,9 +34,7 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
 void launchEnqueueTaskKernel(int opType, size_t tensorSize,
                              int64_t broadcastRoot, int bufferOffset,
                              uint64_t submitSequence, void* meta, Task* tasks,
-                             int* failedRanksHintHostPtr,
-                             int* attemptedRanksHintHostPtr, size_t taskId,
-                             cudaStream_t stream);
+                             size_t taskId, cudaStream_t stream);
 
 void launchReduceKernel_uint8(uint8_t* dst, const uint8_t* src,
                               size_t numElements, size_t numRanks, int op,

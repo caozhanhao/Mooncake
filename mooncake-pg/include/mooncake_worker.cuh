@@ -80,9 +80,6 @@ __global__
     uint64_t submitSequence = 0;
     BatchID batchID;
     void* transferGroupMeta;
-    int* failedRanksHintHost = nullptr;  // per-op bitmap indexed by InGroupRank
-    int* attemptedRanksHintHost =
-        nullptr;  // per-op bitmap indexed by InGroupRank
 };
 
 #if !defined(__MUSA__)
@@ -157,6 +154,11 @@ class MooncakeWorker {
     int cudaTaskCount = 0;
     std::atomic<uint64_t> next_cuda_task_sequence_{1};
     std::atomic<uint64_t> submitted_task_sequence_[kNumTasks_]{};
+
+    // Per-slot tensor references keep the bitmap memory alive until the
+    // worker is done.
+    at::Tensor task_failed_tensor_[kNumTasks_];
+    at::Tensor task_attempted_tensor_[kNumTasks_];
 
     std::thread worker_thread_;
 };

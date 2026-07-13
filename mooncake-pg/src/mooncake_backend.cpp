@@ -345,6 +345,13 @@ MooncakeBackend::MooncakeBackend(
         agent_.waitUntilGroupReady(meta_->group_id, std::chrono::seconds(30));
 
     applyViewUpdate(view);
+
+    // Initialize all peer segment IDs from the LinkManager.
+    // Subsequent updates (endpoint changes, disconnects) are handled by
+    // the NotifyLinkRefreshed effect.
+    for (int local = 0; local < meta_->size; ++local) {
+        refreshSegmentID(local);
+    }
 }
 
 MooncakeBackend::~MooncakeBackend() {
@@ -423,7 +430,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
         stream = current_stream.stream();
     }
 
-    auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
+    auto failed_ranks = FailedRanksHint::allocate(meta_->size);
 
     TORCH_CHECK(p2p_proxy_, "P2P send proxy is not initialized.");
     p2p_proxy_->enqueueSend(P2PProxy::SendOp{
@@ -459,7 +466,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
         stream = current_stream.stream();
     }
 
-    auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
+    auto failed_ranks = FailedRanksHint::allocate(meta_->size);
 
     TORCH_CHECK(p2p_proxy_, "P2P recv proxy is not initialized.");
     p2p_proxy_->enqueueRecv(P2PProxy::RecvOp{
@@ -483,7 +490,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
     int64_t root = opts.rootRank + opts.rootTensor;
     bool isRoot = (root == rank_);
     prepareOp(c10d::OpType::BROADCAST);
-    auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
+    auto failed_ranks = FailedRanksHint::allocate(meta_->size);
     if (isCpu_) {
         return worker_->putTaskCpu(
             c10d::OpType::BROADCAST, tensorSize, root, meta_,
@@ -525,7 +532,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     auto tensor = tensors.back();
     size_t tensorSize = tensor.numel() * tensor.element_size();
     prepareOp(c10d::OpType::ALLREDUCE);
-    auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
+    auto failed_ranks = FailedRanksHint::allocate(meta_->size);
     if (isCpu_) {
         auto numRanks = meta_->size;
         return worker_->putTaskCpu(
@@ -569,7 +576,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     auto outputTensors_ = outputTensors.back();
     size_t tensorSize = inputTensor.numel() * inputTensor.element_size();
     prepareOp(c10d::OpType::ALLGATHER);
-    auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
+    auto failed_ranks = FailedRanksHint::allocate(meta_->size);
     if (isCpu_) {
         return worker_->putTaskCpu(
             c10d::OpType::ALLGATHER, tensorSize, 0, meta_,
@@ -610,7 +617,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     const c10d::AllgatherOptions& opts) {
     size_t tensorSize = inputBuffer.numel() * inputBuffer.element_size();
     prepareOp(c10d::OpType::_ALLGATHER_BASE);
-    auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
+    auto failed_ranks = FailedRanksHint::allocate(meta_->size);
     if (isCpu_) {
         return worker_->putTaskCpu(
             c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, meta_,
@@ -655,7 +662,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
     const c10d::ReduceScatterOptions& opts) {
     size_t tensorSize = outputBuffer.numel() * outputBuffer.element_size();
     prepareOp(c10d::OpType::_REDUCE_SCATTER_BASE);
-    auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
+    auto failed_ranks = FailedRanksHint::allocate(meta_->size);
     if (isCpu_) {
         auto numRanks = meta_->size;
         return worker_->putTaskCpu(
@@ -696,8 +703,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
                                 realSize, enq_stream);
                 launchReduceKernel(outputBuffer, pos, realSize, src,
                                    meta_->size, opts.reduceOp,
-                                   meta_->activeRanksDevice,
-                                   enq_stream);
+                                   meta_->activeRanksDevice, enq_stream);
             });
     }
 }
@@ -708,7 +714,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
     size_t tensorSize =
         inputTensors[0].numel() * inputTensors[0].element_size();
     prepareOp(c10d::OpType::ALLTOALL);
-    auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
+    auto failed_ranks = FailedRanksHint::allocate(meta_->size);
     if (isCpu_) {
         return worker_->putTaskCpu(
             c10d::OpType::ALLTOALL, tensorSize, 0, meta_,
@@ -753,7 +759,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     const c10d::BarrierOptions& opts) {
     prepareOp(c10d::OpType::BARRIER);
-    auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
+    auto failed_ranks = FailedRanksHint::allocate(meta_->size);
     if (isCpu_) {
         return worker_->putTaskCpu(
             // a non-zero tensorSize is required to ensure the worker task for
@@ -780,7 +786,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
     int64_t root = opts.rootRank + opts.rootTensor;
     bool isRoot = (root == rank_);
     prepareOp(c10d::OpType::REDUCE);
-    auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
+    auto failed_ranks = FailedRanksHint::allocate(meta_->size);
     if (isCpu_) {
         auto numRanks = meta_->size;
         return worker_->putTaskCpu(
@@ -831,7 +837,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
     auto inputTensor = inputTensors.back();
     size_t tensorSize = inputTensor.numel() * inputTensor.element_size();
     prepareOp(c10d::OpType::GATHER);
-    auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
+    auto failed_ranks = FailedRanksHint::allocate(meta_->size);
     if (isCpu_) {
         return worker_->putTaskCpu(
             c10d::OpType::GATHER, tensorSize, root, meta_,
@@ -887,7 +893,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
     auto outputTensor = outputTensors.back();
     size_t tensorSize = outputTensor.numel() * outputTensor.element_size();
     prepareOp(c10d::OpType::SCATTER);
-    auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
+    auto failed_ranks = FailedRanksHint::allocate(meta_->size);
     if (isCpu_) {
         return worker_->putTaskCpu(
             c10d::OpType::SCATTER, tensorSize, root, meta_,
@@ -1115,24 +1121,12 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view) {
         meta_->activeRanks[local_rank] = member.isActive();
         if (member.endpoint.has_value()) {
             meta_->segmentInfos[local_rank] = *member.endpoint;
-
-            // Resolve the peer and cache the current segment ID.
-            {
-                auto handle = ctx_.link_manager.resolvePeer(global_rank);
-                if (handle) {
-                    meta_->segmentIDs[local_rank] = *handle;
-                } else {
-                    LOG(ERROR) << "applyViewUpdate rank=" << meta_->globalRank
-                               << ", TE link to peer=" << global_rank
-                               << " not ready yet; segmentID will be "
-                                  "refreshed on LinkUp";
-                }
-            }
         }
     }
 
     // Keep the Python-visible activeRanksTensor in sync with the view.
-    // syncActiveRanksTensor();
+    // FIXME
+    syncActiveRanksTensor();
 
     // Publish epoch AFTER all data-plane state (activeRanks, segmentInfos,
     // etc.) is updated.  This ensures that a thread observing the new epoch
@@ -1150,6 +1144,14 @@ void MooncakeBackend::onPeerLinkReset(InGroupRank peer) {
     if (peer >= 0 && peer < meta_->size) {
         meta_->segmentIDs[peer] = static_cast<TransferMetadata::SegmentID>(-1);
     }
+}
+
+void MooncakeBackend::refreshSegmentID(InGroupRank local) {
+    auto global = meta_->rank_order[local];
+    auto handle = ctx_.link_manager.resolvePeer(global);
+    meta_->segmentIDs[local] =
+        handle.has_value() ? *handle
+                           : static_cast<TransferMetadata::SegmentID>(-1);
 }
 
 GroupEndpointPublication MooncakeBackend::buildEndpointMetadata() const {
