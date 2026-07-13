@@ -30,6 +30,12 @@ MooncakeProcessContext::MooncakeProcessContext() {
                 << " us";
         }
     }
+    if (const char* val =
+            std::getenv("MOONCAKE_PG_IMPLICIT_SYNC_AFTER_FAILURE")) {
+        implicit_sync_after_failure =
+            (std::string(val) == "1" || std::string(val) == "true");
+            LOG(INFO) << "Implicit sync after failure: " << implicit_sync_after_failure;
+    }
 }
 
 MooncakeProcessContext::~MooncakeProcessContext() {

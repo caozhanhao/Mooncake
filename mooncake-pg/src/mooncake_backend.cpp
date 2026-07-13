@@ -528,7 +528,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
     if (isCpu_) {
         auto numRanks = meta_->size;
-        auto* failed_ranks_ptr = failed_ranks.data();
         return worker_->putTaskCpu(
             c10d::OpType::ALLREDUCE, tensorSize, 0, meta_,
             std::move(failed_ranks),
@@ -538,12 +537,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
             [=, this](void* src, size_t pos, size_t realSize) {
                 memset((char*)tensor.data_ptr() + pos, 0, realSize);
                 launchReduceCpu(tensor, pos, realSize, src, numRanks,
-                                opts.reduceOp, meta_->activeRanks,
-                                failed_ranks_ptr);
+                                opts.reduceOp, meta_->activeRanks);
             });
     } else {
         auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
-        auto* failed_ranks_dev_ptr = failed_ranks.dev_ptr;
         return worker_->putTaskCuda(
             c10d::OpType::ALLREDUCE, tensorSize, 0, meta_, stream,
             std::move(failed_ranks),
@@ -558,7 +555,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                                 enq_stream);
                 launchReduceKernel(tensor, pos, realSize, src, meta_->size,
                                    opts.reduceOp, meta_->activeRanksDevice,
-                                   failed_ranks_dev_ptr, enq_stream);
+                                   enq_stream);
             });
     }
 }
@@ -661,7 +658,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
     auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
     if (isCpu_) {
         auto numRanks = meta_->size;
-        auto* failed_ranks_ptr = failed_ranks.data();
         return worker_->putTaskCpu(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, meta_,
             std::move(failed_ranks),
@@ -676,13 +672,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
             [=, this](void* src, size_t pos, size_t realSize) {
                 memset((char*)outputBuffer.data_ptr() + pos, 0, realSize);
                 launchReduceCpu(outputBuffer, pos, realSize, src, numRanks,
-                                opts.reduceOp, meta_->activeRanks,
-                                failed_ranks_ptr);
+                                opts.reduceOp, meta_->activeRanks);
             });
     } else {
         auto stream =
             at::cuda::getCurrentCUDAStream(inputBuffer.device().index());
-        auto* failed_ranks_dev_ptr = failed_ranks.dev_ptr;
         return worker_->putTaskCuda(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, meta_, stream,
             std::move(failed_ranks),
@@ -703,7 +697,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
                 launchReduceKernel(outputBuffer, pos, realSize, src,
                                    meta_->size, opts.reduceOp,
                                    meta_->activeRanksDevice,
-                                   failed_ranks_dev_ptr, enq_stream);
+                                   enq_stream);
             });
     }
 }
@@ -789,7 +783,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
     auto failed_ranks = FailedRanksHint::allocate(meta_->size, isCpu_);
     if (isCpu_) {
         auto numRanks = meta_->size;
-        auto* failed_ranks_ptr = failed_ranks.data();
         return worker_->putTaskCpu(
             c10d::OpType::REDUCE, tensorSize, root, meta_,
             std::move(failed_ranks),
@@ -800,13 +793,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
                 if (isRoot) {
                     memset((char*)tensor.data_ptr() + pos, 0, realSize);
                     launchReduceCpu(tensor, pos, realSize, src, numRanks,
-                                    opts.reduceOp, meta_->activeRanks,
-                                    failed_ranks_ptr);
+                                    opts.reduceOp, meta_->activeRanks);
                 }
             });
     } else {
         auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
-        auto* failed_ranks_dev_ptr = failed_ranks.dev_ptr;
         return worker_->putTaskCuda(
             c10d::OpType::REDUCE, tensorSize, root, meta_, stream,
             std::move(failed_ranks),
@@ -822,7 +813,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
                                     enq_stream);
                     launchReduceKernel(tensor, pos, realSize, src, meta_->size,
                                        opts.reduceOp, meta_->activeRanksDevice,
-                                       failed_ranks_dev_ptr, enq_stream);
+                                       enq_stream);
                 }
             });
     }
@@ -1141,7 +1132,7 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view) {
     }
 
     // Keep the Python-visible activeRanksTensor in sync with the view.
-    syncActiveRanksTensor();
+    // syncActiveRanksTensor();
 
     // Publish epoch AFTER all data-plane state (activeRanks, segmentInfos,
     // etc.) is updated.  This ensures that a thread observing the new epoch

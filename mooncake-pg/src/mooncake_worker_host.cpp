@@ -17,7 +17,7 @@ namespace mooncake {
 
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                        int* failedRanksHint, cudaStream_t stream) {
+                        cudaStream_t stream) {
     TORCH_CHECK(op == c10d::ReduceOp::SUM || op == c10d::ReduceOp::MIN ||
                     op == c10d::ReduceOp::MAX || op == c10d::ReduceOp::PRODUCT,
                 "Only support SUM/MIN/MAX/PRODUCT for reduction.");
@@ -27,47 +27,39 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
     switch (dst.scalar_type()) {
         case c10::kByte:
             launchReduceKernel_uint8((uint8_t*)ptr, (uint8_t*)src, num,
-                                     numRanks, (int)op, activeRanks,
-                                     failedRanksHint, stream);
+                                     numRanks, (int)op, activeRanks, stream);
             break;
         case c10::kChar:
             launchReduceKernel_int8((int8_t*)ptr, (int8_t*)src, num, numRanks,
-                                    (int)op, activeRanks, failedRanksHint,
-                                    stream);
+                                    (int)op, activeRanks, stream);
             break;
         case c10::kShort:
             launchReduceKernel_int16((int16_t*)ptr, (int16_t*)src, num,
-                                     numRanks, (int)op, activeRanks,
-                                     failedRanksHint, stream);
+                                     numRanks, (int)op, activeRanks, stream);
             break;
         case c10::kInt:
             launchReduceKernel_int32((int*)ptr, (int*)src, num, numRanks,
-                                     (int)op, activeRanks, failedRanksHint,
-                                     stream);
+                                     (int)op, activeRanks, stream);
             break;
         case c10::kLong:
             launchReduceKernel_int64((int64_t*)ptr, (int64_t*)src, num,
-                                     numRanks, (int)op, activeRanks,
-                                     failedRanksHint, stream);
+                                     numRanks, (int)op, activeRanks, stream);
             break;
         case c10::kFloat:
             launchReduceKernel_float((float*)ptr, (float*)src, num, numRanks,
-                                     (int)op, activeRanks, failedRanksHint,
-                                     stream);
+                                     (int)op, activeRanks, stream);
             break;
         case c10::kDouble:
             launchReduceKernel_double((double*)ptr, (double*)src, num, numRanks,
-                                      (int)op, activeRanks, failedRanksHint,
-                                      stream);
+                                      (int)op, activeRanks, stream);
             break;
         case c10::kBool:
             launchReduceKernel_bool((bool*)ptr, (bool*)src, num, numRanks,
-                                    (int)op, activeRanks, failedRanksHint,
-                                    stream);
+                                    (int)op, activeRanks, stream);
             break;
         case c10::kBFloat16:
             launchReduceKernel_bf16(ptr, src, num, numRanks, (int)op,
-                                    activeRanks, failedRanksHint, stream);
+                                    activeRanks, stream);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
@@ -93,16 +85,15 @@ T applyReduceOp(const T& a, const T& b, c10d::ReduceOp op) {
 
 template <typename T>
 void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
-               c10d::ReduceOp op, bool* activeRanks, int* failedRanksHint) {
+               c10d::ReduceOp op, bool* activeRanks) {
     at::parallel_for(0, numElements, 1024, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
             bool valid = false;
             T acc{};
             for (int64_t rank = 0; rank < numRanks; ++rank) {
-                bool shouldInclude =
-                    activeRanks[rank] &&
-                    (!failedRanksHint || failedRanksHint[rank] == 0);
-                if (shouldInclude) {
+                // Note: failedRanksHint is intentionally NOT checked here
+                // (same rationale as the GPU reduceKernel).
+                if (activeRanks[rank]) {
                     if (!valid) {
                         acc = src[i + rank * numElements];
                         valid = true;
@@ -118,43 +109,39 @@ void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
 }
 
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
-                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                     int* failedRanksHint) {
+                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks) {
     auto ptr = (char*)dst.data_ptr() + pos;
     size_t num = realSize / dst.element_size();
 
     switch (dst.scalar_type()) {
         case c10::kByte:
             reduceCpu((uint8_t*)ptr, (uint8_t*)src, num, numRanks, op,
-                      activeRanks, failedRanksHint);
+                      activeRanks);
             break;
         case c10::kChar:
             reduceCpu((int8_t*)ptr, (int8_t*)src, num, numRanks, op,
-                      activeRanks, failedRanksHint);
+                      activeRanks);
             break;
         case c10::kShort:
             reduceCpu((int16_t*)ptr, (int16_t*)src, num, numRanks, op,
-                      activeRanks, failedRanksHint);
+                      activeRanks);
             break;
         case c10::kInt:
-            reduceCpu((int*)ptr, (int*)src, num, numRanks, op, activeRanks,
-                      failedRanksHint);
+            reduceCpu((int*)ptr, (int*)src, num, numRanks, op, activeRanks);
             break;
         case c10::kLong:
             reduceCpu((int64_t*)ptr, (int64_t*)src, num, numRanks, op,
-                      activeRanks, failedRanksHint);
+                      activeRanks);
             break;
         case c10::kFloat:
-            reduceCpu((float*)ptr, (float*)src, num, numRanks, op, activeRanks,
-                      failedRanksHint);
+            reduceCpu((float*)ptr, (float*)src, num, numRanks, op, activeRanks);
             break;
         case c10::kDouble:
             reduceCpu((double*)ptr, (double*)src, num, numRanks, op,
-                      activeRanks, failedRanksHint);
+                      activeRanks);
             break;
         case c10::kBool:
-            reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op, activeRanks,
-                      failedRanksHint);
+            reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op, activeRanks);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",

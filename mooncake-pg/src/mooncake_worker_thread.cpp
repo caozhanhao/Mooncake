@@ -272,15 +272,6 @@ void MooncakeWorker::startWorker() {
                     }
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
-                        // Send a completion signal to every active peer.
-                        // The signal phase acts as a bidirectional barrier:
-                        // each rank writes to every peer's recv_sync at its
-                        // own rank-slot and waits for every peer's signal in
-                        // its own recv_sync.  This is independent of the
-                        // data-transfer direction — even ranks that only
-                        // sent data (e.g. REDUCE contributors) or only
-                        // received (e.g. BROADCAST non-roots) must
-                        // participate so every rank sees the global barrier.
                         if (!group->activeRanks[j]) {
                             continue;
                         }

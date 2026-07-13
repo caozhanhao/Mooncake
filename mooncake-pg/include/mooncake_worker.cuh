@@ -88,11 +88,10 @@ __global__
 #if !defined(__MUSA__)
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                        int* failedRanksHint, cudaStream_t stream);
+                        cudaStream_t stream);
 
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
-                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                     int* failedRanksHint);
+                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks);
 void preloadReduceKernels();
 
 class MooncakeWorker {

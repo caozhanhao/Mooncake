@@ -24,6 +24,9 @@
 
 namespace mooncake {
 
+static constexpr size_t kDefaultCollectiveTimeoutUs = 100000;  // 100 ms
+static constexpr int64_t kDefaultP2PTimeoutUs = 3000000;       // 3 s
+
 class AgentInterface;
 class AgentHost;
 
@@ -34,9 +37,15 @@ struct MooncakeProcessContext {
     TransferEngine* external_engine = nullptr;
     std::string host_ip = "127.0.0.1";
     size_t collective_timeout_us =
-        100000;                        // 100 ms (kDefaultCollectiveTimeoutUs)
-    int64_t p2p_timeout_us = 3000000;  // 3 s (kDefaultP2PTimeoutUs)
+        kDefaultCollectiveTimeoutUs;
+    int64_t p2p_timeout_us = kDefaultP2PTimeoutUs;
     int64_t fault_reconciliation_window_us = 50000;  // 50 ms
+
+    // When true, Work::wait() implicitly calls syncAfterFailure() after
+    // a peer failure is detected, so that failed ranks are deactivated
+    // by the time wait() returns.
+    // Controlled by MOONCAKE_PG_IMPLICIT_SYNC_AFTER_FAILURE (default 1).
+    bool implicit_sync_after_failure = true;
 
     // === Runtime ===
     // Eagerly created so set_device_filter works before init_process_group.
@@ -109,9 +118,6 @@ class MooncakeP2PShim final : public ::c10d::Backend {
 
 class MooncakeBackend final : public ::c10d::ProcessGroup {
    public:
-    static constexpr size_t kDefaultCollectiveTimeoutUs = 100000;  // 100 ms
-    static constexpr int64_t kDefaultP2PTimeoutUs = 3000000;       // 3 s
-
     struct MooncakeBackendOptions final : torch::CustomClassHolder {
         explicit MooncakeBackendOptions(at::Tensor activeRanks)
             : activeRanks_{activeRanks} {}

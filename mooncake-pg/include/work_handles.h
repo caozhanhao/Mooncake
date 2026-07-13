@@ -16,33 +16,21 @@ namespace mooncake {
 struct TransferGroupMeta;
 class MooncakeWorker;
 
-// Per-operation failedRanksHint / attemptedRanks buffer (non-copyable, movable)
-// CPU: owning tensor.
-// CUDA: pinned mapped memory (tensor owns the allocation via custom deleter;
-//       dev_ptr is the device-visible alias of the same buffer).
+// Per-operation failedRanksHint / attemptedRanks buffer (non-copyable, movable).
+//
 // local_success: true iff ALL attempted peers succeeded in this operation.
 //   Set by the Work handle on wait() completion.
 struct FailedRanksHint {
     at::Tensor tensor;
-    int* dev_ptr = nullptr;  // CUDA only: device pointer for GPU kernel.
-
-    // CUDA only: bitmap of ranks that were attempted in this op.  Used by the
-    // control plane to distinguish "peer failed" from "peer not attempted".
     at::Tensor attempted_tensor;
-    int* attempted_dev_ptr = nullptr;
 
     // Set to true on wait() if no peer failed this operation locally.
     bool local_success = false;
 
     FailedRanksHint() = default;
-    FailedRanksHint(at::Tensor tensor_in, int* dev_ptr_in)
-        : tensor(std::move(tensor_in)), dev_ptr(dev_ptr_in) {}
-    FailedRanksHint(at::Tensor tensor_in, int* dev_ptr_in,
-                    at::Tensor attempted_tensor_in, int* attempted_dev_ptr_in)
+    FailedRanksHint(at::Tensor tensor_in, at::Tensor attempted_tensor_in)
         : tensor(std::move(tensor_in)),
-          dev_ptr(dev_ptr_in),
-          attempted_tensor(std::move(attempted_tensor_in)),
-          attempted_dev_ptr(attempted_dev_ptr_in) {}
+          attempted_tensor(std::move(attempted_tensor_in)) {}
 
     FailedRanksHint(const FailedRanksHint&) = delete;
     FailedRanksHint& operator=(const FailedRanksHint&) = delete;

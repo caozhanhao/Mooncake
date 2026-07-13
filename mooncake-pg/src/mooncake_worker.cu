@@ -44,7 +44,7 @@ __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
 template <typename scalar_t>
 __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                              size_t numElements, size_t numRanks, int op,
-                             bool* activeRanks, int* failedRanksHint) {
+                             bool* activeRanks) {
     size_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
 
@@ -65,10 +65,13 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
         acc_t acc = 0;
         for (size_t rank = 0; rank < numRanks; ++rank) {
             // activeRanks is indexed by InGroupRank, just like the loop rank.
-            bool shouldInclude =
-                activeRanks[rank] &&
-                (!failedRanksHint || failedRanksHint[rank] == 0);
-            if (shouldInclude) {
+            // Note: failedRanksHint is intentionally NOT checked here.
+            // When a peer fails mid-operation its recv-buffer data may be
+            // garbage, so the reduce result is only guaranteed correct when
+            // no peers failed (failedRanks == 0).  The work handle reports
+            // local_success = false on any failure so the application knows
+            // to discard and retry.
+            if (activeRanks[rank]) {
                 if (!valid) {
                     if constexpr (kIsBf16) {
                         acc = (float)src[rank * numElements + elem_idx];
@@ -153,11 +156,10 @@ void launchEnqueueTaskKernel(int opType, size_t tensorSize,
 #define DEF_LAUNCH_REDUCE(scalar_t, suffix)                                   \
     void launchReduceKernel_##suffix(                                         \
         scalar_t* dst, const scalar_t* src, size_t numElements,               \
-        size_t numRanks, int op, bool* activeRanks, int* failedRanksHint,     \
+        size_t numRanks, int op, bool* activeRanks,                           \
         cudaStream_t stream) {                                                \
         reduceKernel<<<64, 256, 0, stream>>>(dst, src, numElements, numRanks, \
-                                             op, activeRanks,                 \
-                                             failedRanksHint);                \
+                                             op, activeRanks);                \
     }
 
 DEF_LAUNCH_REDUCE(uint8_t, uint8)
@@ -173,15 +175,15 @@ DEF_LAUNCH_REDUCE(bool, bool)
 
 void launchReduceKernel_bf16(void* dst, const void* src, size_t numElements,
                              size_t numRanks, int op, bool* activeRanks,
-                             int* failedRanksHint, cudaStream_t stream) {
+                             cudaStream_t stream) {
 #ifdef __MUSA__
     reduceKernel<<<64, 256, 0, stream>>>(
         (mt_bfloat16*)dst, (const mt_bfloat16*)src, numElements, numRanks, op,
-        activeRanks, failedRanksHint);
+        activeRanks);
 #else
     reduceKernel<<<64, 256, 0, stream>>>(
         (at::BFloat16*)dst, (const at::BFloat16*)src, numElements, numRanks, op,
-        activeRanks, failedRanksHint);
+        activeRanks);
 #endif
 }
 

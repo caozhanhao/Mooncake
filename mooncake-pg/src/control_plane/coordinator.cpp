@@ -662,11 +662,9 @@ void CentralizedCoordinatorStateMachine::updateRankStates(
                                     i) != healthy_set.end();
 
         if (in_healthy && ranks_[i].state != RankState::Healthy) {
-            LOG(INFO) << "[COORD] rank=" << i << " transitioning to Healthy";
             ranks_[i].state = RankState::Healthy;
             effects.push_back(makeRankStateEffect(i));
         } else if (!in_healthy && ranks_[i].state == RankState::Healthy) {
-            LOG(INFO) << "[COORD] rank=" << i << " transitioning to Synced";
             ranks_[i].state = RankState::Synced;
             effects.push_back(makeRankStateEffect(i));
         }
