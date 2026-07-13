@@ -17,11 +17,10 @@ bool MooncakeWorkCpu::wait(std::chrono::milliseconds timeout) {
     future_->wait();
     bool ok = future_->completed() && !future_->hasError();
 
-    auto& ctx = meta_->backend->getProcessContext();
-    if (ctx.implicit_sync_after_failure) {
+    if (meta_->autoSyncOnFailure) {
         if (ok && !getLocalSuccess()) {
             LOG(INFO) << "Local failure detected on cpu work, triggering "
-                         "implicit syncAfterFailure";
+                         "syncAfterFailure";
             meta_->backend->syncAfterFailure();
         }
     }
@@ -104,10 +103,11 @@ bool MooncakeWorkCuda::wait(std::chrono::milliseconds timeout) {
     auto current_stream = at::cuda::getCurrentCUDAStream();
     event_->block(current_stream);
 
-    // Implicit sync-after-failure
-    auto& ctx = meta_->backend->getProcessContext();
-    if (ctx.implicit_sync_after_failure) {
-        // WARNING: getLocalSuccess would trigger a event_->synchronize().
+    // Auto sync-on-failure.
+    // WARNING: getLocalSuccess() synchronizes the GPU event, blocking the
+    // calling thread.  With autoSyncOnFailure=true, every collective is
+    // effectively synchronous (async_op=True is defeated).
+    if (meta_->autoSyncOnFailure) {
         if (!getLocalSuccess()) {
             meta_->backend->syncAfterFailure();
         }
@@ -132,8 +132,7 @@ bool MooncakeBarrierWorkCuda::wait(std::chrono::milliseconds timeout) {
     if (timeout == kNoTimeout) {
         event_->synchronize();
         if (!getLocalSuccess()) {
-            auto& ctx = meta_->backend->getProcessContext();
-            if (ctx.implicit_sync_after_failure) {
+            if (meta_->autoSyncOnFailure) {
                 meta_->backend->syncAfterFailure();
             }
         }
@@ -144,8 +143,7 @@ bool MooncakeBarrierWorkCuda::wait(std::chrono::milliseconds timeout) {
         BackoffWaiterConfig::constantSleep(std::chrono::microseconds(10)));
     bool ok = waiter.wait_for(timeout, [this] { return event_->query(); });
 
-    auto& ctx = meta_->backend->getProcessContext();
-    if (ok && ctx.implicit_sync_after_failure) {
+    if (ok && meta_->autoSyncOnFailure) {
         if (!getLocalSuccess()) {
             meta_->backend->syncAfterFailure();
         }

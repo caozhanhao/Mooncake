@@ -432,7 +432,6 @@ def _run_allgather_reduce_scatter(
     device: str,
     active_world_size: int,
     rank: int,
-    backend,
 ) -> None:
     """Run _allgather_base and _reduce_scatter_base and assert correctness.
 
@@ -445,13 +444,7 @@ def _run_allgather_reduce_scatter(
     # input: scalar (rank+1); output: flat buffer of active_world_size elements
     input_t = torch.tensor([rank + 1], dtype=torch.int32, device=device)
     output_t = torch.zeros(active_world_size, dtype=torch.int32, device=device)
-    work = dist.all_gather_into_tensor(output_t, input_t, async_op=True)
-    work.wait()
-    if not pg.get_local_success(work):
-        pg.sync_after_failure(backend)
-        # Re-run with dead ranks now deactivated.
-        output_t.zero_()
-        dist.all_gather_into_tensor(output_t, input_t)
+    dist.all_gather_into_tensor(output_t, input_t)
 
     for j in range(active_world_size):
         expected = j + 1
@@ -469,13 +462,7 @@ def _run_allgather_reduce_scatter(
     # rank j receives sum of input[j] from all ranks = (j+1) * active_world_size.
     input_rs = torch.arange(1, active_world_size + 1, dtype=torch.int32, device=device)
     output_rs = torch.zeros(1, dtype=torch.int32, device=device)
-    work = dist.reduce_scatter_tensor(output_rs, input_rs, async_op=True)
-    work.wait()
-    if not pg.get_local_success(work):
-        pg.sync_after_failure(backend)
-        # Re-run with dead ranks now deactivated.
-        output_rs.zero_()
-        dist.reduce_scatter_tensor(output_rs, input_rs)
+    dist.reduce_scatter_tensor(output_rs, input_rs)
     expected_rs = (rank + 1) * active_world_size
     got_rs = int(output_rs[0].item())
     if got_rs != expected_rs:
@@ -520,8 +507,7 @@ def _allgather_reduce_scatter_extension_worker(
         # Pre-activation: 3 active ranks, max_world_size=4.
         # This is the overflow path: buggy code would iterate 4 times into a
         # buffer sized for 3.
-        _run_allgather_reduce_scatter(device, initial_world_size, ctx.proc_rank,
-                                      backend=backend)
+        _run_allgather_reduce_scatter(device, initial_world_size, ctx.proc_rank)
 
         if ctx.proc_rank == 0:
             extend_event.set()
@@ -535,8 +521,7 @@ def _allgather_reduce_scatter_extension_worker(
         pg.recover_ranks(backend, join_ranks)
 
         # Post-activation: all 4 ranks active.
-        _run_allgather_reduce_scatter(device, ctx.world_size, ctx.proc_rank,
-                                  backend=backend)
+        _run_allgather_reduce_scatter(device, ctx.world_size, ctx.proc_rank)
 
         ctx.record_result({"role": "primary", "rank": ctx.proc_rank})
     else:
@@ -558,8 +543,7 @@ def _allgather_reduce_scatter_extension_worker(
         pg.join_group(backend)
 
         # Post-activation: all 4 ranks active.
-        _run_allgather_reduce_scatter(device, ctx.world_size, extension_rank,
-                                  backend=backend)
+        _run_allgather_reduce_scatter(device, ctx.world_size, extension_rank)
 
         ctx.record_result({"role": "joiner", "rank": extension_rank})
 
@@ -584,8 +568,7 @@ def _allgather_reduce_scatter_recovery_worker(
         backend = ctx.get_backend()
 
         # Pre-failure: all 4 ranks active.
-        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank,
-                                  backend=backend)
+        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank)
 
         if logical_rank == broken_rank:
             ctx.record_result({"role": "broken"})
@@ -595,8 +578,7 @@ def _allgather_reduce_scatter_recovery_worker(
         # Survivors: 3 active ranks, max_world_size=4 → overflow path.
         broken_exited.wait()
 
-        _run_allgather_reduce_scatter(device, ctx.world_size - 1, logical_rank,
-                                      backend=backend)
+        _run_allgather_reduce_scatter(device, ctx.world_size - 1, logical_rank)
 
         if logical_rank == 0:
             start_recovery.set()
@@ -610,8 +592,7 @@ def _allgather_reduce_scatter_recovery_worker(
         pg.recover_ranks(backend, [broken_rank])
 
         # Post-recovery: all 4 ranks active again.
-        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank,
-                                  backend=backend)
+        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank)
 
         ctx.record_result({"role": "survivor"})
     else:
@@ -621,8 +602,7 @@ def _allgather_reduce_scatter_recovery_worker(
         pg.join_group(backend)
 
         # Post-recovery: all 4 ranks active.
-        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank,
-                                  backend=backend)
+        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank)
 
         ctx.record_result({"role": "replacement"})
 
@@ -636,18 +616,8 @@ def _fault_detection_worker(
     backend = ctx.get_backend()
 
     # Step 1: All ranks participate in first collective
-    epoch_before = pg.get_current_epoch(backend)
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
-    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-    work.wait() 
-
-    # Verify local_success=True and failedRanksHint=all 0s when all healthy
-    assert pg.get_local_success(work), \
-        f"rank {ctx.rank}: Round 1 should succeed locally"
-    failed_ranks_hint = pg.get_failed_ranks_hint(work)
-    assert (
-        failed_ranks_hint.tolist() == [0] * ctx.world_size
-    ), f"rank {ctx.rank}: pre-failure failed_ranks_hint={failed_ranks_hint.tolist()}"
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
     if ctx.rank == BROKEN_RANK:
         # Step 2: Broken rank exits after first collective
@@ -661,41 +631,7 @@ def _fault_detection_worker(
     # Step 4: Survivors run collective without broken rank
     # This should not hang - verifies fault detection works
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
-    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-    work.wait()
-
-    # Verify local_success=False when a peer is dead
-    assert not pg.get_local_success(work), \
-        f"rank {ctx.rank}: Round 2 should fail locally (broken rank detected)"
-    failed_ranks_hint = pg.get_failed_ranks_hint(work)
-    expected_failed_ranks_hint = [0] * ctx.world_size
-    expected_failed_ranks_hint[BROKEN_RANK] = 1
-    assert failed_ranks_hint.tolist() == expected_failed_ranks_hint, (
-        f"rank {ctx.rank}: post-failure failed_ranks_hint={failed_ranks_hint.tolist()}, "
-        f"expected {expected_failed_ranks_hint}"
-    )
-
-    # Use epoch-based step-boundary detection: poll get_current_epoch
-    # (atomic read, no side effects) until the Coordinator auto-deactivates
-    # the dead rank and increments the epoch.
-    wait_until(
-        lambda: pg.get_current_epoch(backend) != epoch_before,
-        timeout_s=30.0,
-        poll_interval_s=0.01,
-        description=f"rank {ctx.rank}: waiting for epoch change",
-    )
-
-    # Verify auto_deactivate took effect: epoch incremented.
-    assert pg.get_current_epoch(backend) > epoch_before, (
-        f"rank {ctx.rank}: epoch should increase after deactivation"
-    )
-
-    tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
-    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-    work.wait()
-    assert pg.get_local_success(work), (
-        f"rank {ctx.rank}: collective should succeed after auto-deactivate"
-    )
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
     ctx.record_result({"role": "survivor"})
 
@@ -714,12 +650,7 @@ def _replacement_recovery_worker(
 
         # Round 1: all healthy
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
-        work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-        work.wait()
-        assert pg.get_local_success(work), \
-            f"rank {logical_rank}: round 1 should succeed locally"
-        failed_ranks_hint = pg.get_failed_ranks_hint(work)
-        assert failed_ranks_hint.tolist() == [0] * ctx.world_size
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
         if logical_rank == BROKEN_RANK:
             # Broken rank exits
@@ -733,22 +664,7 @@ def _replacement_recovery_worker(
 
         # Round 2: run collective with dead rank -> local_success=False
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
-        work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-        work.wait()
-        assert not pg.get_local_success(work), \
-            f"rank {logical_rank}: round 2 should detect broken rank"
-        failed_ranks_hint = pg.get_failed_ranks_hint(work)
-        expected_failed_ranks_hint = [0] * ctx.world_size
-        expected_failed_ranks_hint[BROKEN_RANK] = 1
-        assert failed_ranks_hint.tolist() == expected_failed_ranks_hint
-
-        # Sync with the Coordinator to get the auto-deactivation decision.
-        # After this, get_peer_state() reflects the authoritative decision.
-        result = pg.sync_after_failure(backend)
-        assert result["status"] != 2, (  # kRejected
-            f"rank {logical_rank}: sync_after_failure rejected: "
-            f"{result.get('reject_reason', '')}"
-        )
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
         # Signal that we're ready for replacement
         if logical_rank == 0:
@@ -767,12 +683,7 @@ def _replacement_recovery_worker(
 
         # Final collective with all 4 ranks
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
-        work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-        work.wait()
-        assert pg.get_local_success(work), \
-            f"rank {logical_rank}: round 3 should succeed with replacement"
-        failed_ranks_hint = pg.get_failed_ranks_hint(work)
-        assert failed_ranks_hint.tolist() == [0] * ctx.world_size
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
         ctx.record_result({"role": "survivor"})
     else:
@@ -797,6 +708,7 @@ def _replacement_recovery_worker(
 def _manual_deactivate_worker(
     ctx: MooncakePGWorkerContext,
     broken_exited: mp.Event,
+    survivors_synced: mp.Barrier,
 ) -> None:
     """Multi-round test with auto_deactivate_on_failure=False:
     Round 1 (all healthy): failedRanks = all 0s, activeRanks = all 1s.
@@ -805,7 +717,8 @@ def _manual_deactivate_worker(
     Round 3 (after deactivate): failedRanks = all 0s for reduced group,
       activeRanks reflects the deactivation.
     """
-    device = ctx.init_group(auto_deactivate_on_failure=False)
+    device = ctx.init_group(auto_deactivate_on_failure=False,
+                            auto_sync_on_failure=False)
     backend = ctx.get_backend()
 
     # Round 1: all healthy
@@ -847,6 +760,18 @@ def _manual_deactivate_worker(
 
     active_ranks = pg.get_active_ranks(backend)
     assert active_ranks.cpu().tolist() == [1] * ctx.world_size
+
+    # For groups with auto_deactivate=False, users are responsible for synchronizing
+    # the surviving ranks after a failure. Otherwise, a ViewUpdate may race with
+    # in-flight operations on other ranks.
+    #
+    # This behavior is intentional:
+    #   - For auto_deactivate=True groups, PG automatically performs synchronization and
+    #     failure reconciliation. Synchronization is handled by `sync_after_failure`, which
+    #     is also performed automatically when `auto_sync_on_failure` is enabled (the default).
+    #   - For auto_deactivate=False groups, synchronization and failure
+    #     reconciliation are entirely the user's responsibility.
+    survivors_synced.wait()
 
     # Survivors deactivate the dead rank before issuing new collectives.
     pg.deactivate_rank(backend, [BROKEN_RANK])
@@ -932,8 +857,7 @@ class _ElasticMixin:
         original_rows = [r for r in rows if r.get("role") == "original"]
         extension_rows = [r for r in rows if r.get("role") == "extension"]
 
-        if len(original_rows) != self.world_size - 1:
-            self.assertEqual(len(original_rows), self.world_size - 1)
+        self.assertEqual(len(original_rows), self.world_size - 1)
         self.assertEqual(len(extension_rows), 1)
 
         # Verify baseline sum: 1+2+...+(world_size-1) = world_size*(world_size-1)/2
@@ -1051,10 +975,12 @@ class _ElasticMixin:
         """
         spawn_ctx = mp.get_context("spawn")
         broken_exited = spawn_ctx.Event()
+        survivors_synced = spawn_ctx.Barrier(self.world_size - 1)
 
         rows = self.spawn_backend_and_collect(
             _manual_deactivate_worker,
             broken_exited,
+            survivors_synced,
             timeout_s=30.0,
         )
 

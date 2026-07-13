@@ -25,11 +25,12 @@
 namespace mooncake {
 
 static constexpr size_t kDefaultCollectiveTimeoutUs = 100000;  // 100 ms
-static constexpr int64_t kDefaultP2PTimeoutUs = 3000000;        // 3 s
+static constexpr int64_t kDefaultP2PTimeoutUs = 3000000;       // 3 s
 static constexpr int64_t kDefaultFaultReconciliationWindowUs =
-    4 * kDefaultCollectiveTimeoutUs;  // 400 ms — must be &gt; collective_timeout_us
-                                       // so timeout-based failure reporters
-                                       // contribute before the window expires
+    4 *
+    kDefaultCollectiveTimeoutUs;  // 400 ms — must be &gt; collective_timeout_us
+                                  // so timeout-based failure reporters
+                                  // contribute before the window expires
 
 class AgentInterface;
 class AgentHost;
@@ -44,12 +45,6 @@ struct MooncakeProcessContext {
     int64_t p2p_timeout_us = kDefaultP2PTimeoutUs;
     int64_t fault_reconciliation_window_us =
         kDefaultFaultReconciliationWindowUs;
-
-    // When true, Work::wait() implicitly calls syncAfterFailure() after
-    // a peer failure is detected, so that failed ranks are deactivated
-    // by the time wait() returns.
-    // Controlled by MOONCAKE_PG_IMPLICIT_SYNC_AFTER_FAILURE (default 1).
-    bool implicit_sync_after_failure = true;
 
     // === Runtime ===
     // Eagerly created so set_device_filter works before init_process_group.
@@ -139,6 +134,15 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
               maxGroupSize_{maxGroupSize},
               autoDeactivateOnFailure_{autoDeactivateOnFailure} {}
 
+        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
+                               int maxGroupSize, bool autoDeactivateOnFailure,
+                               bool autoSyncOnFailure)
+            : activeRanks_{activeRanks},
+              isExtension_{isExtension},
+              maxGroupSize_{maxGroupSize},
+              autoDeactivateOnFailure_{autoDeactivateOnFailure},
+              autoSyncOnFailure_{autoSyncOnFailure} {}
+
         ~MooncakeBackendOptions() override = default;
 
         at::Tensor activeRanks_;
@@ -157,6 +161,20 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         // failedRanks, while leaving the active rank unchanged so that the
         // caller can decide whether and how to handle the failure.
         bool autoDeactivateOnFailure_ = true;
+
+        // When true, Work::wait() calls syncAfterFailure() on the Coordinator
+        // after detecting a local failure, so that get_peer_state() reflects
+        // the authoritative membership decision by the time wait() returns.
+        //
+        // IMPORTANT: This option defeats async_op=True semantics.  To detect
+        // failures, wait() must call getLocalSuccess() which synchronizes the
+        // GPU event, blocking the calling thread until the collective
+        // completes.  With this option enabled, every collective is
+        // effectively synchronous.
+        //
+        // Requires autoDeactivateOnFailure_=true (enforced at construction).
+        // Controlled by MOONCAKE_PG_AUTO_SYNC_ON_FAILURE (default 1).
+        bool autoSyncOnFailure_ = true;
     };
 
     /**
@@ -180,7 +198,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     const std::string getBackendName() const override;
 
-    int getSize() const override { return meta_ ? meta_->size : size_; }
+    int getSize() const override { return meta_ ? meta_->activeSize : size_; }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.

@@ -264,8 +264,7 @@ using AgentEffect =
     std::variant<EnablePeerProbe, DisconnectLink, StopReconnect,
                  ClearPeerMetadata, DisconnectAllLinks, ClearAllPeerMetadata,
                  ApplyViewToBackend, NotifyTEUnreachable, RefreshPeerLink,
-                 NotifyLinkRefreshed,
-                 NotifyGroupReady, NotifyRanksActivated>;
+                 NotifyLinkRefreshed, NotifyGroupReady, NotifyRanksActivated>;
 
 // Results produced by the Coordinator/Agent state machine
 

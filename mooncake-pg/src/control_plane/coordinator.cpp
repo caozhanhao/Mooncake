@@ -354,12 +354,12 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
     if (has_negative) {
         LOG(INFO) << "[COORD] TransferObservation has negative → opening "
                      "reconciliation window";
-        openReconciliationWindow();
+        tryOpenReconciliationWindow();
     }
     return result;
 }
 
-void CentralizedCoordinatorStateMachine::openReconciliationWindow() {
+void CentralizedCoordinatorStateMachine::tryOpenReconciliationWindow() {
     if (!reconciliation_ctx_.active) {
         reconciliation_ctx_.active = true;
         reconciliation_ctx_.deadline =
@@ -428,6 +428,15 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
         return result;
     }
 
+    // sync_after_failure is only meaningful for auto_deactivate groups.
+    if (!view_it->second.auto_deactivate) {
+        result.effects.push_back(ReplySyncEffect{
+            sync_id,
+            {SyncAfterFailureStatus::Rejected, view_it->second.epoch,
+             "group has auto_deactivate=false"}});
+        return result;
+    }
+
     // Apply piggybacked observation inline.
     if (req.observation.has_value()) {
         bool has_negative =
@@ -435,7 +444,7 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
                                   req.observation->failed_ranks_hint);
 
         if (has_negative) {
-            openReconciliationWindow();
+            tryOpenReconciliationWindow();
         }
     }
 

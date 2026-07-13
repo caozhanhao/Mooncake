@@ -332,7 +332,26 @@ MooncakeBackend::MooncakeBackend(
     for (GlobalRank r : initial_group.rank_order) {
         initial_group.members[r].status = GroupMemberStatus::Active;
     }
-    bool auto_deactivate = options_ ? options_->autoDeactivateOnFailure_ : true;
+    bool auto_deactivate = [&]() -> bool {
+        if (options_) return options_->autoDeactivateOnFailure_;
+        if (const char* val =
+                std::getenv("MOONCAKE_PG_AUTO_DEACTIVATE_ON_FAILURE"))
+            return (std::string(val) == "1" || std::string(val) == "true");
+        return true;
+    }();
+    bool auto_sync_on_failure = [&]() -> bool {
+        if (options_) return options_->autoSyncOnFailure_;
+        if (const char* val = std::getenv("MOONCAKE_PG_AUTO_SYNC_ON_FAILURE"))
+            return (std::string(val) == "1" || std::string(val) == "true");
+        return true;
+    }();
+
+    // auto_sync_on_failure requires auto_deactivate_on_failure.
+    TORCH_CHECK(
+        !auto_sync_on_failure || auto_deactivate,
+        "auto_sync_on_failure requires auto_deactivate_on_failure=true");
+
+    meta_->autoSyncOnFailure = auto_sync_on_failure;
 
     // Register group is synchronous.  Pass `this` as a raw pointer — the
     // backend's lifetime is managed by the intrusive_ptr returned from
@@ -1124,8 +1143,14 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view) {
         }
     }
 
+    // FIXME:
+    // meta_->activeSize = std::count_if(view.members.begin(),
+    // view.members.end(), [](auto&& m) {
+    //     return m.isActive();
+    // });
+
     // Keep the Python-visible activeRanksTensor in sync with the view.
-    // FIXME
+    // FIXME: potential deadlock?
     syncActiveRanksTensor();
 
     // Publish epoch AFTER all data-plane state (activeRanks, segmentInfos,

@@ -30,13 +30,6 @@ MooncakeProcessContext::MooncakeProcessContext() {
                 << " us";
         }
     }
-    if (const char* val =
-            std::getenv("MOONCAKE_PG_IMPLICIT_SYNC_AFTER_FAILURE")) {
-        implicit_sync_after_failure =
-            (std::string(val) == "1" || std::string(val) == "true");
-        LOG(INFO) << "Implicit sync after failure: "
-                  << implicit_sync_after_failure;
-    }
 }
 
 MooncakeProcessContext::~MooncakeProcessContext() {
@@ -336,7 +329,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("is_extension"), py::arg("max_group_size"))
         .def(py::init<at::Tensor, bool, int, bool>(), py::arg("active_ranks"),
              py::arg("is_extension"), py::arg("max_group_size"),
-             py::arg("auto_deactivate_on_failure"));
+             py::arg("auto_deactivate_on_failure"))
+        .def(py::init<at::Tensor, bool, int, bool, bool>(),
+             py::arg("active_ranks"), py::arg("is_extension"),
+             py::arg("max_group_size"), py::arg("auto_deactivate_on_failure"),
+             py::arg("auto_sync_on_failure") = true);
 }
 
 }  // namespace mooncake

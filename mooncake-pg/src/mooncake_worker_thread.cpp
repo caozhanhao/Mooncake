@@ -255,8 +255,9 @@ void MooncakeWorker::startWorker() {
                     for (int j = 0; j < group->size; ++j) {
                         if (!group->activeRanks[j] ||
                             task_failed_tensor_[i][j].item<int>()) {
-                        LOG(INFO) << "Rank " << group->globalRank << " skipped sync to " 
-                             << group->rank_order[j];
+                            LOG(INFO)
+                                << "Rank " << group->globalRank
+                                << " skipped sync to " << group->rank_order[j];
                             continue;
                         }
                         *source_ptr = 1;
@@ -270,10 +271,13 @@ void MooncakeWorker::startWorker() {
                                              group->rank * sizeof(int32_t),
                             .length = sizeof(int32_t),
                         });
-                        LOG(INFO) << "Rank " << group->globalRank << " initiating sync to " 
-                             << group->rank_order[j] << " id " << group->segmentIDs[j] << " offset "
-                             << group->segmentInfos[j].recv_sync[task.bufferOffset] +
-                                             group->rank * sizeof(int32_t);
+                        LOG(INFO)
+                            << "Rank " << group->globalRank
+                            << " initiating sync to " << group->rank_order[j]
+                            << " id " << group->segmentIDs[j] << " offset "
+                            << group->segmentInfos[j]
+                                       .recv_sync[task.bufferOffset] +
+                                   group->rank * sizeof(int32_t);
                     }
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());

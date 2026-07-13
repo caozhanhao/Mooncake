@@ -65,6 +65,7 @@ struct TransferGroupMeta {
     GroupEndpointInfo segmentInfos[kMaxNumRanks];
     const size_t* collectiveTimeoutUs = nullptr;
     MooncakeBackend* backend = nullptr;  // for failure reporting / link check
+    bool autoSyncOnFailure = true;  // per-group, set at backend construction
 };
 
 #if defined(__CUDACC__) || defined(__MUSA__)
