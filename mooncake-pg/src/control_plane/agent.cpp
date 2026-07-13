@@ -115,8 +115,14 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
         return effects;
     }
 
-    // Detect endpoint updates.
     const auto& old_view = it->second;
+
+    // Collect peers whose segment caches must be refreshed.
+    // This should be done after ApplyViewToBackend updates each
+    // backend's rank_order, since refreshSegmentID requires rank_order.
+    std::vector<GlobalRank> need_segment_refresh;
+
+    // Detect endpoint updates.
     for (size_t r = 0; r < push.view.members.size(); ++r) {
         if (r == static_cast<size_t>(rank_)) continue;
         if (!push.view.members[r].isMember()) continue;
@@ -130,7 +136,7 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
         }
         if (new_epoch != 0 && new_epoch != old_epoch) {
             effects.push_back(RefreshPeerLink{r});
-            effects.push_back(NotifyLinkRefreshed{r});
+            need_segment_refresh.push_back(static_cast<GlobalRank>(r));
         }
     }
 
@@ -165,6 +171,13 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
     }
 
     effects.push_back(ApplyViewToBackend{push.group_id, push.view});
+
+    // Must come AFTER ApplyViewToBackend: refreshSegmentID requires
+    // latest meta_->rank_order.
+    for (auto gr : need_segment_refresh) {
+        effects.push_back(NotifyLinkRefreshed{gr});
+    }
+
     return effects;
 }
 

@@ -58,7 +58,7 @@ abi_define = f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}"
 # etc.) diverges between the C++ targets and this file, template types
 # instantiated into both pg_*.so and store.so will have different layouts,
 #  leading to silent crashes. :(
-cxx_args = [abi_define, "-DYLT_ENABLE_IBV", "-std=c++20", "-O0", "-g"]
+cxx_args = [abi_define, "-DYLT_ENABLE_IBV", "-std=c++20", "-O3", "-g0"]
 
 cuda_libraries = ["ibverbs", "mlx5"]
 cuda_library_dirs = []

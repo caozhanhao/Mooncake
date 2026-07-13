@@ -167,7 +167,7 @@ at::Tensor MooncakeWorkCuda::getFailedRanksHint() const {
 }
 
 bool MooncakeWorkCpu::getLocalSuccess() const {
-    return failedRanksHint_.isLocalSuccess(meta_->size);
+    return failedRanksHint_.isLocalSuccess(meta_->maxGroupSize);
 }
 
 bool MooncakeWorkCuda::getLocalSuccess() const {
@@ -175,7 +175,7 @@ bool MooncakeWorkCuda::getLocalSuccess() const {
                       c10::cuda::CaptureStatus::None) {
         event_->synchronize();
     }
-    return failedRanksHint_.isLocalSuccess(meta_->size);
+    return failedRanksHint_.isLocalSuccess(meta_->maxGroupSize);
 }
 
 bool MooncakeP2PWork::getLocalSuccess() const { return isSuccess(); }

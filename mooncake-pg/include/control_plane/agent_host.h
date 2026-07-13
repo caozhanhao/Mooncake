@@ -94,13 +94,11 @@ class AgentInterface {
     // Accessors.
     virtual uint64_t getAgentSessionEpoch() = 0;
 
-    // Thread-safe: process-level rank state.
     virtual RankState getRankState(GlobalRank rank) = 0;
 
-    // Thread-safe: rank is active in the given group.
     virtual bool isRankActive(GroupId group_id, InGroupRank rank) = 0;
 
-    // Best-effort: Healthy + isMember + hasEndpoint (thread-safe).
+    // Best-effort: Healthy + isMember + hasEndpoint
     virtual bool maybeActivatable(GroupId group_id, InGroupRank rank) = 0;
 };
 

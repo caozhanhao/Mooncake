@@ -107,7 +107,7 @@ void MooncakeWorker::startWorker() {
                         rankToTaskId[i][j] = kInvalidTaskId;
                     }
                     std::vector<TransferRequest> entries;
-                    for (int j = 0; j < group->size; ++j) {
+                    for (int j = 0; j < group->maxGroupSize; ++j) {
                         if (!group->activeRanks[j] ||
                             task_failed_tensor_[i][j].item<int>()) {
                             continue;
@@ -191,7 +191,7 @@ void MooncakeWorker::startWorker() {
                         auto now = clock::now();
                         auto diff = std::chrono::duration_cast<
                             std::chrono::microseconds>(now - activeTime[i]);
-                        for (int j = 0; j < group->size; ++j) {
+                        for (int j = 0; j < group->maxGroupSize; ++j) {
                             if (!group->activeRanks[j] ||
                                 task_failed_tensor_[i][j].item<int>()) {
                                 continue;
@@ -252,12 +252,9 @@ void MooncakeWorker::startWorker() {
                         rankToTaskId[i][j] = kInvalidTaskId;
                     }
                     std::vector<TransferRequest> entries;
-                    for (int j = 0; j < group->size; ++j) {
+                    for (int j = 0; j < group->maxGroupSize; ++j) {
                         if (!group->activeRanks[j] ||
                             task_failed_tensor_[i][j].item<int>()) {
-                            LOG(INFO)
-                                << "Rank " << group->globalRank
-                                << " skipped sync to " << group->rank_order[j];
                             continue;
                         }
                         *source_ptr = 1;
@@ -271,13 +268,6 @@ void MooncakeWorker::startWorker() {
                                              group->rank * sizeof(int32_t),
                             .length = sizeof(int32_t),
                         });
-                        LOG(INFO)
-                            << "Rank " << group->globalRank
-                            << " initiating sync to " << group->rank_order[j]
-                            << " id " << group->segmentIDs[j] << " offset "
-                            << group->segmentInfos[j]
-                                       .recv_sync[task.bufferOffset] +
-                                   group->rank * sizeof(int32_t);
                     }
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());
@@ -296,7 +286,7 @@ void MooncakeWorker::startWorker() {
                             now - activeTime[i]);
 
                     TransferStatus status;
-                    for (int j = 0; j < group->size; ++j) {
+                    for (int j = 0; j < group->maxGroupSize; ++j) {
                         if (!group->activeRanks[j] ||
                             task_failed_tensor_[i][j].item<int>()) {
                             continue;
@@ -339,7 +329,7 @@ void MooncakeWorker::startWorker() {
                         activeTime[i] = clock::now();
                     }
                     if (task_done) {
-                        for (int j = 0; j < group->size; ++j) {
+                        for (int j = 0; j < group->maxGroupSize; ++j) {
                             signal_ptr[j] = 0;
                         }
 
@@ -348,7 +338,7 @@ void MooncakeWorker::startWorker() {
                             auto& att_tensor = task_attempted_tensor_[i];
                             auto& fail_tensor = task_failed_tensor_[i];
                             bool has_any_attempted = false;
-                            for (int j = 0; j < group->size; ++j) {
+                            for (int j = 0; j < group->maxGroupSize; ++j) {
                                 if (att_tensor[j].item<int>()) {
                                     has_any_attempted = true;
                                     break;
@@ -356,24 +346,15 @@ void MooncakeWorker::startWorker() {
                             }
                             if (has_any_attempted) {
                                 std::string raw_att, raw_fail;
-                                for (int j = 0; j < group->size; ++j) {
+                                for (int j = 0; j < group->maxGroupSize; ++j) {
                                     int att = att_tensor[j].item<int>();
                                     int fail = fail_tensor[j].item<int>();
                                     raw_att += std::to_string(att) + " ";
                                     raw_fail += std::to_string(fail) + " ";
                                 }
-                                LOG(INFO)
-                                    << "[OBS] Rank " << group->globalRank
-                                    << " group=" << group->group_id
-                                    << " size=" << group->size
-                                    << " op=" << (int)task.opType
-                                    << " boff=" << task.bufferOffset
-                                    << " raw_attempted=[" << raw_att << "]"
-                                    << " raw_failed=[" << raw_fail << "]";
-
                                 std::vector<uint8_t> attempted(kMaxNumRanks, 0);
                                 std::vector<uint8_t> failed(kMaxNumRanks, 0);
-                                for (int j = 0; j < group->size; ++j) {
+                                for (int j = 0; j < group->maxGroupSize; ++j) {
                                     int32_t peer_global = group->rank_order[j];
                                     attempted[peer_global] =
                                         att_tensor[j].item<int>() ? 1 : 0;

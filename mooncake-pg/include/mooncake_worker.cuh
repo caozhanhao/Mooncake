@@ -38,11 +38,11 @@ class MooncakeBackend;
 struct TransferGroupMeta {
     InGroupRank rank;
     GlobalRank globalRank;
-    // rank_order maps InGroupRank (0 .. size-1) to GlobalRank.
+    // rank_order maps InGroupRank (0 .. maxGroupSize-1) to GlobalRank.
     GlobalRank rank_order[kMaxNumRanks];
 
-    int size;        // capacity: number of in-group slots allocated
-    int activeSize;  // Number of in-group slots that is active
+    int maxGroupSize;  // capacity: number of in-group slots allocated
+    int activeSize;    // Number of in-group slots that are active
     int taskCount;
 
     GroupId group_id;
@@ -52,14 +52,14 @@ struct TransferGroupMeta {
     bool* activeRanksDevice;
 #if !defined(__MUSA__)
     at::Tensor
-        activeRanksTensor;  // length = this->size, ordered by InGroupRank
+        activeRanksTensor;  // length = maxGroupSize, ordered by InGroupRank
 #endif
     TransferEngine* engine;
     // segmentIDs and segmentInfos are indexed by InGroupRank (size
-    // kMaxNumRanks, but only slots 0 .. size-1 are valid). Collective code and
-    // the P2P proxy can index them directly by the local peer's in-group rank.
-    // The segment ID values themselves are global TransferEngine handles,
-    // resolved from the corresponding GlobalRank by the control plane.
+    // kMaxNumRanks, but only slots 0 .. maxGroupSize-1 are valid). Collective
+    // code and the P2P proxy can index them directly by the local peer's
+    // in-group rank. The segment ID values themselves are global TransferEngine
+    // handles, resolved from the corresponding GlobalRank by the control plane.
     TransferMetadata::SegmentID
         segmentIDs[kMaxNumRanks];  // synced by control plane
     GroupEndpointInfo segmentInfos[kMaxNumRanks];

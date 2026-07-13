@@ -116,42 +116,15 @@ def require_test_device(rank: int, device_type: str) -> torch.device:
 
 
 def mooncake_backend_options(
-    world_size: int,
-    device_type: str,
+    max_group_size: int,
     *,
-    active_value: int = 0,
-    is_extension: bool = False,
-    max_world_size: int | None = None,
     auto_deactivate_on_failure: bool = True,
     auto_sync_on_failure: bool = True,
 ) -> pg.MooncakeBackendOptions:
-    device = torch.device(device_type)
-    tensor_size = world_size if max_world_size is None else int(max_world_size)
-    active_ranks = torch.full(
-        (tensor_size,),
-        int(active_value),
-        dtype=torch.int32,
-        device=device,
-    )
     return pg.MooncakeBackendOptions(
-        active_ranks,
-        bool(is_extension),
-        tensor_size,
+        int(max_group_size),
         bool(auto_deactivate_on_failure),
         bool(auto_sync_on_failure),
-    )
-
-
-def mooncake_cpu_options(world_size: int) -> pg.MooncakeBackendOptions:
-    return mooncake_backend_options(world_size, "cpu", active_value=0)
-
-
-def mooncake_extension_cpu_options(world_size: int) -> pg.MooncakeBackendOptions:
-    return mooncake_backend_options(
-        world_size,
-        "cpu",
-        active_value=1,
-        is_extension=True,
     )
 
 
@@ -163,9 +136,7 @@ def init_mooncake_group(
     device_type: str,
     device_filters: Sequence[str] | None = None,
     use_pg_options: bool = True,
-    is_extension: bool = False,
-    active_value: int | None = None,
-    max_world_size: int | None = None,
+    max_group_size: int | None = None,
     auto_deactivate_on_failure: bool = True,
     auto_sync_on_failure: bool = True,
 ) -> torch.device:
@@ -177,37 +148,13 @@ def init_mooncake_group(
         "world_size": world_size,
     }
     if use_pg_options:
-        resolved_active_value = (
-            1 if is_extension else 0 if active_value is None else active_value
-        )
         kwargs["pg_options"] = mooncake_backend_options(
-            world_size,
-            device_type,
-            active_value=resolved_active_value,
-            is_extension=is_extension,
-            max_world_size=max_world_size,
+            max_group_size if max_group_size is not None else world_size,
             auto_deactivate_on_failure=auto_deactivate_on_failure,
             auto_sync_on_failure=auto_sync_on_failure,
         )
     dist.init_process_group(**kwargs)
     return device
-
-
-def init_mooncake_cpu_group(
-    rank: int,
-    world_size: int,
-    *,
-    device_filters: Sequence[str] | None = None,
-    use_pg_options: bool = True,
-) -> None:
-    init_mooncake_group(
-        rank,
-        world_size,
-        backend_name="mooncake-cpu",
-        device_type="cpu",
-        device_filters=device_filters,
-        use_pg_options=use_pg_options,
-    )
 
 
 def get_mooncake_backend(group=None, device_type: str = "cpu"):
@@ -243,9 +190,7 @@ class MooncakePGWorkerContext:
         world_size: int | None = None,
         device_filters: Sequence[str] | None = None,
         use_pg_options: bool = True,
-        is_extension: bool = False,
-        active_value: int | None = None,
-        max_world_size: int | None = None,
+        max_group_size: int | None = None,
         auto_deactivate_on_failure: bool = True,
         auto_sync_on_failure: bool = True,
     ) -> torch.device:
@@ -258,9 +203,7 @@ class MooncakePGWorkerContext:
             if device_filters is None
             else device_filters,
             use_pg_options=use_pg_options,
-            is_extension=is_extension,
-            active_value=active_value,
-            max_world_size=max_world_size,
+            max_group_size=max_group_size,
             auto_deactivate_on_failure=auto_deactivate_on_failure,
             auto_sync_on_failure=auto_sync_on_failure,
         )

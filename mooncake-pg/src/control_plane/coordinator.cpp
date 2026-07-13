@@ -332,22 +332,6 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
     }
     auto& reporter = ranks_[req.reporter_rank];
 
-    // Log what was reported
-    std::string attempted_str, failed_str;
-    for (int32_t i = 0; i < max_world_size_; ++i) {
-        if (i < static_cast<int32_t>(req.attempted_ranks.size()) &&
-            req.attempted_ranks[i]) {
-            attempted_str += std::to_string(i) + " ";
-        }
-        if (i < static_cast<int32_t>(req.failed_ranks_hint.size()) &&
-            req.failed_ranks_hint[i]) {
-            failed_str += std::to_string(i) + " ";
-        }
-    }
-    LOG(INFO) << "[COORD] TransferObservation from rank=" << req.reporter_rank
-              << " attempted=[" << attempted_str << "]"
-              << " failed=[" << failed_str << "]";
-
     bool has_negative = applyLinkStatusUpdate(reporter, req.attempted_ranks,
                                               req.failed_ranks_hint);
 
@@ -393,9 +377,6 @@ CentralizedCoordinatorStateMachine::handleLinkStateChange(
         return result;
     if (!rankInRange(req.peer)) return result;
     auto& reporter = ranks_[req.reporter_rank];
-
-    LOG(INFO) << "[COORD] LinkStateChange from rank=" << req.reporter_rank
-              << " peer=" << req.peer << " is_up=" << req.is_up;
 
     reporter.link_status[req.peer] = req.is_up ? 1 : 0;
     reporter.link_status[req.reporter_rank] = 1;  // self is always connected
@@ -705,12 +686,6 @@ void CentralizedCoordinatorStateMachine::updateRankStates(
 void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
     std::vector<CoordinatorEffect>& effects) {
     auto healthy_set = extendHealthySet();
-
-    {
-        std::string hs;
-        for (auto r : healthy_set) hs += std::to_string(r) + " ";
-        LOG(INFO) << "[COORD] extendHealthySet result: [" << hs << "]";
-    }
 
     // For auto_deactivate groups, remove unhealthy ranks from the active set.
     // However, during bootstrap / BootstrapSyncing we do NOT do this: we wait

@@ -181,7 +181,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize)>&
         bufferToTensor) {
-    size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
+    size_t chunkSize = ((kBufferSize - 1) / meta->maxGroupSize) & ~(size_t)7;
     auto future = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()));
 
@@ -226,12 +226,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
 
         hasCallback_[taskId] = true;
 
-        callbacks_[taskId] = [this, processNextChunk, state, meta,
-                              bufferToTensor, bufferOffset, realSize,
-                              future]() {
+        callbacks_[taskId] = [processNextChunk, state, meta, bufferToTensor,
+                              bufferOffset, realSize, future]() {
             if (meta->activeRanksTensor.device().is_cpu()) {
                 // activeRanks is InGroupRank-indexed, same order as the tensor.
-                for (int i = 0; i < meta->size; ++i) {
+                for (int i = 0; i < meta->maxGroupSize; ++i) {
                     meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
                 }
             }
@@ -263,7 +262,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
                              const at::cuda::CUDAStream&)>& tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize,
                              const at::cuda::CUDAStream&)>& bufferToTensor) {
-    size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
+    size_t chunkSize = ((kBufferSize - 1) / meta->maxGroupSize) & ~(size_t)7;
 
     at::cuda::CUDAStream enq_stream =
         at::cuda::getStreamFromPool(false, issue_stream.device_index());

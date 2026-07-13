@@ -288,31 +288,10 @@ void AgentHost::pushTransferObservation(std::vector<uint8_t> attempted_ranks,
     TransferObservationEvent event{std::move(attempted_ranks),
                                    std::move(failed_ranks)};
 
-    // Log what's being pushed (before move)
-    std::string att, fail;
-    for (size_t i = 0; i < event.attempted_ranks.size(); ++i) {
-        if (event.attempted_ranks[i]) att += std::to_string(i) + " ";
-        if (event.failed_ranks_hint[i]) fail += std::to_string(i) + " ";
-    }
-
     std::lock_guard<std::mutex> lock(pending_observation_mutex_);
     if (!pending_observation_.has_value()) {
-        LOG(INFO) << "[AGENT] pushObservation rank=" << rank_ << " STORE: att=["
-                  << att << "] fail=[" << fail << "]";
         pending_observation_ = std::move(event);
     } else {
-        std::string old_att, old_fail;
-        for (size_t i = 0; i < pending_observation_->attempted_ranks.size();
-             ++i) {
-            if (pending_observation_->attempted_ranks[i])
-                old_att += std::to_string(i) + " ";
-            if (pending_observation_->failed_ranks_hint[i])
-                old_fail += std::to_string(i) + " ";
-        }
-        LOG(INFO) << "[AGENT] pushObservation rank=" << rank_
-                  << " MERGE: old_att=[" << old_att << "] old_fail=["
-                  << old_fail << "] + new_att=[" << att << "] new_fail=["
-                  << fail << "]";
         agent_.mergeObservationEvent(*pending_observation_, event);
     }
 }
