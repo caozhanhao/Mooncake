@@ -1,0 +1,6 @@
+1. source /home/caozhanhao/ep-main/.venv/bin/activate
+2. uv run cmake -G Ninja -DUSE_CUDA=ON -DUSE_TENT=ON -DWITH_EP=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF -DWITH_STORE_GO=OFF -DBUILD_UNIT_TESTS=OFF -DBUILD_BENCHMARK=OFF -B build && cmake --build build -j$(nproc) && BUILD_DIR=build ./scripts/prepare_wheel_dir.sh
+3. export PYTHONPATH=/home/caozhanhao/Mooncake/mooncake-wheel:$PYTHONPATH
+4. MOONCAKE_PGTEST_DEVICE_FILTERS=mlx5_1,mlx5_2,mlx5_3,mlx5_4 python mooncake-pg/tests/test_pg_elastic.py TestMooncakePGElasticCUDA.test_failed_rank 2>&1 | tee log.txt
+
+# 第四步的测试按需选择。注意你可能需要用 && 拼接 1. 3. 这样的命令来确保环境变量正常。其中 1. 是全局的，每一条的依赖，3. 是 4. 的依赖

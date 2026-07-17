@@ -209,3 +209,11 @@ core_*
 # MacOS
 .DS_Store
 .envrc
+compile_commands.json
+log.txt
+__init__.py
+async_store.py
+mooncake-wheel/mooncake/fabric_allocator_utils.py
+mooncake-wheel/mooncake/mooncake_client
+.qoder
+mooncake-pg-source.txt
