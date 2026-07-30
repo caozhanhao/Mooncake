@@ -2,7 +2,7 @@
 
 #include <cstring>
 
-#ifndef MOONCAKE_EP_USE_MUSA
+#ifndef USE_MUSA
 #include <cuda.h>
 #include <cuda_runtime.h>
 #endif
@@ -15,7 +15,7 @@
 
 namespace mooncake {
 
-#ifndef MOONCAKE_EP_USE_MUSA
+#ifndef USE_MUSA
 static bool checkSupportFabricMem() {
     const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
     bool fabric_enabled = nvlink_ipc && strcmp(nvlink_ipc, "0") == 0;

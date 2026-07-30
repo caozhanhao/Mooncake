@@ -64,21 +64,27 @@ void CoordinatorRpcServiceImpl::syncAfterFailure(
     host_.postSyncAfterFailure(std::move(ctx), std::move(req));
 }
 
-CoordinatorHost::CoordinatorHost(c10::intrusive_ptr<c10d::Store> store,
-                                 const std::string& host_ip, int max_world_size,
+CoordinatorHost::CoordinatorHost(const std::string& host_ip, int max_world_size,
                                  int64_t fault_reconciliation_window_us)
     : state_machine_(max_world_size,
                      std::chrono::microseconds(fault_reconciliation_window_us)),
       executor_("CoordinatorHost"),
-      store_(std::move(store)),
       host_ip_(host_ip),
       max_world_size_(max_world_size),
-      rpc_client_(std::make_unique<RpcClient>(
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              std::chrono::microseconds(fault_reconciliation_window_us) * 2))) {
-}
+      rpc_client_(
+          std::make_unique<RpcClient>(rpcTimeoutForFaultReconciliationWindow(
+              fault_reconciliation_window_us))) {}
 
 CoordinatorHost::~CoordinatorHost() { shutdown(); }
+
+void CoordinatorHost::setFaultReconciliationWindow(int64_t timeout_us) {
+    rpc_client_->setRequestTimeout(
+        rpcTimeoutForFaultReconciliationWindow(timeout_us));
+    executor_.postAndWait([this, timeout_us] {
+        state_machine_.setFaultReconciliationWindow(
+            std::chrono::microseconds(timeout_us));
+    });
+}
 
 void CoordinatorHost::start() {
     rpc_server_ = std::make_unique<RpcServer>(/*port=*/0, /*thread_num=*/2);
@@ -101,8 +107,7 @@ void CoordinatorHost::start() {
         LOG(FATAL) << "CoordinatorHost: failed to start RPC server";
     }
 
-    std::string addr = rpc_server_->getListenAddr(host_ip_);
-    store_->set("coordinator_addr", addr);
+    listen_addr_ = rpc_server_->getListenAddr(host_ip_);
 
     executor_.setTickCallback([this]() {
         auto result = state_machine_.tick();

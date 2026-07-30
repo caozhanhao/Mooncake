@@ -71,6 +71,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         std::chrono::microseconds fault_reconciliation_window =
             std::chrono::microseconds(50000));
 
+    void setFaultReconciliationWindow(
+        std::chrono::microseconds fault_reconciliation_window);
+
     CoordinatorApplyResult<RegisterAgentResponse> handleRegisterAgent(
         const RegisterAgentRequest& req) override;
 

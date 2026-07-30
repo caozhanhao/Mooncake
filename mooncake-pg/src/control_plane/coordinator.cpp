@@ -27,6 +27,11 @@ CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
     }
 }
 
+void CentralizedCoordinatorStateMachine::setFaultReconciliationWindow(
+    std::chrono::microseconds fault_reconciliation_window) {
+    fault_reconciliation_window_ = fault_reconciliation_window;
+}
+
 CoordinatorApplyResult<RegisterAgentResponse>
 CentralizedCoordinatorStateMachine::handleRegisterAgent(
     const RegisterAgentRequest& req) {
