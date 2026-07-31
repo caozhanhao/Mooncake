@@ -170,7 +170,7 @@ MooncakeWorker::~MooncakeWorker() {
     }
 }
 
-std::shared_ptr<WorkCompletion> MooncakeWorker::putTaskCpu(
+std::unique_ptr<WorkCompletion> MooncakeWorker::putTaskCpu(
     OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::shared_ptr<TransferGroupMeta>& meta, int32_t* failed_ranks_hint,
     const std::function<void(void* dst, size_t pos, size_t realSize)>&
@@ -181,7 +181,7 @@ std::shared_ptr<WorkCompletion> MooncakeWorker::putTaskCpu(
     size_t chunkSize = ((kBufferSize - 1) / meta->maxGroupSize) & ~(size_t)7;
     auto completion = std::make_shared<std::promise<void>>();
     auto future = completion->get_future().share();
-    auto result = std::make_shared<WorkCompletion>(std::move(future));
+    auto result = std::make_unique<WorkCompletion>(std::move(future));
 
     struct IterState {
         size_t currentPos = 0;

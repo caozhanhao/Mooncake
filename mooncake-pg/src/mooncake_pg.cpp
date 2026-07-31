@@ -12,21 +12,29 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include "types.h"
+#include "comm_types.h"
 
 struct mooncakePgContext {
-    std::shared_ptr<mooncake::MooncakePGContext> impl;
+    std::unique_ptr<mooncake::MooncakePGContext> impl;
 };
 
 struct mooncakePgComm {
-    std::shared_ptr<mooncake::MooncakeCommunicator> impl;
+    explicit mooncakePgComm(mooncake::MooncakePGContext& context)
+        : context(&context) {
+        context.incrementCommUseCount();
+    }
+
+    ~mooncakePgComm() {
+        impl.reset();
+        context->decrementCommUseCount();
+    }
+
+    mooncake::MooncakePGContext* context;
+    std::unique_ptr<mooncake::MooncakeCommunicator> impl;
 };
 
 struct mooncakePgCompletion {
-    std::shared_ptr<mooncake::WorkCompletion> impl;
-    // Keep the communicator alive until the operation and its callbacks have
-    // finished, even if the public communicator handle is destroyed first.
-    std::shared_ptr<mooncake::MooncakeCommunicator> communicator;
+    std::unique_ptr<mooncake::WorkCompletion> impl;
 };
 
 namespace {
@@ -40,6 +48,9 @@ mooncakePgResult_t translateExceptions(Function&& function) {
     try {
         function();
         return mooncakePgSuccess;
+    } catch (const mooncake::ContextBusyError& error) {
+        setLastError(error.what());
+        return mooncakePgResourceBusy;
     } catch (const std::invalid_argument& error) {
         setLastError(error.what());
         return mooncakePgInvalidArgument;
@@ -236,7 +247,6 @@ mooncakePgResult_t invokeOperationWithCompletion(
         initializeFailedRanksHint(comm, failed_ranks_hint,
                                   failed_ranks_hint_count);
         auto output = std::make_unique<mooncakePgCompletion>();
-        output->communicator = comm->impl;
         auto completion = launch(failed_ranks_hint);
         if (!completion) {
             throw std::runtime_error("operation returned no completion");
@@ -303,6 +313,8 @@ const char* mooncakePgGetErrorString(mooncakePgResult_t result) {
             return "invalid argument";
         case mooncakePgTimeout:
             return "operation timed out";
+        case mooncakePgResourceBusy:
+            return "resource busy";
         default:
             return "unknown result";
     }
@@ -316,7 +328,7 @@ mooncakePgResult_t mooncakePgContextCreate(mooncakePgContext_t* context) {
         *context = nullptr;
 
         auto output = std::make_unique<mooncakePgContext>();
-        output->impl = std::make_shared<mooncake::MooncakePGContext>();
+        output->impl = std::make_unique<mooncake::MooncakePGContext>();
         *context = output.release();
     });
 }
@@ -416,7 +428,12 @@ mooncakePgResult_t mooncakePgContextSetFaultReconciliationWindow(
 }
 
 mooncakePgResult_t mooncakePgContextDestroy(mooncakePgContext_t context) {
-    return translateExceptions([&] { delete context; });
+    return translateExceptions([&] {
+        if (!context) return;
+        validateContext(context);
+        context->impl->shutdown();
+        delete context;
+    });
 }
 
 mooncakePgResult_t mooncakePgCommCreate(mooncakePgContext_t context,
@@ -476,9 +493,9 @@ mooncakePgResult_t mooncakePgCommCreate(mooncakePgContext_t context,
         internal.active_ranks_mirror_is_device =
             config->activeRanksMirrorIsDevice != 0;
 
-        auto output = std::make_unique<mooncakePgComm>();
-        output->impl = std::make_shared<mooncake::MooncakeCommunicator>(
-            context->impl, std::move(internal));
+        auto output = std::make_unique<mooncakePgComm>(*context->impl);
+        output->impl = std::make_unique<mooncake::MooncakeCommunicator>(
+            *context->impl, std::move(internal));
         *comm = output.release();
     });
 }

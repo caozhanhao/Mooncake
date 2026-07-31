@@ -10,7 +10,7 @@
 
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
-#include "types.h"
+#include "control_plane/control_types.h"
 
 namespace mooncake {
 

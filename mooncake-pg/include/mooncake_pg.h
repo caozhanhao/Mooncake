@@ -33,6 +33,7 @@ typedef enum mooncakePgResult {
     mooncakePgInternalError = 2,
     mooncakePgInvalidArgument = 3,
     mooncakePgTimeout = 4,
+    mooncakePgResourceBusy = 5,
 } mooncakePgResult_t;
 
 typedef enum mooncakePgDataType {

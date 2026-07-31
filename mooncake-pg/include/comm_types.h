@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_TYPES_H
-#define MOONCAKE_PG_TYPES_H
+#ifndef MOONCAKE_PG_COMM_TYPES_H
+#define MOONCAKE_PG_COMM_TYPES_H
 
 #include <chrono>
 #include <cstddef>
@@ -99,4 +99,4 @@ struct CudaTaskSubmissionToken {
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_TYPES_H
+#endif  // MOONCAKE_PG_COMM_TYPES_H

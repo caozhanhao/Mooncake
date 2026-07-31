@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -18,9 +19,14 @@
 #include "mooncake_pg.h"
 #include "mooncake_worker.cuh"
 #include "p2p_proxy.h"
-#include "types.h"
+#include "comm_types.h"
 
 namespace mooncake {
+
+class ContextBusyError : public std::runtime_error {
+   public:
+    using std::runtime_error::runtime_error;
+};
 
 static constexpr size_t kDefaultCollectiveTimeoutUs = 10000000;  // 10 s
 static constexpr int64_t kDefaultP2PTimeoutUs = 10000000;        // 10 s
@@ -71,9 +77,16 @@ struct MooncakePGContext {
     void setCollectiveTimeout(size_t timeout_us);
     void setP2PTimeout(int64_t timeout_us);
     void setFaultReconciliationWindow(int64_t timeout_us);
+    void incrementCommUseCount();
+    void decrementCommUseCount() noexcept;
+    void shutdown();
 
    private:
-    std::mutex initialize_mutex_;
+    void requireRunning() const;
+
+    std::mutex state_mutex_;
+    size_t comm_use_count_ = 0;
+    bool shutdown_requested_ = false;
 };
 
 struct MooncakeCommunicatorConfig {
@@ -97,7 +110,7 @@ struct MooncakeCommunicatorConfig {
 
 class MooncakeCommunicator {
    public:
-    MooncakeCommunicator(std::shared_ptr<MooncakePGContext> context,
+    MooncakeCommunicator(MooncakePGContext& context,
                          MooncakeCommunicatorConfig config);
     ~MooncakeCommunicator();
 
@@ -109,21 +122,21 @@ class MooncakeCommunicator {
     int getMaxGroupSize() const { return max_group_size_; }
     bool isCpu() const { return is_cpu_; }
 
-    std::shared_ptr<WorkCompletion> send(const void* buffer, size_t bytes,
+    std::unique_ptr<WorkCompletion> send(const void* buffer, size_t bytes,
                                          int peer, cudaStream_t stream,
                                          int32_t* failed_ranks_hint);
-    std::shared_ptr<WorkCompletion> recv(void* buffer, size_t bytes, int peer,
+    std::unique_ptr<WorkCompletion> recv(void* buffer, size_t bytes, int peer,
                                          cudaStream_t stream,
                                          int32_t* failed_ranks_hint);
 
-    std::shared_ptr<WorkCompletion> broadcastCpu(const void* send_buffer,
+    std::unique_ptr<WorkCompletion> broadcastCpu(const void* send_buffer,
                                                  void* recv_buffer,
                                                  size_t bytes, int root,
                                                  int32_t* failed_ranks_hint);
     void broadcastGpu(const void* send_buffer, void* recv_buffer, size_t bytes,
                       int root, cudaStream_t stream,
                       int32_t* failed_ranks_hint);
-    std::shared_ptr<WorkCompletion> allReduceCpu(const void* send_buffer,
+    std::unique_ptr<WorkCompletion> allReduceCpu(const void* send_buffer,
                                                  void* recv_buffer,
                                                  size_t bytes,
                                                  DataType datatype, ReduceOp op,
@@ -131,29 +144,29 @@ class MooncakeCommunicator {
     void allReduceGpu(const void* send_buffer, void* recv_buffer, size_t bytes,
                       DataType datatype, ReduceOp op, cudaStream_t stream,
                       int32_t* failed_ranks_hint);
-    std::shared_ptr<WorkCompletion> allGatherCpu(const void* send_buffer,
+    std::unique_ptr<WorkCompletion> allGatherCpu(const void* send_buffer,
                                                  void* recv_buffer,
                                                  size_t send_bytes,
                                                  int32_t* failed_ranks_hint);
     void allGatherGpu(const void* send_buffer, void* recv_buffer,
                       size_t send_bytes, cudaStream_t stream,
                       int32_t* failed_ranks_hint);
-    std::shared_ptr<WorkCompletion> reduceScatterCpu(
+    std::unique_ptr<WorkCompletion> reduceScatterCpu(
         const void* send_buffer, void* recv_buffer, size_t recv_bytes,
         DataType datatype, ReduceOp op, int32_t* failed_ranks_hint);
     void reduceScatterGpu(const void* send_buffer, void* recv_buffer,
                           size_t recv_bytes, DataType datatype, ReduceOp op,
                           cudaStream_t stream, int32_t* failed_ranks_hint);
-    std::shared_ptr<WorkCompletion> allToAllCpu(const void* send_buffer,
+    std::unique_ptr<WorkCompletion> allToAllCpu(const void* send_buffer,
                                                 void* recv_buffer,
                                                 size_t peer_bytes,
                                                 int32_t* failed_ranks_hint);
     void allToAllGpu(const void* send_buffer, void* recv_buffer,
                      size_t peer_bytes, cudaStream_t stream,
                      int32_t* failed_ranks_hint);
-    std::shared_ptr<WorkCompletion> barrierCpu(int32_t* failed_ranks_hint);
+    std::unique_ptr<WorkCompletion> barrierCpu(int32_t* failed_ranks_hint);
     void barrierGpu(cudaStream_t stream, int32_t* failed_ranks_hint);
-    std::shared_ptr<WorkCompletion> reduceCpu(const void* send_buffer,
+    std::unique_ptr<WorkCompletion> reduceCpu(const void* send_buffer,
                                               void* recv_buffer, size_t bytes,
                                               DataType datatype, ReduceOp op,
                                               int root,
@@ -161,14 +174,14 @@ class MooncakeCommunicator {
     void reduceGpu(const void* send_buffer, void* recv_buffer, size_t bytes,
                    DataType datatype, ReduceOp op, int root,
                    cudaStream_t stream, int32_t* failed_ranks_hint);
-    std::shared_ptr<WorkCompletion> gatherCpu(const void* send_buffer,
+    std::unique_ptr<WorkCompletion> gatherCpu(const void* send_buffer,
                                               void* recv_buffer,
                                               size_t send_bytes, int root,
                                               int32_t* failed_ranks_hint);
     void gatherGpu(const void* send_buffer, void* recv_buffer,
                    size_t send_bytes, int root, cudaStream_t stream,
                    int32_t* failed_ranks_hint);
-    std::shared_ptr<WorkCompletion> scatterCpu(const void* send_buffer,
+    std::unique_ptr<WorkCompletion> scatterCpu(const void* send_buffer,
                                                void* recv_buffer,
                                                size_t recv_bytes, int root,
                                                int32_t* failed_ranks_hint);
@@ -228,7 +241,7 @@ class MooncakeCommunicator {
     // GroupView.
     void syncActiveRanksMirror() const;
 
-    std::shared_ptr<MooncakePGContext> context_;
+    MooncakePGContext& context_;
     AgentInterface& agent_;
     int rank_ = 0;
     int size_ = 1;

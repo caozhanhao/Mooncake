@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_CONTROL_PLANE_TYPES_H
-#define MOONCAKE_PG_CONTROL_PLANE_TYPES_H
+#ifndef MOONCAKE_PG_CONTROL_PLANE_CONTROL_TYPES_H
+#define MOONCAKE_PG_CONTROL_PLANE_CONTROL_TYPES_H
 
 #include <cstdint>
 #include <optional>
@@ -167,4 +167,4 @@ struct LinkEvent {
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_CONTROL_PLANE_TYPES_H
+#endif  // MOONCAKE_PG_CONTROL_PLANE_CONTROL_TYPES_H

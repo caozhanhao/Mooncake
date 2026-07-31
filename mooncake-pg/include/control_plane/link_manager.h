@@ -15,7 +15,7 @@
 
 #include <transfer_engine.h>
 
-#include "types.h"
+#include "control_plane/control_types.h"
 
 namespace mooncake {
 

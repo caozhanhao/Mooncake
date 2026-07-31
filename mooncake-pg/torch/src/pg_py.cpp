@@ -241,8 +241,13 @@ std::vector<int> droppedRanks(const mooncakePgProposalResponse_t& response) {
 
 void shutdownProcessContext() {
     auto context = g_ctx.handle;
-    g_ctx.handle = nullptr;
-    if (context) (void)mooncakePgContextDestroy(context);
+    if (!context) return;
+    // ContextDestroy rejects a parent-before-child teardown while a communicator
+    // is still alive. Keep the handle for the static-destructor fallback instead
+    // of losing ownership.
+    if (mooncakePgContextDestroy(context) == mooncakePgSuccess) {
+        g_ctx.handle = nullptr;
+    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
