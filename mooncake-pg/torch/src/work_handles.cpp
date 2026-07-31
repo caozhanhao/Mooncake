@@ -48,8 +48,7 @@ std::function<void()> makePostCompletionOnce(
 
 template <typename... Resources>
 std::any makeTrackedResources(Resources&&... resources) {
-    return std::any(
-        std::make_tuple(std::forward<Resources>(resources)...));
+    return std::any(std::make_tuple(std::forward<Resources>(resources)...));
 }
 
 }  // namespace
@@ -76,8 +75,7 @@ void MooncakeWorkTracker::retire(
     // run a post-completion callback that may perform a device copy.
     std::lock_guard<std::mutex> lock(mutex_);
     if (is_shutdown_) return;
-    retired_.push_back(
-        {std::move(resources), std::move(ready_to_release)});
+    retired_.push_back({std::move(resources), std::move(ready_to_release)});
 }
 
 void MooncakeWorkTracker::retainUntilShutdown(std::any resources) noexcept {
@@ -100,12 +98,14 @@ void MooncakeWorkTracker::evictCompleted() noexcept {
         try {
             if (candidate.ready_to_release()) continue;
         } catch (const std::exception& error) {
-            TORCH_WARN("MooncakeWorkTracker: failed to process retired work; "
-                       "resources remain retained: ",
-                       error.what());
+            TORCH_WARN(
+                "MooncakeWorkTracker: failed to process retired work; "
+                "resources remain retained: ",
+                error.what());
         } catch (...) {
-            TORCH_WARN("MooncakeWorkTracker: failed to process retired work; "
-                       "resources remain retained: unknown exception");
+            TORCH_WARN(
+                "MooncakeWorkTracker: failed to process retired work; "
+                "resources remain retained: unknown exception");
         }
         pending.push_back(std::move(candidate));
     }
@@ -158,22 +158,20 @@ MooncakeWorkCpu::MooncakeWorkCpu(c10d::OpType opType,
       failed_ranks_hint_(std::move(failedRanksHint)),
       tracker_(std::move(tracker)),
       keep_alive_(std::move(keepAlive)),
-      post_completion_(
-          makePostCompletionOnce(std::move(postCompletion))) {}
+      post_completion_(makePostCompletionOnce(std::move(postCompletion))) {}
 
 MooncakeWorkCpu::~MooncakeWorkCpu() {
     if (!tracker_) return;
     auto completion = std::move(completion_);
     auto post_completion = std::move(post_completion_);
-    tracker_->retire(
-        makeTrackedResources(std::move(failed_ranks_hint_),
-                             std::move(keep_alive_)),
-        [completion = std::move(completion),
-         post_completion = std::move(post_completion)]() mutable {
-            if (!queryCompletion(completion.get())) return false;
-            if (post_completion) post_completion();
-            return true;
-        });
+    tracker_->retire(makeTrackedResources(std::move(failed_ranks_hint_),
+                                          std::move(keep_alive_)),
+                     [completion = std::move(completion),
+                      post_completion = std::move(post_completion)]() mutable {
+                         if (!queryCompletion(completion.get())) return false;
+                         if (post_completion) post_completion();
+                         return true;
+                     });
 }
 
 bool MooncakeWorkCpu::isCompleted() {
@@ -223,10 +221,9 @@ MooncakeWorkCuda::~MooncakeWorkCuda() {
     }
 
     auto event = std::move(event_);
-    tracker_->retire(
-        makeTrackedResources(std::move(failed_ranks_hint_),
-                             std::move(keep_alive_)),
-        [event = std::move(event)] { return event->query(); });
+    tracker_->retire(makeTrackedResources(std::move(failed_ranks_hint_),
+                                          std::move(keep_alive_)),
+                     [event = std::move(event)] { return event->query(); });
 }
 
 bool MooncakeWorkCuda::wait(std::chrono::milliseconds) {
@@ -296,8 +293,7 @@ MooncakeP2PWork::MooncakeP2PWork(mooncakePgCompletion_t completion,
       failed_ranks_hint_(std::move(failedRanksHint)),
       tracker_(std::move(tracker)),
       keep_alive_(std::move(keepAlive)),
-      post_completion_(
-          makePostCompletionOnce(std::move(postCompletion))) {}
+      post_completion_(makePostCompletionOnce(std::move(postCompletion))) {}
 
 MooncakeP2PWork::~MooncakeP2PWork() {
     if (!tracker_) return;
@@ -320,8 +316,7 @@ MooncakeP2PWork::~MooncakeP2PWork() {
 
 bool MooncakeP2PWork::isCompleted() {
     const bool completed = queryCompletion(completion_.get());
-    if (completed && failed_ranks_hint_.isLocalSuccess() &&
-        post_completion_) {
+    if (completed && failed_ranks_hint_.isLocalSuccess() && post_completion_) {
         post_completion_();
     }
     return completed;

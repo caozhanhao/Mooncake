@@ -240,15 +240,9 @@ std::vector<int> droppedRanks(const mooncakePgProposalResponse_t& response) {
 }
 
 void shutdownProcessContext() {
-    if (g_ctx.agent_host) g_ctx.agent_host->shutdown();
-    // AgentHost::shutdown stops the control plane. Finish LinkManager's
-    // resource release before Python tears down an injected TransferEngine.
-    g_ctx.link_manager.shutdown();
-    g_ctx.agent_host.reset();
-    if (g_ctx.coordinator_host) g_ctx.coordinator_host->shutdown();
-    g_ctx.coordinator_host.reset();
-    g_ctx.external_engine = nullptr;
-    g_ctx.engine = nullptr;
+    auto context = g_ctx.handle;
+    g_ctx.handle = nullptr;
+    if (context) (void)mooncakePgContextDestroy(context);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -266,9 +260,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "set_collective_timeout_us",
         [](size_t us) {
-            checkResult(
-                mooncakePgContextSetCollectiveTimeout(getContext(), us),
-                "mooncakePgContextSetCollectiveTimeout");
+            checkResult(mooncakePgContextSetCollectiveTimeout(getContext(), us),
+                        "mooncakePgContextSetCollectiveTimeout");
         },
         py::arg("us"),
         "Set the default peer-liveness probe timeout (microseconds) for "
@@ -276,17 +269,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "set_p2p_timeout_us",
         [](int64_t us) {
-            checkResult(
-                mooncakePgContextSetP2PTimeout(getContext(), us),
-                "mooncakePgContextSetP2PTimeout");
+            checkResult(mooncakePgContextSetP2PTimeout(getContext(), us),
+                        "mooncakePgContextSetP2PTimeout");
         },
         py::arg("us"), "Set the default P2P transfer timeout (microseconds).");
     m.def(
         "set_fault_reconciliation_window_us",
         [](int64_t us) {
-            checkResult(mooncakePgContextSetFaultReconciliationWindow(
-                            getContext(), us),
-                        "mooncakePgContextSetFaultReconciliationWindow");
+            checkResult(
+                mooncakePgContextSetFaultReconciliationWindow(getContext(), us),
+                "mooncakePgContextSetFaultReconciliationWindow");
         },
         py::arg("us"),
         "Set the coordinator fault reconciliation window (microseconds).");
@@ -297,9 +289,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             filter_pointers.push_back(filter.c_str());
         }
         checkResult(
-            mooncakePgContextSetDeviceFilter(getContext(),
-                                             filter_pointers.data(),
-                                             filter_pointers.size()),
+            mooncakePgContextSetDeviceFilter(
+                getContext(), filter_pointers.data(), filter_pointers.size()),
             "mooncakePgContextSetDeviceFilter");
     });
     m.def("set_transfer_engine", &setTransferEnginePy, py::arg("engine"),

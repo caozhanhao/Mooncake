@@ -110,27 +110,31 @@ class MooncakeCommunicator {
     bool isCpu() const { return is_cpu_; }
 
     std::shared_ptr<WorkCompletion> send(const void* buffer, size_t bytes,
-                                             int peer, cudaStream_t stream,
-                                             int32_t* failed_ranks_hint);
-    std::shared_ptr<WorkCompletion> recv(void* buffer, size_t bytes,
-                                             int peer, cudaStream_t stream,
-                                             int32_t* failed_ranks_hint);
+                                         int peer, cudaStream_t stream,
+                                         int32_t* failed_ranks_hint);
+    std::shared_ptr<WorkCompletion> recv(void* buffer, size_t bytes, int peer,
+                                         cudaStream_t stream,
+                                         int32_t* failed_ranks_hint);
 
-    std::shared_ptr<WorkCompletion> broadcastCpu(
-        const void* send_buffer, void* recv_buffer, size_t bytes, int root,
-        int32_t* failed_ranks_hint);
+    std::shared_ptr<WorkCompletion> broadcastCpu(const void* send_buffer,
+                                                 void* recv_buffer,
+                                                 size_t bytes, int root,
+                                                 int32_t* failed_ranks_hint);
     void broadcastGpu(const void* send_buffer, void* recv_buffer, size_t bytes,
                       int root, cudaStream_t stream,
                       int32_t* failed_ranks_hint);
-    std::shared_ptr<WorkCompletion> allReduceCpu(
-        const void* send_buffer, void* recv_buffer, size_t bytes,
-        DataType datatype, ReduceOp op, int32_t* failed_ranks_hint);
+    std::shared_ptr<WorkCompletion> allReduceCpu(const void* send_buffer,
+                                                 void* recv_buffer,
+                                                 size_t bytes,
+                                                 DataType datatype, ReduceOp op,
+                                                 int32_t* failed_ranks_hint);
     void allReduceGpu(const void* send_buffer, void* recv_buffer, size_t bytes,
                       DataType datatype, ReduceOp op, cudaStream_t stream,
                       int32_t* failed_ranks_hint);
-    std::shared_ptr<WorkCompletion> allGatherCpu(
-        const void* send_buffer, void* recv_buffer, size_t send_bytes,
-        int32_t* failed_ranks_hint);
+    std::shared_ptr<WorkCompletion> allGatherCpu(const void* send_buffer,
+                                                 void* recv_buffer,
+                                                 size_t send_bytes,
+                                                 int32_t* failed_ranks_hint);
     void allGatherGpu(const void* send_buffer, void* recv_buffer,
                       size_t send_bytes, cudaStream_t stream,
                       int32_t* failed_ranks_hint);
@@ -141,31 +145,33 @@ class MooncakeCommunicator {
                           size_t recv_bytes, DataType datatype, ReduceOp op,
                           cudaStream_t stream, int32_t* failed_ranks_hint);
     std::shared_ptr<WorkCompletion> allToAllCpu(const void* send_buffer,
-                                                    void* recv_buffer,
-                                                    size_t peer_bytes,
-                                                    int32_t* failed_ranks_hint);
+                                                void* recv_buffer,
+                                                size_t peer_bytes,
+                                                int32_t* failed_ranks_hint);
     void allToAllGpu(const void* send_buffer, void* recv_buffer,
                      size_t peer_bytes, cudaStream_t stream,
                      int32_t* failed_ranks_hint);
     std::shared_ptr<WorkCompletion> barrierCpu(int32_t* failed_ranks_hint);
     void barrierGpu(cudaStream_t stream, int32_t* failed_ranks_hint);
-    std::shared_ptr<WorkCompletion> reduceCpu(
-        const void* send_buffer, void* recv_buffer, size_t bytes,
-        DataType datatype, ReduceOp op, int root, int32_t* failed_ranks_hint);
+    std::shared_ptr<WorkCompletion> reduceCpu(const void* send_buffer,
+                                              void* recv_buffer, size_t bytes,
+                                              DataType datatype, ReduceOp op,
+                                              int root,
+                                              int32_t* failed_ranks_hint);
     void reduceGpu(const void* send_buffer, void* recv_buffer, size_t bytes,
                    DataType datatype, ReduceOp op, int root,
                    cudaStream_t stream, int32_t* failed_ranks_hint);
     std::shared_ptr<WorkCompletion> gatherCpu(const void* send_buffer,
-                                                  void* recv_buffer,
-                                                  size_t send_bytes, int root,
-                                                  int32_t* failed_ranks_hint);
+                                              void* recv_buffer,
+                                              size_t send_bytes, int root,
+                                              int32_t* failed_ranks_hint);
     void gatherGpu(const void* send_buffer, void* recv_buffer,
                    size_t send_bytes, int root, cudaStream_t stream,
                    int32_t* failed_ranks_hint);
     std::shared_ptr<WorkCompletion> scatterCpu(const void* send_buffer,
-                                                   void* recv_buffer,
-                                                   size_t recv_bytes, int root,
-                                                   int32_t* failed_ranks_hint);
+                                               void* recv_buffer,
+                                               size_t recv_bytes, int root,
+                                               int32_t* failed_ranks_hint);
     void scatterGpu(const void* send_buffer, void* recv_buffer,
                     size_t recv_bytes, int root, cudaStream_t stream,
                     int32_t* failed_ranks_hint);

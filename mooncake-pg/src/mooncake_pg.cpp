@@ -225,8 +225,8 @@ void initializeFailedRanksHint(mooncakePgComm_t comm,
 template <typename Launch>
 mooncakePgResult_t invokeOperationWithCompletion(
     mooncakePgComm_t comm, bool expect_cpu, int32_t* failed_ranks_hint,
-    size_t failed_ranks_hint_count,
-    mooncakePgCompletion_t* output_completion, Launch&& launch) {
+    size_t failed_ranks_hint_count, mooncakePgCompletion_t* output_completion,
+    Launch&& launch) {
     return translateExceptions([&] {
         if (!output_completion) {
             throw std::invalid_argument("completion output is null");
@@ -683,12 +683,12 @@ mooncakePgResult_t mooncakePgBarrierGpu(mooncakePgComm_t comm,
                                         mooncakePgStream_t stream,
                                         int32_t* failed_ranks_hint,
                                         size_t failed_ranks_hint_count) {
-    return invokeOperation(
-        comm, false, failed_ranks_hint, failed_ranks_hint_count,
-        [&](int32_t* failed_ranks_hint_buffer) {
-            comm->impl->barrierGpu(convertStream(stream),
-                                   failed_ranks_hint_buffer);
-        });
+    return invokeOperation(comm, false, failed_ranks_hint,
+                           failed_ranks_hint_count,
+                           [&](int32_t* failed_ranks_hint_buffer) {
+                               comm->impl->barrierGpu(convertStream(stream),
+                                                      failed_ranks_hint_buffer);
+                           });
 }
 
 mooncakePgResult_t mooncakePgBroadcastCpu(const void* send_buffer,
@@ -941,8 +941,8 @@ mooncakePgResult_t mooncakePgCompletionWait(mooncakePgCompletion_t completion,
     bool completed = false;
     const auto result = translateExceptions([&] {
         validateCompletion(completion);
-        completed = completion->impl->wait(
-            std::chrono::microseconds(timeout_us));
+        completed =
+            completion->impl->wait(std::chrono::microseconds(timeout_us));
     });
     if (result != mooncakePgSuccess) return result;
     if (!completed) return mooncakePgTimeout;
@@ -994,8 +994,8 @@ mooncakePgResult_t mooncakePgCommActivateRanks(
     mooncakePgProposalResponse_t* response) {
     return translateExceptions([&] {
         validateComm(comm);
-        copyProposalResp(comm->impl->activateRanks(copyRanks(ranks, rank_count)),
-                         response);
+        copyProposalResp(
+            comm->impl->activateRanks(copyRanks(ranks, rank_count)), response);
     });
 }
 
@@ -1040,8 +1040,8 @@ mooncakePgResult_t mooncakePgCommGetEpoch(mooncakePgComm_t comm,
     });
 }
 
-mooncakePgResult_t mooncakePgCommGetNumSyncedRanks(
-    mooncakePgComm_t comm, int* num_synced_ranks) {
+mooncakePgResult_t mooncakePgCommGetNumSyncedRanks(mooncakePgComm_t comm,
+                                                   int* num_synced_ranks) {
     return translateExceptions([&] {
         validateComm(comm);
         if (!num_synced_ranks) {

@@ -171,10 +171,9 @@ MooncakeCommunicator::MooncakeCommunicator(
              "auto_sync_on_failure requires "
              "auto_deactivate_on_failure");
     if (active_ranks_mirror_) {
-        PG_CHECK(
-            config.active_ranks_mirror_count >=
-                static_cast<size_t>(max_group_size_),
-            "active-ranks mirror is too small");
+        PG_CHECK(config.active_ranks_mirror_count >=
+                     static_cast<size_t>(max_group_size_),
+                 "active-ranks mirror is too small");
     }
 
     // Build rank order from global_ranks. rank order is a mapping from in-group
@@ -475,13 +474,14 @@ void MooncakeCommunicator::broadcastGpu(const void* send_buffer,
         OpType::Broadcast, bytes, root, meta_, stream, failed_ranks_hint,
         [=](void* dst, size_t pos, size_t size, cudaStream_t enqueue_stream) {
             if (is_root) {
-                copyDeviceToDevice(dst, static_cast<const char*>(send_buffer) + pos,
-                             size, enqueue_stream);
+                copyDeviceToDevice(dst,
+                                   static_cast<const char*>(send_buffer) + pos,
+                                   size, enqueue_stream);
             }
         },
         [=](void* src, size_t pos, size_t size, cudaStream_t enqueue_stream) {
             copyDeviceToDevice(static_cast<char*>(recv_buffer) + pos, src, size,
-                         enqueue_stream);
+                               enqueue_stream);
         });
 }
 
@@ -498,8 +498,8 @@ std::shared_ptr<WorkCompletion> MooncakeCommunicator::allReduceCpu(
         },
         [=, this](void* src, size_t pos, size_t size) {
             std::memset(static_cast<char*>(recv_buffer) + pos, 0, size);
-            launchReduceCpu(recv_buffer, datatype, pos, size, src,
-                            active_size, op, meta_->activeRanks);
+            launchReduceCpu(recv_buffer, datatype, pos, size, src, active_size,
+                            op, meta_->activeRanks);
         });
 }
 
@@ -514,8 +514,8 @@ void MooncakeCommunicator::allReduceGpu(const void* send_buffer,
     worker_->putTaskCuda(
         OpType::AllReduce, bytes, 0, meta_, stream, failed_ranks_hint,
         [=](void* dst, size_t pos, size_t size, cudaStream_t enqueue_stream) {
-            copyDeviceToDevice(dst, static_cast<const char*>(send_buffer) + pos, size,
-                         enqueue_stream);
+            copyDeviceToDevice(dst, static_cast<const char*>(send_buffer) + pos,
+                               size, enqueue_stream);
         },
         [=, this](void* src, size_t pos, size_t size,
                   cudaStream_t enqueue_stream) {
@@ -559,8 +559,8 @@ void MooncakeCommunicator::allGatherGpu(const void* send_buffer,
     worker_->putTaskCuda(
         OpType::AllGather, send_bytes, 0, meta_, stream, failed_ranks_hint,
         [=](void* dst, size_t pos, size_t size, cudaStream_t enqueue_stream) {
-            copyDeviceToDevice(dst, static_cast<const char*>(send_buffer) + pos, size,
-                         enqueue_stream);
+            copyDeviceToDevice(dst, static_cast<const char*>(send_buffer) + pos,
+                               size, enqueue_stream);
         },
         [=, this](void* src, size_t pos, size_t size,
                   cudaStream_t enqueue_stream) {
@@ -593,8 +593,8 @@ std::shared_ptr<WorkCompletion> MooncakeCommunicator::reduceScatterCpu(
         },
         [=, this](void* src, size_t pos, size_t size) {
             std::memset(static_cast<char*>(recv_buffer) + pos, 0, size);
-            launchReduceCpu(recv_buffer, datatype, pos, size, src,
-                            active_size, op, meta_->activeRanks);
+            launchReduceCpu(recv_buffer, datatype, pos, size, src, active_size,
+                            op, meta_->activeRanks);
         });
 }
 
@@ -614,9 +614,9 @@ void MooncakeCommunicator::reduceScatterGpu(const void* send_buffer,
             for (int peer = 0; peer < active_size; ++peer) {
                 if (!meta_->activeRanks[peer]) continue;
                 copyDeviceToDevice(static_cast<char*>(dst) + peer * size,
-                             static_cast<const char*>(send_buffer) +
-                                 peer * recv_bytes + pos,
-                             size, enqueue_stream);
+                                   static_cast<const char*>(send_buffer) +
+                                       peer * recv_bytes + pos,
+                                   size, enqueue_stream);
             }
         },
         [=, this](void* src, size_t pos, size_t size,
@@ -668,9 +668,9 @@ void MooncakeCommunicator::allToAllGpu(const void* send_buffer,
                   cudaStream_t enqueue_stream) {
             for (int peer = 0; peer < active_size; ++peer) {
                 copyDeviceToDevice(static_cast<char*>(dst) + peer * size,
-                             static_cast<const char*>(send_buffer) +
-                                 peer * peer_bytes + pos,
-                             size, enqueue_stream);
+                                   static_cast<const char*>(send_buffer) +
+                                       peer * peer_bytes + pos,
+                                   size, enqueue_stream);
             }
         },
         [=, this](void* src, size_t pos, size_t size,
@@ -720,8 +720,8 @@ std::shared_ptr<WorkCompletion> MooncakeCommunicator::reduceCpu(
         [=, this](void* src, size_t pos, size_t size) {
             if (!is_root) return;
             std::memset(static_cast<char*>(recv_buffer) + pos, 0, size);
-            launchReduceCpu(recv_buffer, datatype, pos, size, src,
-                            active_size, op, meta_->activeRanks);
+            launchReduceCpu(recv_buffer, datatype, pos, size, src, active_size,
+                            op, meta_->activeRanks);
         });
 }
 
@@ -738,8 +738,8 @@ void MooncakeCommunicator::reduceGpu(const void* send_buffer, void* recv_buffer,
     worker_->putTaskCuda(
         OpType::Reduce, bytes, root, meta_, stream, failed_ranks_hint,
         [=](void* dst, size_t pos, size_t size, cudaStream_t enqueue_stream) {
-            copyDeviceToDevice(dst, static_cast<const char*>(send_buffer) + pos, size,
-                         enqueue_stream);
+            copyDeviceToDevice(dst, static_cast<const char*>(send_buffer) + pos,
+                               size, enqueue_stream);
         },
         [=, this](void* src, size_t pos, size_t size,
                   cudaStream_t enqueue_stream) {
@@ -790,8 +790,8 @@ void MooncakeCommunicator::gatherGpu(const void* send_buffer, void* recv_buffer,
     worker_->putTaskCuda(
         OpType::Gather, send_bytes, root, meta_, stream, failed_ranks_hint,
         [=](void* dst, size_t pos, size_t size, cudaStream_t enqueue_stream) {
-            copyDeviceToDevice(dst, static_cast<const char*>(send_buffer) + pos, size,
-                         enqueue_stream);
+            copyDeviceToDevice(dst, static_cast<const char*>(send_buffer) + pos,
+                               size, enqueue_stream);
         },
         [=, this](void* src, size_t pos, size_t size,
                   cudaStream_t enqueue_stream) {
@@ -847,14 +847,14 @@ void MooncakeCommunicator::scatterGpu(const void* send_buffer,
             if (!is_root) return;
             for (int peer = 0; peer < active_size; ++peer) {
                 copyDeviceToDevice(static_cast<char*>(dst) + peer * size,
-                             static_cast<const char*>(send_buffer) +
-                                 peer * recv_bytes + pos,
-                             size, enqueue_stream);
+                                   static_cast<const char*>(send_buffer) +
+                                       peer * recv_bytes + pos,
+                                   size, enqueue_stream);
             }
         },
         [=](void* src, size_t pos, size_t size, cudaStream_t enqueue_stream) {
             copyDeviceToDevice(static_cast<char*>(recv_buffer) + pos, src, size,
-                         enqueue_stream);
+                               enqueue_stream);
         });
 }
 
@@ -1156,8 +1156,8 @@ void MooncakeCommunicator::applyViewUpdate(
     // current taskCount even though they advance the view epoch.
     bool reset_task_count = next_mode != mode;
     for (int local_rank = 0; local_rank < meta_->maxGroupSize; ++local_rank) {
-        reset_task_count |= previous_active_ranks[local_rank] !=
-                            meta_->activeRanks[local_rank];
+        reset_task_count |=
+            previous_active_ranks[local_rank] != meta_->activeRanks[local_rank];
     }
     if (reset_task_count) meta_->taskCount = 0;
 

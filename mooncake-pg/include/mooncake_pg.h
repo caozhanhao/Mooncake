@@ -134,7 +134,6 @@ MOONCAKE_PG_EXPORT const char* mooncakePgGetErrorString(
     mooncakePgResult_t result);
 MOONCAKE_PG_EXPORT const char* mooncakePgGetLastError(void);
 
-
 MOONCAKE_PG_EXPORT mooncakePgResult_t
 mooncakePgContextCreate(mooncakePgContext_t* context);
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgContextInitialize(
@@ -278,7 +277,6 @@ MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgRecvCpu(
     void* recvBuffer, size_t count, mooncakePgDataType_t dataType, int peer,
     mooncakePgComm_t comm, int32_t* failedRanksHint,
     size_t failedRanksHintCount, mooncakePgCompletion_t* completion);
-
 
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgCompletionIsCompleted(
     mooncakePgCompletion_t completion, int* completed);

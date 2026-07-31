@@ -37,8 +37,7 @@ class GpuDeviceGuard {
     explicit GpuDeviceGuard(int device) {
         PG_CHECK(device >= 0, "invalid CUDA device index");
 
-        checkCuda(cudaGetDevice(&previous_device_),
-                  "get current CUDA device");
+        checkCuda(cudaGetDevice(&previous_device_), "get current CUDA device");
         if (previous_device_ == device) return;
 
         checkCuda(cudaSetDevice(device), "set CUDA device");
@@ -104,22 +103,19 @@ class GpuStream {
 
    private:
     GpuStream(cudaStream_t stream, int device, bool owns_stream) noexcept
-        : stream_(stream),
-          device_index_(device),
-          owns_stream_(owns_stream) {}
+        : stream_(stream), device_index_(device), owns_stream_(owns_stream) {}
 
     void reset() noexcept {
         if (owns_stream_ && stream_) {
             try {
                 const GpuDeviceGuard device_guard(device_index_);
-                detail::warnCuda(cudaStreamDestroy(stream_),
-                                 "destroy stream");
+                detail::warnCuda(cudaStreamDestroy(stream_), "destroy stream");
             } catch (const std::exception& error) {
-                detail::warnCudaCleanupException(
-                    "destroy stream", error.what());
+                detail::warnCudaCleanupException("destroy stream",
+                                                 error.what());
             } catch (...) {
-                detail::warnCudaCleanupException(
-                    "destroy stream", "unknown error");
+                detail::warnCudaCleanupException("destroy stream",
+                                                 "unknown error");
             }
         }
         stream_ = nullptr;
@@ -167,8 +163,7 @@ class GpuEvent {
                  "CUDA event device does not match recording stream device");
 
         const GpuDeviceGuard device_guard(device_index_);
-        checkCuda(cudaEventRecord(event_, stream),
-                  "record CUDA event");
+        checkCuda(cudaEventRecord(event_, stream), "record CUDA event");
     }
 
     void block(const GpuStream& stream) const {
@@ -195,11 +190,11 @@ class GpuEvent {
                 detail::warnCuda(cudaEventDestroy(event_),
                                  "destroy CUDA event");
             } catch (const std::exception& error) {
-                detail::warnCudaCleanupException(
-                    "destroy CUDA event", error.what());
+                detail::warnCudaCleanupException("destroy CUDA event",
+                                                 error.what());
             } catch (...) {
-                detail::warnCudaCleanupException(
-                    "destroy CUDA event", "unknown error");
+                detail::warnCudaCleanupException("destroy CUDA event",
+                                                 "unknown error");
             }
         }
         event_ = nullptr;
