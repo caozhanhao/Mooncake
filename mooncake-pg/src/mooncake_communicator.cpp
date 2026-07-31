@@ -199,8 +199,8 @@ void MooncakePGContext::shutdown() {
  * @brief Initialize Mooncake communicator state from the framework-neutral
  * communicator configuration.
  */
-MooncakeCommunicator::MooncakeCommunicator(
-    MooncakePGContext& context, MooncakeCommunicatorConfig config)
+MooncakeCommunicator::MooncakeCommunicator(MooncakePGContext& context,
+                                           MooncakeCommunicatorConfig config)
     : context_(context),
       agent_(*context_.agent_host),
       rank_(config.rank),

@@ -53,7 +53,7 @@ void launchReduceKernel(void* dst, DataType dataType, size_t pos,
             launchReduceKernel_bool((bool*)ptr, (bool*)src, num, numRanks,
                                     (int)op, activeRanks, stream);
             break;
-        case DataType::BFloat16:
+        case DataType::Bfloat16:
             launchReduceKernel_bf16(ptr, src, num, numRanks, (int)op,
                                     activeRanks, stream);
             break;

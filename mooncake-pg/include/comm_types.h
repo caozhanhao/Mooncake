@@ -26,30 +26,48 @@ enum class OpType : uint8_t {
 };
 
 enum class DataType : uint8_t {
-    Uint8 = 0,
-    Int8,
+    Int8 = 0,
+    Uint8,
     Int16,
+    Uint16,
     Int32,
+    Uint32,
     Int64,
+    Uint64,
+    Float16,
     Float32,
     Float64,
+    Bfloat16,
     Bool,
-    BFloat16,
+    Float8e4m3fn,
+    Float8e5m2,
+    Float8e4m3fnuz,
+    Float8e5m2fnuz,
+    Float8e8m0fnu,
 };
 
 inline size_t elementSize(DataType dataType) {
     switch (dataType) {
-        case DataType::Uint8:
         case DataType::Int8:
+        case DataType::Uint8:
         case DataType::Bool:
+        case DataType::Float8e4m3fn:
+        case DataType::Float8e5m2:
+        case DataType::Float8e4m3fnuz:
+        case DataType::Float8e5m2fnuz:
+        case DataType::Float8e8m0fnu:
             return 1;
         case DataType::Int16:
-        case DataType::BFloat16:
+        case DataType::Uint16:
+        case DataType::Float16:
+        case DataType::Bfloat16:
             return 2;
         case DataType::Int32:
+        case DataType::Uint32:
         case DataType::Float32:
             return 4;
         case DataType::Int64:
+        case DataType::Uint64:
         case DataType::Float64:
             return 8;
     }

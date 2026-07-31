@@ -215,9 +215,14 @@ class RpcClient {
 
 inline std::chrono::milliseconds rpcTimeoutForFaultReconciliationWindow(
     int64_t timeout_us) {
+    const auto reconciliation_timeout =
+        std::chrono::ceil<std::chrono::milliseconds>(
+            std::chrono::microseconds(timeout_us));
+
+    // A syncAfterFailure request can remain pending for the entire
+    // reconciliation window.
     return std::max(RpcClient::kDefaultRequestTimeout,
-                    std::chrono::ceil<std::chrono::milliseconds>(
-                        std::chrono::microseconds(timeout_us)));
+                    2 * reconciliation_timeout);
 }
 
 }  // namespace mooncake

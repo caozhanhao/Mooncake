@@ -137,24 +137,42 @@ void copyCoordinatorAddress(const std::string& value,
 mooncake::DataType convertDataType(mooncakePgDataType_t data_type) {
     using mooncake::DataType;
     switch (data_type) {
-        case mooncakePgUint8:
-            return DataType::Uint8;
         case mooncakePgInt8:
             return DataType::Int8;
+        case mooncakePgUint8:
+            return DataType::Uint8;
         case mooncakePgInt16:
             return DataType::Int16;
+        case mooncakePgUint16:
+            return DataType::Uint16;
         case mooncakePgInt32:
             return DataType::Int32;
+        case mooncakePgUint32:
+            return DataType::Uint32;
         case mooncakePgInt64:
             return DataType::Int64;
+        case mooncakePgUint64:
+            return DataType::Uint64;
+        case mooncakePgFloat16:
+            return DataType::Float16;
         case mooncakePgFloat32:
             return DataType::Float32;
         case mooncakePgFloat64:
             return DataType::Float64;
+        case mooncakePgBfloat16:
+            return DataType::Bfloat16;
         case mooncakePgBool:
             return DataType::Bool;
-        case mooncakePgBfloat16:
-            return DataType::BFloat16;
+        case mooncakePgFloat8e4m3fn:
+            return DataType::Float8e4m3fn;
+        case mooncakePgFloat8e5m2:
+            return DataType::Float8e5m2;
+        case mooncakePgFloat8e4m3fnuz:
+            return DataType::Float8e4m3fnuz;
+        case mooncakePgFloat8e5m2fnuz:
+            return DataType::Float8e5m2fnuz;
+        case mooncakePgFloat8e8m0fnu:
+            return DataType::Float8e8m0fnu;
         default:
             throw std::invalid_argument("unsupported Mooncake PG datatype");
     }

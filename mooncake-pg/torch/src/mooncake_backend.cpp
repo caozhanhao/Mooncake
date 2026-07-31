@@ -25,16 +25,24 @@ constexpr size_t kPreferredHcaBytes = 256;
 
 mooncakePgDataType_t tensorType(const at::Tensor& tensor) {
     switch (tensor.scalar_type()) {
-        case at::kByte:
-            return mooncakePgUint8;
         case at::kChar:
             return mooncakePgInt8;
+        case at::kByte:
+            return mooncakePgUint8;
         case at::kShort:
             return mooncakePgInt16;
+        case at::kUInt16:
+            return mooncakePgUint16;
         case at::kInt:
             return mooncakePgInt32;
+        case at::kUInt32:
+            return mooncakePgUint32;
         case at::kLong:
             return mooncakePgInt64;
+        case at::kUInt64:
+            return mooncakePgUint64;
+        case at::kHalf:
+            return mooncakePgFloat16;
         case at::kFloat:
             return mooncakePgFloat32;
         case at::kDouble:
@@ -43,6 +51,16 @@ mooncakePgDataType_t tensorType(const at::Tensor& tensor) {
             return mooncakePgBool;
         case at::kBFloat16:
             return mooncakePgBfloat16;
+        case at::kFloat8_e4m3fn:
+            return mooncakePgFloat8e4m3fn;
+        case at::kFloat8_e5m2:
+            return mooncakePgFloat8e5m2;
+        case at::kFloat8_e4m3fnuz:
+            return mooncakePgFloat8e4m3fnuz;
+        case at::kFloat8_e5m2fnuz:
+            return mooncakePgFloat8e5m2fnuz;
+        case at::kFloat8_e8m0fnu:
+            return mooncakePgFloat8e8m0fnu;
         default:
             TORCH_CHECK(false, "Unsupported Mooncake PG datatype: ",
                         tensor.scalar_type());

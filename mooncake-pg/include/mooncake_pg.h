@@ -37,15 +37,24 @@ typedef enum mooncakePgResult {
 } mooncakePgResult_t;
 
 typedef enum mooncakePgDataType {
-    mooncakePgUint8 = 0,
-    mooncakePgInt8 = 1,
+    mooncakePgInt8 = 0,
+    mooncakePgUint8 = 1,
     mooncakePgInt16 = 2,
-    mooncakePgInt32 = 3,
-    mooncakePgInt64 = 4,
-    mooncakePgFloat32 = 5,
-    mooncakePgFloat64 = 6,
-    mooncakePgBool = 7,
-    mooncakePgBfloat16 = 8,
+    mooncakePgUint16 = 3,
+    mooncakePgInt32 = 4,
+    mooncakePgUint32 = 5,
+    mooncakePgInt64 = 6,
+    mooncakePgUint64 = 7,
+    mooncakePgFloat16 = 8,
+    mooncakePgFloat32 = 9,
+    mooncakePgFloat64 = 10,
+    mooncakePgBfloat16 = 11,
+    mooncakePgBool = 12,
+    mooncakePgFloat8e4m3fn = 13,
+    mooncakePgFloat8e5m2 = 14,
+    mooncakePgFloat8e4m3fnuz = 15,
+    mooncakePgFloat8e5m2fnuz = 16,
+    mooncakePgFloat8e8m0fnu = 17,
 } mooncakePgDataType_t;
 
 typedef enum mooncakePgReduceOp {
