@@ -83,6 +83,7 @@ typedef struct mooncakePgCommConfig {
     int rank;
     int size;
     int maxGroupSize;
+    /* Required InGroupRank-to-GlobalRank mapping with exactly size entries. */
     const int32_t* globalRanks;
     size_t globalRankCount;
     mooncakePgDeviceType_t deviceType;
@@ -94,6 +95,8 @@ typedef struct mooncakePgCommConfig {
     int32_t* activeRanksMirror;
     size_t activeRanksMirrorCount;
     int activeRanksMirrorIsDevice;
+    /* Device index for a device mirror; ignored for a CPU mirror. */
+    int activeRanksMirrorDeviceIndex;
 } mooncakePgCommConfig_t;
 
 #define MOONCAKE_PG_COMM_CONFIG_INITIALIZER \
@@ -113,7 +116,8 @@ typedef struct mooncakePgCommConfig {
      1,                                     \
      NULL,                                  \
      0,                                     \
-     0}
+     0,                                     \
+     MOONCAKE_PG_CONFIG_UNDEF_INT}
 
 typedef enum mooncakePgProposalStatus {
     mooncakePgProposalRejected = 0,

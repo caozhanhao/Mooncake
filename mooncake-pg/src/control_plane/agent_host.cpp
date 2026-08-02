@@ -1,5 +1,6 @@
 #include "control_plane/agent_host.h"
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <stdexcept>
@@ -57,16 +58,15 @@ AgentHost::AgentHost(std::string coordinator_addr, const std::string& host_ip,
       rank_(rank),
       max_world_size_(max_world_size),
       coordinator_addr_(std::move(coordinator_addr)),
+      fault_reconciliation_window_us_(fault_reconciliation_window_us),
       agent_session_id_(generateInitialAgentSessionId()),
-      rpc_client_(
-          std::make_unique<RpcClient>(rpcTimeoutForFaultReconciliationWindow(
-              fault_reconciliation_window_us))) {}
+      rpc_client_(std::make_unique<RpcClient>()) {}
 
 AgentHost::~AgentHost() { shutdown(); }
 
 void AgentHost::setFaultReconciliationWindow(int64_t timeout_us) {
-    rpc_client_->setRequestTimeout(
-        rpcTimeoutForFaultReconciliationWindow(timeout_us));
+    fault_reconciliation_window_us_.store(timeout_us,
+                                          std::memory_order_relaxed);
 }
 
 void AgentHost::start() {
@@ -201,8 +201,8 @@ GroupView AgentHost::waitUntilGroupReady(GroupId group_id,
     return future.get();
 }
 
-void AgentHost::waitUntilRankActive(GroupId group_id, GlobalRank rank,
-                                    std::chrono::milliseconds timeout) {
+Expected<void, TimeoutError> AgentHost::waitUntilRankActive(
+    GroupId group_id, GlobalRank rank, std::chrono::milliseconds timeout) {
     auto promise = std::make_shared<std::promise<void>>();
     auto future = promise->get_future();
 
@@ -229,10 +229,11 @@ void AgentHost::waitUntilRankActive(GroupId group_id, GlobalRank rank,
                 if (it->second.empty()) rank_active_promises_.erase(it);
             }
         });
-        throw std::runtime_error("waitUntilRankActive timed out for rank " +
-                                 std::to_string(rank) + " in group " +
-                                 group_id);
+        return Unexpected<TimeoutError>{
+            TimeoutError{"waitUntilRankActive timed out for rank " +
+                         std::to_string(rank) + " in group " + group_id}};
     }
+    return {};
 }
 
 GroupId AgentHost::registerGroup(GroupBootstrapId group_bootstrap_id,
@@ -409,9 +410,15 @@ SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
     // Blocking the serialized executor would stall all local state-machine
     // tasks.
     SyncAfterFailureResponse response;
+    const auto reconciliation_window = std::chrono::microseconds(
+        fault_reconciliation_window_us_.load(std::memory_order_relaxed));
+    const auto reconciliation_timeout =
+        std::chrono::ceil<std::chrono::milliseconds>(reconciliation_window);
+    const auto rpc_timeout =
+        std::max(RpcClient::kDefaultRequestTimeout, 2 * reconciliation_timeout);
     throwIfRpcCallFailed(
         rpc_client_->call<&CoordinatorRpcService::syncAfterFailure>(
-            coordinator_addr_, req, response),
+            coordinator_addr_, req, response, rpc_timeout),
         "syncAfterFailure");
 
     executor_.postAndWait([this, request_session = req.agent_session_id,

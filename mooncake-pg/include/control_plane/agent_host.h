@@ -65,8 +65,9 @@ class AgentInterface {
     virtual GroupView waitUntilGroupReady(
         GroupId group_id, std::chrono::milliseconds timeout) = 0;
 
-    virtual void waitUntilRankActive(GroupId group_id, GlobalRank rank,
-                                     std::chrono::milliseconds timeout) = 0;
+    virtual Expected<void, TimeoutError> waitUntilRankActive(
+        GroupId group_id, GlobalRank rank,
+        std::chrono::milliseconds timeout) = 0;
 
     // Returns an empty GroupId when the Coordinator rejects this group. The
     // rejected group is not inserted into the process-scoped Agent state.
@@ -133,8 +134,9 @@ class AgentHost : public AgentInterface {
     bool waitUntilRegistered(std::chrono::milliseconds timeout) override;
     GroupView waitUntilGroupReady(GroupId group_id,
                                   std::chrono::milliseconds timeout) override;
-    void waitUntilRankActive(GroupId group_id, GlobalRank rank,
-                             std::chrono::milliseconds timeout) override;
+    Expected<void, TimeoutError> waitUntilRankActive(
+        GroupId group_id, GlobalRank rank,
+        std::chrono::milliseconds timeout) override;
 
     GroupId registerGroup(GroupBootstrapId group_bootstrap_id,
                           int32_t max_group_size,
@@ -173,6 +175,7 @@ class AgentHost : public AgentInterface {
     int max_world_size_;
 
     std::string coordinator_addr_;
+    std::atomic<int64_t> fault_reconciliation_window_us_;
     uint64_t agent_session_id_ = 0;
     bool agent_session_initialized_ = false;
     std::atomic<bool> shutdown_requested_{false};

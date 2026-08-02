@@ -3,11 +3,9 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
+#include <c10/util/env.h>
 
-#include <algorithm>
 #include <array>
-#include <cstdlib>
-#include <cstring>
 #include <exception>
 #include <functional>
 #include <numeric>
@@ -89,35 +87,16 @@ size_t tensorCount(const at::Tensor& tensor) {
     return static_cast<size_t>(tensor.numel());
 }
 
-at::cuda::CUDAStream currentCudaStream(const at::Tensor& tensor) {
-    return at::cuda::getCurrentCUDAStream(tensor.device().index());
+c10::cuda::CUDAStream currentCudaStream(const at::Tensor& tensor) {
+    return c10::cuda::getCurrentCUDAStream(tensor.device().index());
 }
 
-at::cuda::CUDAStream currentCudaStream() {
-    return at::cuda::getCurrentCUDAStream();
-}
-
-mooncakePgStream_t convertStream(const at::cuda::CUDAStream& stream) {
+mooncakePgStream_t convertStream(const c10::cuda::CUDAStream& stream) {
     return reinterpret_cast<mooncakePgStream_t>(stream.stream());
 }
 
-std::shared_ptr<c10::Event> recordCompletionEvent(
-    const at::cuda::CUDAStream& stream) {
-    auto event = std::make_shared<c10::Event>(c10::DeviceType::CUDA);
-    event->record(stream);
-    return event;
-}
-
-bool envFlag(const char* name, bool fallback) {
-    const char* value = std::getenv(name);
-    if (!value) return fallback;
-    const std::string text(value);
-    return text == "1" || text == "true" || text == "TRUE" || text == "on" ||
-           text == "ON";
-}
-
-void validatePeerTensors(const std::vector<at::Tensor>& tensors,
-                         const at::Tensor& reference, int active_size) {
+void validateEqualPeerTensors(const std::vector<at::Tensor>& tensors,
+                              const at::Tensor& reference, int active_size) {
     TORCH_CHECK(tensors.size() == static_cast<size_t>(active_size),
                 "Tensor list size must match active group size");
     for (const auto& tensor : tensors) {
@@ -130,9 +109,22 @@ void validatePeerTensors(const std::vector<at::Tensor>& tensors,
     }
 }
 
+void validateSingleBufferTensors(const at::Tensor& output,
+                                 const at::Tensor& input,
+                                 c10::DeviceType expected_device) {
+    TORCH_CHECK(input.device().type() == expected_device,
+                "Input tensor device does not match the backend device");
+    TORCH_CHECK(output.device() == input.device(),
+                "Input and output tensors must be on the same device");
+    TORCH_CHECK(output.scalar_type() == input.scalar_type(),
+                "Input and output tensors must have the same dtype");
+    TORCH_CHECK(input.is_contiguous(), "Input tensor must be contiguous");
+    TORCH_CHECK(output.is_contiguous(), "Output tensor must be contiguous");
+}
+
 at::Tensor packPeerTensors(const std::vector<at::Tensor>& tensors,
                            const at::Tensor& reference, int active_size) {
-    validatePeerTensors(tensors, reference, active_size);
+    validateEqualPeerTensors(tensors, reference, active_size);
     const int64_t elements_per_peer = reference.numel();
     auto packed =
         at::empty({elements_per_peer * static_cast<int64_t>(tensors.size())},
@@ -160,20 +152,6 @@ std::function<void()> makeCopyBackToPeerTensors(
                     .view(outputs[index].sizes()));
         }
     };
-}
-
-std::vector<at::Tensor> retain(std::initializer_list<at::Tensor> tensors) {
-    std::vector<at::Tensor> result;
-    result.reserve(tensors.size());
-    for (const auto& tensor : tensors) {
-        if (tensor.defined()) result.push_back(tensor);
-    }
-    return result;
-}
-
-void appendTensors(std::vector<at::Tensor>& destination,
-                   const std::vector<at::Tensor>& source) {
-    destination.insert(destination.end(), source.begin(), source.end());
 }
 
 std::vector<int32_t> convertRanks(const std::vector<int>& ranks) {
@@ -220,20 +198,30 @@ MooncakeBackend::MooncakeBackend(
                     "active_ranks must be contiguous");
         TORCH_CHECK(activeRanks_.numel() >= max_group_size_,
                     "active_ranks is smaller than max_group_size");
-        TORCH_CHECK(activeRanks_.device().is_cpu() == isCpu_,
-                    "active_ranks device does not match the backend device");
+        TORCH_CHECK(activeRanks_.is_cpu() || activeRanks_.is_cuda(),
+                    "active_ranks must be on a CPU or supported GPU device");
     } else {
         activeRanks_ =
             at::empty({max_group_size_},
                       torch::dtype(torch::kInt32)
                           .device(isCpu_ ? torch::kCPU : torch::kCUDA));
     }
+    // The mirror follows its tensor storage, independently of the communicator
+    // device used for collectives.
+    const bool active_ranks_mirror_is_device = !activeRanks_.is_cpu();
 
     std::vector<int32_t> global_ranks;
-    if (distBackendOpts.global_ranks_in_group.size() ==
-        static_cast<size_t>(size)) {
+    if (distBackendOpts.global_ranks_in_group.empty()) {
+        global_ranks.resize(size);
+        std::iota(global_ranks.begin(), global_ranks.end(), 0);
+    } else {
+        TORCH_CHECK(distBackendOpts.global_ranks_in_group.size() ==
+                        static_cast<size_t>(size),
+                    "global_ranks_in_group must contain group_size entries");
         global_ranks.reserve(size);
         for (const auto global_rank : distBackendOpts.global_ranks_in_group) {
+            TORCH_CHECK(global_rank >= 0 && global_rank < MOONCAKE_PG_MAX_RANKS,
+                        "global rank is outside the supported range");
             global_ranks.push_back(static_cast<int32_t>(global_rank));
         }
     }
@@ -247,7 +235,7 @@ MooncakeBackend::MooncakeBackend(
     config.rank = rank;
     config.size = size;
     config.maxGroupSize = max_group_size_;
-    config.globalRanks = global_ranks.empty() ? nullptr : global_ranks.data();
+    config.globalRanks = global_ranks.data();
     config.globalRankCount = global_ranks.size();
     config.deviceIndex = isCpu_ ? -1 : at::cuda::current_device();
     config.deviceType = isCpu_ ? mooncakePgDeviceCpu : mooncakePgDeviceGpu;
@@ -255,18 +243,23 @@ MooncakeBackend::MooncakeBackend(
                                  ? mooncakePgIdResolveAttachOrExtend
                                  : mooncakePgIdResolveCreateOrAttach;
     config.autoDeactivateOnFailure =
-        options_ ? options_->autoDeactivateOnFailure_
-                 : envFlag("MOONCAKE_PG_AUTO_DEACTIVATE_ON_FAILURE", true);
+        options_
+            ? options_->autoDeactivateOnFailure_
+            : c10::utils::check_env("MOONCAKE_PG_AUTO_DEACTIVATE_ON_FAILURE")
+                  .value_or(true);
     config.autoSyncOnFailure =
         options_ ? options_->autoSyncOnFailure_
-                 : envFlag("MOONCAKE_PG_AUTO_SYNC_ON_FAILURE", true);
+                 : c10::utils::check_env("MOONCAKE_PG_AUTO_SYNC_ON_FAILURE")
+                       .value_or(true);
     // auto_sync_on_failure requires auto_deactivate_on_failure.
     TORCH_CHECK(!config.autoSyncOnFailure || config.autoDeactivateOnFailure,
                 "auto_sync_on_failure requires "
                 "auto_deactivate_on_failure=true");
     config.activeRanksMirror = activeRanks_.data_ptr<int32_t>();
     config.activeRanksMirrorCount = static_cast<size_t>(activeRanks_.numel());
-    config.activeRanksMirrorIsDevice = isCpu_ ? 0 : 1;
+    config.activeRanksMirrorIsDevice = active_ranks_mirror_is_device ? 1 : 0;
+    config.activeRanksMirrorDeviceIndex =
+        active_ranks_mirror_is_device ? activeRanks_.get_device() : -1;
 
     checkResult(mooncakePgCommCreate(context, &config, &comm_),
                 "mooncakePgCommCreate");
@@ -302,7 +295,7 @@ int MooncakeBackend::getSize() const {
     return size;
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackend::wrapCpuCompletion(
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::makeCpuWork(
     c10d::OpType opType, mooncakePgCompletion_t completion,
     FailedRanksHint failedRanksHint, std::vector<at::Tensor> keepAlive,
     std::function<void()> postCompletion) {
@@ -312,33 +305,43 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::wrapCpuCompletion(
         std::move(keepAlive), std::move(postCompletion));
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackend::wrapCudaEvent(
-    c10d::OpType opType, std::shared_ptr<c10::Event> event,
-    FailedRanksHint failedRanksHint, std::vector<at::Tensor> keepAlive,
-    bool isBarrier) {
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::makeCudaWork(
+    c10d::OpType opType, const c10::cuda::CUDAStream& stream,
+    FailedRanksHint failedRanksHint, std::vector<at::Tensor> keepAlive) {
+    auto event = std::make_shared<c10::Event>(c10::DeviceType::CUDA);
+    event->record(stream);
     if (at::cuda::currentStreamCaptureStatus() ==
         c10::cuda::CaptureStatus::None) {
         work_tracker_->evictCompleted();
-    }
-    if (isBarrier) {
-        return c10::make_intrusive<MooncakeBarrierWorkCuda>(
-            opType, std::move(event), std::move(failedRanksHint), work_tracker_,
-            std::move(keepAlive));
     }
     return c10::make_intrusive<MooncakeWorkCuda>(
         opType, std::move(event), std::move(failedRanksHint), work_tracker_,
         std::move(keepAlive));
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackend::wrapP2PWork(
-    mooncakePgCompletion_t completion, FailedRanksHint failedRanksHint,
-    std::vector<at::Tensor> keepAlive, std::function<void()> postCompletion) {
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::makeCudaBarrierWork(
+    const c10::cuda::CUDAStream& stream, FailedRanksHint failedRanksHint) {
+    auto event = std::make_shared<c10::Event>(c10::DeviceType::CUDA);
+    event->record(stream);
+    if (at::cuda::currentStreamCaptureStatus() ==
+        c10::cuda::CaptureStatus::None) {
+        work_tracker_->evictCompleted();
+    }
+    return c10::make_intrusive<MooncakeBarrierWorkCuda>(
+        c10d::OpType::BARRIER, std::move(event), std::move(failedRanksHint),
+        work_tracker_);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::makeP2PWork(
+    c10d::OpType opType, mooncakePgCompletion_t completion,
+    FailedRanksHint failedRanksHint, std::vector<at::Tensor> keepAlive,
+    std::function<void()> postCompletion) {
     if (isCpu_ || at::cuda::currentStreamCaptureStatus() ==
                       c10::cuda::CaptureStatus::None) {
         work_tracker_->evictCompleted();
     }
     return c10::make_intrusive<MooncakeP2PWork>(
-        completion, std::move(failedRanksHint), work_tracker_,
+        opType, completion, std::move(failedRanksHint), work_tracker_,
         std::move(keepAlive), std::move(postCompletion));
 }
 
@@ -365,8 +368,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
                 static_cast<size_t>(max_group_size_), &completion),
             "mooncakePgSendGpu");
     }
-    return wrapP2PWork(completion, std::move(failed_ranks_hint),
-                       retain({tensor}));
+    return makeP2PWork(c10d::OpType::SEND, completion,
+                       std::move(failed_ranks_hint), {tensor});
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
@@ -401,8 +404,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
             if (!is_cpu) currentCudaStream(output).synchronize();
         };
     }
-    return wrapP2PWork(completion, std::move(failed_ranks_hint),
-                       retain({output, target}), std::move(post_completion));
+    return makeP2PWork(c10d::OpType::RECV, completion,
+                       std::move(failed_ranks_hint), {output, target},
+                       std::move(post_completion));
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
@@ -419,9 +423,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
                 tensorType(tensor), root, comm_, failed_ranks_hint.data(),
                 static_cast<size_t>(max_group_size_), &completion),
             "mooncakePgBroadcastCpu");
-        return wrapCpuCompletion(c10d::OpType::BROADCAST, completion,
-                                 std::move(failed_ranks_hint),
-                                 retain({tensor}));
+        return makeCpuWork(c10d::OpType::BROADCAST, completion,
+                           std::move(failed_ranks_hint), {tensor});
     }
     const auto stream = currentCudaStream(tensor);
     checkResult(mooncakePgBroadcastGpu(tensor.data_ptr(), tensor.data_ptr(),
@@ -430,8 +433,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
                                        failed_ranks_hint.data(),
                                        static_cast<size_t>(max_group_size_)),
                 "mooncakePgBroadcastGpu");
-    return wrapCudaEvent(c10d::OpType::BROADCAST, recordCompletionEvent(stream),
-                         std::move(failed_ranks_hint), retain({tensor}));
+    return makeCudaWork(c10d::OpType::BROADCAST, stream,
+                        std::move(failed_ranks_hint), {tensor});
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
@@ -449,9 +452,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                 failed_ranks_hint.data(), static_cast<size_t>(max_group_size_),
                 &completion),
             "mooncakePgAllReduceCpu");
-        return wrapCpuCompletion(c10d::OpType::ALLREDUCE, completion,
-                                 std::move(failed_ranks_hint),
-                                 retain({tensor}));
+        return makeCpuWork(c10d::OpType::ALLREDUCE, completion,
+                           std::move(failed_ranks_hint), {tensor});
     }
     const auto stream = currentCudaStream(tensor);
     checkResult(mooncakePgAllReduceGpu(
@@ -460,8 +462,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
                     convertStream(stream), failed_ranks_hint.data(),
                     static_cast<size_t>(max_group_size_)),
                 "mooncakePgAllReduceGpu");
-    return wrapCudaEvent(c10d::OpType::ALLREDUCE, recordCompletionEvent(stream),
-                         std::move(failed_ranks_hint), retain({tensor}));
+    return makeCudaWork(c10d::OpType::ALLREDUCE, stream,
+                        std::move(failed_ranks_hint), {tensor});
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
@@ -472,14 +474,14 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     auto input = inputTensors.back();
     auto outputs = outputTensors.back();
     const int active_size = getSize();
-    validatePeerTensors(outputs, input, active_size);
+    validateEqualPeerTensors(outputs, input, active_size);
     auto packed_output =
         at::empty({input.numel() * static_cast<int64_t>(outputs.size())},
                   input.options());
 
     auto failed_ranks_hint = FailedRanksHint::allocate(max_group_size_);
-    auto keep_alive = retain({input, packed_output});
-    appendTensors(keep_alive, outputs);
+    std::vector<at::Tensor> keep_alive{input, packed_output};
+    keep_alive.insert(keep_alive.end(), outputs.begin(), outputs.end());
     auto post_completion =
         makeCopyBackToPeerTensors(packed_output, std::move(outputs));
     if (isCpu_) {
@@ -490,9 +492,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
                 tensorType(input), comm_, failed_ranks_hint.data(),
                 static_cast<size_t>(max_group_size_), &completion),
             "mooncakePgAllGatherCpu");
-        return wrapCpuCompletion(
-            c10d::OpType::ALLGATHER, completion, std::move(failed_ranks_hint),
-            std::move(keep_alive), std::move(post_completion));
+        return makeCpuWork(c10d::OpType::ALLGATHER, completion,
+                           std::move(failed_ranks_hint), std::move(keep_alive),
+                           std::move(post_completion));
     }
     const auto stream = currentCudaStream(input);
     checkResult(
@@ -502,13 +504,22 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
                                static_cast<size_t>(max_group_size_)),
         "mooncakePgAllGatherGpu");
     post_completion();
-    return wrapCudaEvent(c10d::OpType::ALLGATHER, recordCompletionEvent(stream),
-                         std::move(failed_ranks_hint), std::move(keep_alive));
+    return makeCudaWork(c10d::OpType::ALLGATHER, stream,
+                        std::move(failed_ranks_hint), std::move(keep_alive));
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     at::Tensor& outputBuffer, at::Tensor& inputBuffer,
     const c10d::AllgatherOptions&) {
+    validateSingleBufferTensors(
+        outputBuffer, inputBuffer,
+        isCpu_ ? c10::DeviceType::CPU : c10::DeviceType::CUDA);
+    const int active_size = getSize();
+    TORCH_CHECK(
+        outputBuffer.numel() == inputBuffer.numel() * active_size,
+        "All-gather output must contain active group size times the input "
+        "number of elements");
+
     auto failed_ranks_hint = FailedRanksHint::allocate(max_group_size_);
     if (isCpu_) {
         mooncakePgCompletion_t completion = nullptr;
@@ -518,9 +529,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                         comm_, failed_ranks_hint.data(),
                         static_cast<size_t>(max_group_size_), &completion),
                     "mooncakePgAllGatherCpu");
-        return wrapCpuCompletion(c10d::OpType::_ALLGATHER_BASE, completion,
-                                 std::move(failed_ranks_hint),
-                                 retain({inputBuffer, outputBuffer}));
+        return makeCpuWork(c10d::OpType::_ALLGATHER_BASE, completion,
+                           std::move(failed_ranks_hint),
+                           {inputBuffer, outputBuffer});
     }
     const auto stream = currentCudaStream(inputBuffer);
     checkResult(mooncakePgAllGatherGpu(
@@ -529,14 +540,18 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                     convertStream(stream), failed_ranks_hint.data(),
                     static_cast<size_t>(max_group_size_)),
                 "mooncakePgAllGatherGpu");
-    return wrapCudaEvent(
-        c10d::OpType::_ALLGATHER_BASE, recordCompletionEvent(stream),
-        std::move(failed_ranks_hint), retain({inputBuffer, outputBuffer}));
+    return makeCudaWork(c10d::OpType::_ALLGATHER_BASE, stream,
+                        std::move(failed_ranks_hint),
+                        {inputBuffer, outputBuffer});
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
     at::Tensor& outputBuffer, at::Tensor& inputBuffer,
     const c10d::ReduceScatterOptions& opts) {
+    validateSingleBufferTensors(
+        outputBuffer, inputBuffer,
+        isCpu_ ? c10::DeviceType::CPU : c10::DeviceType::CUDA);
+
     auto failed_ranks_hint = FailedRanksHint::allocate(max_group_size_);
     if (isCpu_) {
         mooncakePgCompletion_t completion = nullptr;
@@ -547,9 +562,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
                 convertReduceOp(opts.reduceOp), comm_, failed_ranks_hint.data(),
                 static_cast<size_t>(max_group_size_), &completion),
             "mooncakePgReduceScatterCpu");
-        return wrapCpuCompletion(c10d::OpType::_REDUCE_SCATTER_BASE, completion,
-                                 std::move(failed_ranks_hint),
-                                 retain({inputBuffer, outputBuffer}));
+        return makeCpuWork(c10d::OpType::_REDUCE_SCATTER_BASE, completion,
+                           std::move(failed_ranks_hint),
+                           {inputBuffer, outputBuffer});
     }
     const auto stream = currentCudaStream(outputBuffer);
     checkResult(
@@ -559,9 +574,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
             convertReduceOp(opts.reduceOp), comm_, convertStream(stream),
             failed_ranks_hint.data(), static_cast<size_t>(max_group_size_)),
         "mooncakePgReduceScatterGpu");
-    return wrapCudaEvent(
-        c10d::OpType::_REDUCE_SCATTER_BASE, recordCompletionEvent(stream),
-        std::move(failed_ranks_hint), retain({inputBuffer, outputBuffer}));
+    return makeCudaWork(c10d::OpType::_REDUCE_SCATTER_BASE, stream,
+                        std::move(failed_ranks_hint),
+                        {inputBuffer, outputBuffer});
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
@@ -571,16 +586,18 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
                 "alltoall requires non-empty Tensor lists");
     const auto reference = inputTensors.front();
     const int active_size = getSize();
-    validatePeerTensors(outputTensors, reference, active_size);
+    validateEqualPeerTensors(outputTensors, reference, active_size);
     auto packed_input = packPeerTensors(inputTensors, reference, active_size);
     auto packed_output = at::empty(
         {reference.numel() * static_cast<int64_t>(outputTensors.size())},
         reference.options());
 
     auto failed_ranks_hint = FailedRanksHint::allocate(max_group_size_);
-    auto keep_alive = retain({packed_input, packed_output});
-    appendTensors(keep_alive, inputTensors);
-    appendTensors(keep_alive, outputTensors);
+    std::vector<at::Tensor> keep_alive{packed_input, packed_output};
+    keep_alive.insert(keep_alive.end(), inputTensors.begin(),
+                      inputTensors.end());
+    keep_alive.insert(keep_alive.end(), outputTensors.begin(),
+                      outputTensors.end());
     auto post_completion =
         makeCopyBackToPeerTensors(packed_output, outputTensors);
     if (isCpu_) {
@@ -591,9 +608,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
                         failed_ranks_hint.data(),
                         static_cast<size_t>(max_group_size_), &completion),
                     "mooncakePgAllToAllCpu");
-        return wrapCpuCompletion(
-            c10d::OpType::ALLTOALL, completion, std::move(failed_ranks_hint),
-            std::move(keep_alive), std::move(post_completion));
+        return makeCpuWork(c10d::OpType::ALLTOALL, completion,
+                           std::move(failed_ranks_hint), std::move(keep_alive),
+                           std::move(post_completion));
     }
     const auto stream = currentCudaStream(reference);
     checkResult(mooncakePgAllToAllGpu(
@@ -603,8 +620,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
                     static_cast<size_t>(max_group_size_)),
                 "mooncakePgAllToAllGpu");
     post_completion();
-    return wrapCudaEvent(c10d::OpType::ALLTOALL, recordCompletionEvent(stream),
-                         std::move(failed_ranks_hint), std::move(keep_alive));
+    return makeCudaWork(c10d::OpType::ALLTOALL, stream,
+                        std::move(failed_ranks_hint), std::move(keep_alive));
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
@@ -616,16 +633,15 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
                                          static_cast<size_t>(max_group_size_),
                                          &completion),
                     "mooncakePgBarrierCpu");
-        return wrapCpuCompletion(c10d::OpType::BARRIER, completion,
-                                 std::move(failed_ranks_hint));
+        return makeCpuWork(c10d::OpType::BARRIER, completion,
+                           std::move(failed_ranks_hint));
     }
-    const auto stream = currentCudaStream();
+    const auto stream = c10::cuda::getCurrentCUDAStream();
     checkResult(mooncakePgBarrierGpu(comm_, convertStream(stream),
                                      failed_ranks_hint.data(),
                                      static_cast<size_t>(max_group_size_)),
                 "mooncakePgBarrierGpu");
-    return wrapCudaEvent(c10d::OpType::BARRIER, recordCompletionEvent(stream),
-                         std::move(failed_ranks_hint), {}, true);
+    return makeCudaBarrierWork(stream, std::move(failed_ranks_hint));
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
@@ -643,9 +659,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
                                         static_cast<size_t>(max_group_size_),
                                         &completion),
                     "mooncakePgReduceCpu");
-        return wrapCpuCompletion(c10d::OpType::REDUCE, completion,
-                                 std::move(failed_ranks_hint),
-                                 retain({tensor}));
+        return makeCpuWork(c10d::OpType::REDUCE, completion,
+                           std::move(failed_ranks_hint), {tensor});
     }
     const auto stream = currentCudaStream(tensor);
     checkResult(mooncakePgReduceGpu(
@@ -654,8 +669,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
                     comm_, convertStream(stream), failed_ranks_hint.data(),
                     static_cast<size_t>(max_group_size_)),
                 "mooncakePgReduceGpu");
-    return wrapCudaEvent(c10d::OpType::REDUCE, recordCompletionEvent(stream),
-                         std::move(failed_ranks_hint), retain({tensor}));
+    return makeCudaWork(c10d::OpType::REDUCE, stream,
+                        std::move(failed_ranks_hint), {tensor});
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
@@ -673,15 +688,15 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
     if (is_root) {
         outputs = outputTensors.back();
         const int active_size = getSize();
-        validatePeerTensors(outputs, input, active_size);
+        validateEqualPeerTensors(outputs, input, active_size);
         packed_output =
             at::empty({input.numel() * static_cast<int64_t>(outputs.size())},
                       input.options());
     }
 
     auto failed_ranks_hint = FailedRanksHint::allocate(max_group_size_);
-    auto keep_alive = retain({input, packed_output});
-    appendTensors(keep_alive, outputs);
+    std::vector<at::Tensor> keep_alive{input, packed_output};
+    keep_alive.insert(keep_alive.end(), outputs.begin(), outputs.end());
     auto post_completion = packed_output.defined() ? makeCopyBackToPeerTensors(
                                                          packed_output, outputs)
                                                    : std::function<void()>{};
@@ -695,9 +710,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
                 failed_ranks_hint.data(), static_cast<size_t>(max_group_size_),
                 &completion),
             "mooncakePgGatherCpu");
-        return wrapCpuCompletion(
-            c10d::OpType::GATHER, completion, std::move(failed_ranks_hint),
-            std::move(keep_alive), std::move(post_completion));
+        return makeCpuWork(c10d::OpType::GATHER, completion,
+                           std::move(failed_ranks_hint), std::move(keep_alive),
+                           std::move(post_completion));
     }
     const auto stream = currentCudaStream(input);
     checkResult(
@@ -709,8 +724,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
             static_cast<size_t>(max_group_size_)),
         "mooncakePgGatherGpu");
     if (post_completion) post_completion();
-    return wrapCudaEvent(c10d::OpType::GATHER, recordCompletionEvent(stream),
-                         std::move(failed_ranks_hint), std::move(keep_alive));
+    return makeCudaWork(c10d::OpType::GATHER, stream,
+                        std::move(failed_ranks_hint), std::move(keep_alive));
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
@@ -732,8 +747,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
     }
 
     auto failed_ranks_hint = FailedRanksHint::allocate(max_group_size_);
-    auto keep_alive = retain({output, packed_input});
-    appendTensors(keep_alive, inputs);
+    std::vector<at::Tensor> keep_alive{output, packed_input};
+    keep_alive.insert(keep_alive.end(), inputs.begin(), inputs.end());
     if (isCpu_) {
         mooncakePgCompletion_t completion = nullptr;
         checkResult(
@@ -743,9 +758,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
                 root, comm_, failed_ranks_hint.data(),
                 static_cast<size_t>(max_group_size_), &completion),
             "mooncakePgScatterCpu");
-        return wrapCpuCompletion(c10d::OpType::SCATTER, completion,
-                                 std::move(failed_ranks_hint),
-                                 std::move(keep_alive));
+        return makeCpuWork(c10d::OpType::SCATTER, completion,
+                           std::move(failed_ranks_hint), std::move(keep_alive));
     }
     const auto stream = currentCudaStream(output);
     checkResult(
@@ -755,8 +769,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
             comm_, convertStream(stream), failed_ranks_hint.data(),
             static_cast<size_t>(max_group_size_)),
         "mooncakePgScatterGpu");
-    return wrapCudaEvent(c10d::OpType::SCATTER, recordCompletionEvent(stream),
-                         std::move(failed_ranks_hint), std::move(keep_alive));
+    return makeCudaWork(c10d::OpType::SCATTER, stream,
+                        std::move(failed_ranks_hint), std::move(keep_alive));
 }
 
 void MooncakeBackend::shutdown() {

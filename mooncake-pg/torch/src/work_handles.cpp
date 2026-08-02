@@ -283,12 +283,13 @@ bool MooncakeBarrierWorkCuda::wait(std::chrono::milliseconds timeout) {
     return waiter.wait_for(timeout, [this] { return event_->query(); });
 }
 
-MooncakeP2PWork::MooncakeP2PWork(mooncakePgCompletion_t completion,
+MooncakeP2PWork::MooncakeP2PWork(c10d::OpType opType,
+                                 mooncakePgCompletion_t completion,
                                  FailedRanksHint failedRanksHint,
                                  std::shared_ptr<MooncakeWorkTracker> tracker,
                                  std::vector<at::Tensor> keepAlive,
                                  std::function<void()> postCompletion)
-    : Work(-1, c10d::OpType::UNKNOWN),
+    : Work(-1, opType),
       completion_(makeCompletionHandle(completion)),
       failed_ranks_hint_(std::move(failedRanksHint)),
       tracker_(std::move(tracker)),

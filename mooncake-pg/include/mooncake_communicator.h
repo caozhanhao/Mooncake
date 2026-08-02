@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <stdexcept>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -19,14 +19,10 @@
 #include "mooncake_pg.h"
 #include "mooncake_worker.cuh"
 #include "p2p_proxy.h"
+#include "pg_utils.h"
 #include "comm_types.h"
 
 namespace mooncake {
-
-class ContextBusyError : public std::runtime_error {
-   public:
-    using std::runtime_error::runtime_error;
-};
 
 static constexpr size_t kDefaultCollectiveTimeoutUs = 10000000;  // 10 s
 static constexpr int64_t kDefaultP2PTimeoutUs = 10000000;        // 10 s
@@ -68,7 +64,7 @@ struct MooncakePGContext {
     MooncakePGContext(const MooncakePGContext&) = delete;
     MooncakePGContext& operator=(const MooncakePGContext&) = delete;
 
-    void initializeDataPlane(int rank, int world_size);
+    void initialize(int rank, int world_size);
     std::string launchCoordinator();
     AgentHost& connectCoordinator(const std::string& coordinator_address);
     void setHostIp(std::string value);
@@ -79,13 +75,14 @@ struct MooncakePGContext {
     void setFaultReconciliationWindow(int64_t timeout_us);
     void incrementCommUseCount();
     void decrementCommUseCount() noexcept;
-    void shutdown();
+    Expected<void, ResourceBusyError> shutdown();
 
    private:
     void requireRunning() const;
 
     std::mutex state_mutex_;
     size_t comm_use_count_ = 0;
+    bool initialized_ = false;
     bool shutdown_requested_ = false;
 };
 
@@ -102,10 +99,12 @@ struct MooncakeCommunicatorConfig {
     bool auto_deactivate_on_failure = true;
     bool auto_sync_on_failure = true;
 
-    // Optional caller-owned mirror of the communicator's active ranks.
+    // Optional caller-owned mirror of the communicator's active ranks. Its
+    // memory location is independent of the communicator's device.
     int32_t* active_ranks_mirror = nullptr;
     size_t active_ranks_mirror_count = 0;
     bool active_ranks_mirror_is_device = false;
+    int active_ranks_mirror_device_index = -1;
 };
 
 class MooncakeCommunicator {
@@ -122,12 +121,18 @@ class MooncakeCommunicator {
     int getMaxGroupSize() const { return max_group_size_; }
     bool isCpu() const { return is_cpu_; }
 
-    std::unique_ptr<WorkCompletion> send(const void* buffer, size_t bytes,
-                                         int peer, cudaStream_t stream,
-                                         int32_t* failed_ranks_hint);
-    std::unique_ptr<WorkCompletion> recv(void* buffer, size_t bytes, int peer,
-                                         cudaStream_t stream,
-                                         int32_t* failed_ranks_hint);
+    std::unique_ptr<WorkCompletion> sendCpu(const void* buffer, size_t bytes,
+                                            int peer,
+                                            int32_t* failed_ranks_hint);
+    std::unique_ptr<WorkCompletion> sendGpu(const void* buffer, size_t bytes,
+                                            int peer, cudaStream_t stream,
+                                            int32_t* failed_ranks_hint);
+    std::unique_ptr<WorkCompletion> recvCpu(void* buffer, size_t bytes,
+                                            int peer,
+                                            int32_t* failed_ranks_hint);
+    std::unique_ptr<WorkCompletion> recvGpu(void* buffer, size_t bytes,
+                                            int peer, cudaStream_t stream,
+                                            int32_t* failed_ranks_hint);
 
     std::unique_ptr<WorkCompletion> broadcastCpu(const void* send_buffer,
                                                  void* recv_buffer,
@@ -196,7 +201,7 @@ class MooncakeCommunicator {
     std::vector<bool> getPeerState(const std::vector<int>& ranks) const;
     ProposeViewUpdateResponse activateRanks(const std::vector<int>& ranks);
     ProposeViewUpdateResponse deactivateRanks(const std::vector<int>& ranks);
-    void joinGroup();
+    Expected<void, TimeoutError> joinGroup();
 
     // Returns the current GroupView epoch.
     // Epoch starts at 0 (bootstrap) and increments on membership changes,
@@ -226,6 +231,14 @@ class MooncakeCommunicator {
     AgentInterface& getAgent() { return agent_; }
 
    private:
+    std::unique_ptr<WorkCompletion> enqueueSend(const void* buffer,
+                                                size_t bytes, int peer,
+                                                cudaStream_t stream,
+                                                int32_t* failed_ranks_hint);
+    std::unique_ptr<WorkCompletion> enqueueRecv(void* buffer, size_t bytes,
+                                                int peer, cudaStream_t stream,
+                                                int32_t* failed_ranks_hint);
+
     // Guard: checks that the rank is Healthy (always) and, for collectives,
     // that it is active in this group. Called at the top of every operation.
     void prepareOp(OpType op) const;
@@ -237,14 +250,14 @@ class MooncakeCommunicator {
     // restricted to local-only collectives.
     bool isValidGroup() const { return meta_ && !meta_->group_id.empty(); }
 
-    // Sync the caller-provided active-ranks mirror on CPU/GPU from the current
+    // Sync the caller-provided host/device active-ranks mirror from the current
     // GroupView.
     void syncActiveRanksMirror() const;
 
     MooncakePGContext& context_;
     AgentInterface& agent_;
     int rank_ = 0;
-    int size_ = 1;
+    int initial_size_ = 1;
     int max_group_size_ =
         1;  // per-group capacity (max active members for this group)
     int device_index_ = -1;
@@ -252,7 +265,8 @@ class MooncakeCommunicator {
     bool is_shutdown_ = false;
     int32_t* active_ranks_mirror_ = nullptr;
     bool active_ranks_mirror_is_device_ = false;
-    GpuStream active_ranks_mirror_stream_;
+    int active_ranks_mirror_device_index_ = -1;
+    std::optional<GpuStream> active_ranks_mirror_stream_;
 
     std::shared_ptr<MooncakeWorker> worker_;
     std::array<void*, 2> send_buffer_{};

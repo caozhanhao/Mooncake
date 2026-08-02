@@ -52,8 +52,8 @@ RpcClient::getOrCreateClient(std::shared_ptr<SharedState> state,
     // Slow path: create + connect outside the lock so that a slow TCP
     // handshake suspends only this coroutine, not other peers'.
     coro_rpc::coro_rpc_client::config config;
-    config.connect_timeout_duration = state->connect_timeout.load();
-    config.request_timeout_duration = state->request_timeout.load();
+    config.connect_timeout_duration = state->connect_timeout;
+    config.request_timeout_duration = state->request_timeout;
 
     auto client = std::make_shared<coro_rpc::coro_rpc_client>(
         coro_io::get_global_executor(), config);
@@ -83,8 +83,8 @@ void RpcClient::spawn(async_simple::coro::Lazy<void> task) {
 
 std::unique_ptr<coro_rpc::coro_rpc_client> RpcClient::createSyncClient() {
     coro_rpc::coro_rpc_client::config config;
-    config.connect_timeout_duration = state_->connect_timeout.load();
-    config.request_timeout_duration = state_->request_timeout.load();
+    config.connect_timeout_duration = state_->connect_timeout;
+    config.request_timeout_duration = state_->request_timeout;
     return std::make_unique<coro_rpc::coro_rpc_client>(
         coro_io::get_global_executor(), config);
 }
@@ -92,14 +92,6 @@ std::unique_ptr<coro_rpc::coro_rpc_client> RpcClient::createSyncClient() {
 bool RpcClient::isConnected(const std::string& addr) const {
     std::lock_guard<std::mutex> lock(state_->mutex);
     return state_->clients.find(addr) != state_->clients.end();
-}
-
-void RpcClient::setRequestTimeout(std::chrono::milliseconds request_timeout) {
-    state_->request_timeout.store(request_timeout);
-}
-
-void RpcClient::setConnectTimeout(std::chrono::milliseconds connect_timeout) {
-    state_->connect_timeout.store(connect_timeout);
 }
 
 bool RpcClient::tryReconnect(const std::string& addr) {
@@ -112,8 +104,8 @@ bool RpcClient::tryReconnect(const std::string& addr) {
     }
 
     coro_rpc::coro_rpc_client::config config;
-    config.connect_timeout_duration = state_->connect_timeout.load();
-    config.request_timeout_duration = state_->request_timeout.load();
+    config.connect_timeout_duration = state_->connect_timeout;
+    config.request_timeout_duration = state_->request_timeout;
 
     auto client = std::make_shared<coro_rpc::coro_rpc_client>(
         coro_io::get_global_executor(), config);

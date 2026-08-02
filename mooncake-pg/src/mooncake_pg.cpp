@@ -10,6 +10,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include "comm_types.h"
@@ -46,11 +47,17 @@ void setLastError(const std::string& error) { g_last_error = error; }
 template <typename Function>
 mooncakePgResult_t translateExceptions(Function&& function) {
     try {
-        function();
-        return mooncakePgSuccess;
-    } catch (const mooncake::ContextBusyError& error) {
+        using ReturnType = std::invoke_result_t<Function>;
+        if constexpr (std::is_void_v<ReturnType>) {
+            function();
+            return mooncakePgSuccess;
+        } else {
+            static_assert(std::is_same_v<ReturnType, mooncakePgResult_t>);
+            return function();
+        }
+    } catch (const mooncake::PgCheckError& error) {
         setLastError(error.what());
-        return mooncakePgResourceBusy;
+        return mooncakePgInternalError;
     } catch (const std::invalid_argument& error) {
         setLastError(error.what());
         return mooncakePgInvalidArgument;
@@ -63,21 +70,29 @@ mooncakePgResult_t translateExceptions(Function&& function) {
     }
 }
 
+mooncakePgResult_t mapError(const mooncake::ResourceBusyError& error) {
+    setLastError(error.message);
+    return mooncakePgResourceBusy;
+}
+
+mooncakePgResult_t mapError(const mooncake::TimeoutError& error) {
+    setLastError(error.message);
+    return mooncakePgTimeout;
+}
+
+template <typename Error>
+mooncakePgResult_t mapExpected(const mooncake::Expected<void, Error>& result) {
+    return result.has_value() ? mooncakePgSuccess : mapError(result.error());
+}
+
 void validateContext(mooncakePgContext_t context) {
     if (!context || !context->impl) {
         throw std::invalid_argument("context is null");
     }
 }
 
-void validateProcessIdentity(int global_rank, int max_world_size) {
-    if (global_rank < 0 || max_world_size <= 0 ||
-        global_rank >= max_world_size ||
-        max_world_size > MOONCAKE_PG_MAX_RANKS) {
-        throw std::invalid_argument("invalid process rank or world size");
-    }
-}
-
-void validateCommConfig(const mooncakePgCommConfig_t* config) {
+mooncake::MooncakeCommunicatorConfig parseCommConfig(
+    const mooncakePgCommConfig_t* config) {
     if (!config) throw std::invalid_argument("communicator config is null");
     if (config->structSize < sizeof(*config) ||
         config->magic != MOONCAKE_PG_COMM_CONFIG_MAGIC ||
@@ -86,52 +101,69 @@ void validateCommConfig(const mooncakePgCommConfig_t* config) {
             "communicator config was not initialized with "
             "MOONCAKE_PG_COMM_CONFIG_INITIALIZER");
     }
-    if (!config->groupId || config->groupId[0] == '\0') {
-        throw std::invalid_argument("communicator group id is empty");
+    if (!config->groupId) {
+        throw std::invalid_argument("communicator group id is null");
     }
-    if (config->rank < 0 || config->size <= 0 || config->rank >= config->size) {
-        throw std::invalid_argument("invalid communicator rank or size");
+    if (!config->globalRanks) {
+        throw std::invalid_argument("global ranks is null");
     }
-    const int max_group_size =
-        config->maxGroupSize == MOONCAKE_PG_CONFIG_UNDEF_INT
-            ? config->size
-            : config->maxGroupSize;
-    if (max_group_size < config->size ||
-        max_group_size > MOONCAKE_PG_MAX_RANKS) {
-        throw std::invalid_argument("invalid communicator max group size");
-    }
-    if (config->globalRankCount != 0) {
-        if (!config->globalRanks) {
-            throw std::invalid_argument("global ranks is null");
-        }
-        if (config->globalRankCount != static_cast<size_t>(config->size)) {
-            throw std::invalid_argument(
-                "global rank count must equal communicator size");
-        }
-    }
-    if (config->activeRanksMirror &&
-        config->activeRanksMirrorCount < static_cast<size_t>(max_group_size)) {
-        throw std::invalid_argument("active-ranks mirror is too small");
+    if (config->globalRankCount == 0 ||
+        config->globalRankCount > MOONCAKE_PG_MAX_RANKS) {
+        throw std::invalid_argument("invalid global rank count");
     }
     if (!config->activeRanksMirror && config->activeRanksMirrorCount != 0) {
         throw std::invalid_argument("active-ranks mirror is null");
     }
-}
 
-void copyCoordinatorAddress(const std::string& value,
-                            char* coordinator_address_buf,
-                            size_t coordinator_address_buf_size) {
-    if (!coordinator_address_buf) {
-        throw std::invalid_argument("coordinator address output is null");
+    mooncake::MooncakeCommunicatorConfig internal;
+    internal.rank = config->rank;
+    internal.size = config->size;
+    internal.max_group_size =
+        config->maxGroupSize == MOONCAKE_PG_CONFIG_UNDEF_INT
+            ? config->size
+            : config->maxGroupSize;
+    internal.global_ranks.assign(config->globalRanks,
+                                 config->globalRanks + config->globalRankCount);
+    internal.group_bootstrap_id = config->groupId;
+    switch (config->deviceType) {
+        case mooncakePgDeviceCpu:
+            internal.is_cpu = true;
+            break;
+        case mooncakePgDeviceGpu:
+            internal.is_cpu = false;
+            break;
+        default:
+            throw std::invalid_argument("invalid communicator device type");
     }
-    if (value.empty()) {
-        throw std::invalid_argument("invalid coordinator address");
+    internal.device_index = config->deviceIndex == MOONCAKE_PG_CONFIG_UNDEF_INT
+                                ? -1
+                                : config->deviceIndex;
+    switch (config->idResolvePolicy) {
+        case mooncakePgIdResolveCreateOrAttach:
+            internal.group_resolve_policy =
+                mooncake::GroupBootstrapIdResolvePolicy::CreateOrAttach;
+            break;
+        case mooncakePgIdResolveAttachOrExtend:
+            internal.group_resolve_policy =
+                mooncake::GroupBootstrapIdResolvePolicy::AttachOrExtend;
+            break;
+        default:
+            throw std::invalid_argument(
+                "invalid communicator group resolve policy");
     }
-    if (value.size() >= coordinator_address_buf_size) {
-        throw std::invalid_argument(
-            "coordinator address output buffer is too small");
+    internal.auto_deactivate_on_failure = config->autoDeactivateOnFailure != 0;
+    internal.auto_sync_on_failure = config->autoSyncOnFailure != 0;
+    internal.active_ranks_mirror = config->activeRanksMirror;
+    internal.active_ranks_mirror_count = config->activeRanksMirrorCount;
+    internal.active_ranks_mirror_is_device =
+        config->activeRanksMirrorIsDevice != 0;
+    if (internal.active_ranks_mirror_is_device) {
+        internal.active_ranks_mirror_device_index =
+            config->activeRanksMirrorDeviceIndex == MOONCAKE_PG_CONFIG_UNDEF_INT
+                ? -1
+                : config->activeRanksMirrorDeviceIndex;
     }
-    std::memcpy(coordinator_address_buf, value.c_str(), value.size() + 1);
+    return internal;
 }
 
 mooncake::DataType convertDataType(mooncakePgDataType_t data_type) {
@@ -288,7 +320,10 @@ mooncakePgResult_t invokeOperation(mooncakePgComm_t comm, bool expect_cpu,
     });
 }
 
-std::vector<int> copyRanks(const int32_t* ranks, size_t rank_count) {
+std::vector<int> parseRanks(const int32_t* ranks, size_t rank_count) {
+    if (rank_count > MOONCAKE_PG_MAX_RANKS) {
+        throw std::invalid_argument("invalid rank count");
+    }
     if (rank_count != 0 && !ranks) {
         throw std::invalid_argument("ranks is null");
     }
@@ -296,25 +331,19 @@ std::vector<int> copyRanks(const int32_t* ranks, size_t rank_count) {
     return std::vector<int>(ranks, ranks + rank_count);
 }
 
-void copyErrorText(const std::string& text, char* output, size_t capacity) {
-    if (!output || capacity == 0) return;
-    std::snprintf(output, capacity, "%s", text.c_str());
-}
-
-void copyProposalResp(const mooncake::ProposeViewUpdateResponse& source,
-                      mooncakePgProposalResponse_t* destination) {
-    if (!destination) throw std::invalid_argument("proposal response is null");
-    std::memset(destination, 0, sizeof(*destination));
-    destination->status =
-        static_cast<mooncakePgProposalStatus_t>(source.status);
-    destination->newEpoch = source.new_epoch;
-    destination->droppedRankCount =
+mooncakePgProposalResponse_t convertProposalResponse(
+    const mooncake::ProposeViewUpdateResponse& source) {
+    mooncakePgProposalResponse_t destination{};
+    destination.status = static_cast<mooncakePgProposalStatus_t>(source.status);
+    destination.newEpoch = source.new_epoch;
+    destination.droppedRankCount =
         std::min(source.dropped_ranks.size(),
                  static_cast<size_t>(MOONCAKE_PG_MAX_RANKS));
-    std::copy_n(source.dropped_ranks.begin(), destination->droppedRankCount,
-                destination->droppedRanks);
-    copyErrorText(source.reject_reason, destination->rejectReason,
-                  sizeof(destination->rejectReason));
+    std::copy_n(source.dropped_ranks.begin(), destination.droppedRankCount,
+                destination.droppedRanks);
+    std::snprintf(destination.rejectReason, sizeof(destination.rejectReason),
+                  "%s", source.reject_reason.c_str());
+    return destination;
 }
 
 }  // namespace
@@ -356,8 +385,7 @@ mooncakePgResult_t mooncakePgContextInitialize(mooncakePgContext_t context,
                                                int max_world_size) {
     return translateExceptions([&] {
         validateContext(context);
-        validateProcessIdentity(global_rank, max_world_size);
-        context->impl->initializeDataPlane(global_rank, max_world_size);
+        context->impl->initialize(global_rank, max_world_size);
     });
 }
 
@@ -366,9 +394,18 @@ mooncakePgResult_t mooncakePgContextLaunchCoordinator(
     size_t coordinator_address_buf_size) {
     return translateExceptions([&] {
         validateContext(context);
-        copyCoordinatorAddress(context->impl->launchCoordinator(),
-                               coordinator_address_buf,
-                               coordinator_address_buf_size);
+        if (!coordinator_address_buf) {
+            throw std::invalid_argument("coordinator address output is null");
+        }
+        const auto value = context->impl->launchCoordinator();
+        if (value.empty()) {
+            throw std::runtime_error("coordinator returned an empty address");
+        }
+        if (value.size() >= coordinator_address_buf_size) {
+            throw std::invalid_argument(
+                "coordinator address output buffer is too small");
+        }
+        std::memcpy(coordinator_address_buf, value.c_str(), value.size() + 1);
     });
 }
 
@@ -446,11 +483,12 @@ mooncakePgResult_t mooncakePgContextSetFaultReconciliationWindow(
 }
 
 mooncakePgResult_t mooncakePgContextDestroy(mooncakePgContext_t context) {
-    return translateExceptions([&] {
-        if (!context) return;
+    return translateExceptions([&]() -> mooncakePgResult_t {
+        if (!context) return mooncakePgSuccess;
         validateContext(context);
-        context->impl->shutdown();
-        delete context;
+        auto result = context->impl->shutdown();
+        if (result.has_value()) delete context;
+        return mapExpected(result);
     });
 }
 
@@ -461,55 +499,7 @@ mooncakePgResult_t mooncakePgCommCreate(mooncakePgContext_t context,
         if (!comm) throw std::invalid_argument("communicator output is null");
         *comm = nullptr;
         validateContext(context);
-        validateCommConfig(config);
-
-        mooncake::MooncakeCommunicatorConfig internal;
-        internal.rank = config->rank;
-        internal.size = config->size;
-        internal.max_group_size =
-            config->maxGroupSize == MOONCAKE_PG_CONFIG_UNDEF_INT
-                ? config->size
-                : config->maxGroupSize;
-        if (config->globalRankCount != 0) {
-            internal.global_ranks.assign(
-                config->globalRanks,
-                config->globalRanks + config->globalRankCount);
-        }
-        internal.group_bootstrap_id = config->groupId;
-        switch (config->deviceType) {
-            case mooncakePgDeviceCpu:
-                internal.is_cpu = true;
-                break;
-            case mooncakePgDeviceGpu:
-                internal.is_cpu = false;
-                break;
-            default:
-                throw std::invalid_argument("invalid communicator device type");
-        }
-        internal.device_index =
-            config->deviceIndex == MOONCAKE_PG_CONFIG_UNDEF_INT
-                ? -1
-                : config->deviceIndex;
-        switch (config->idResolvePolicy) {
-            case mooncakePgIdResolveCreateOrAttach:
-                internal.group_resolve_policy =
-                    mooncake::GroupBootstrapIdResolvePolicy::CreateOrAttach;
-                break;
-            case mooncakePgIdResolveAttachOrExtend:
-                internal.group_resolve_policy =
-                    mooncake::GroupBootstrapIdResolvePolicy::AttachOrExtend;
-                break;
-            default:
-                throw std::invalid_argument(
-                    "invalid communicator group resolve policy");
-        }
-        internal.auto_deactivate_on_failure =
-            config->autoDeactivateOnFailure != 0;
-        internal.auto_sync_on_failure = config->autoSyncOnFailure != 0;
-        internal.active_ranks_mirror = config->activeRanksMirror;
-        internal.active_ranks_mirror_count = config->activeRanksMirrorCount;
-        internal.active_ranks_mirror_is_device =
-            config->activeRanksMirrorIsDevice != 0;
+        auto internal = parseCommConfig(config);
 
         auto output = std::make_unique<mooncakePgComm>(*context->impl);
         output->impl = std::make_unique<mooncake::MooncakeCommunicator>(
@@ -904,9 +894,9 @@ mooncakePgResult_t mooncakePgSendGpu(const void* send_buffer, size_t count,
         [&](int32_t* failed_ranks_hint_buffer) {
             const size_t bytes = byteCount(count, data_type);
             validateBuffer(send_buffer, bytes, "send buffer");
-            return comm->impl->send(send_buffer, bytes, peer,
-                                    convertStream(stream),
-                                    failed_ranks_hint_buffer);
+            return comm->impl->sendGpu(send_buffer, bytes, peer,
+                                       convertStream(stream),
+                                       failed_ranks_hint_buffer);
         });
 }
 
@@ -922,9 +912,9 @@ mooncakePgResult_t mooncakePgRecvGpu(void* recv_buffer, size_t count,
         [&](int32_t* failed_ranks_hint_buffer) {
             const size_t bytes = byteCount(count, data_type);
             validateBuffer(recv_buffer, bytes, "receive buffer");
-            return comm->impl->recv(recv_buffer, bytes, peer,
-                                    convertStream(stream),
-                                    failed_ranks_hint_buffer);
+            return comm->impl->recvGpu(recv_buffer, bytes, peer,
+                                       convertStream(stream),
+                                       failed_ranks_hint_buffer);
         });
 }
 
@@ -939,8 +929,8 @@ mooncakePgResult_t mooncakePgSendCpu(const void* send_buffer, size_t count,
         [&](int32_t* failed_ranks_hint_buffer) {
             const size_t bytes = byteCount(count, data_type);
             validateBuffer(send_buffer, bytes, "send buffer");
-            return comm->impl->send(send_buffer, bytes, peer, nullptr,
-                                    failed_ranks_hint_buffer);
+            return comm->impl->sendCpu(send_buffer, bytes, peer,
+                                       failed_ranks_hint_buffer);
         });
 }
 
@@ -955,8 +945,8 @@ mooncakePgResult_t mooncakePgRecvCpu(void* recv_buffer, size_t count,
         [&](int32_t* failed_ranks_hint_buffer) {
             const size_t bytes = byteCount(count, data_type);
             validateBuffer(recv_buffer, bytes, "receive buffer");
-            return comm->impl->recv(recv_buffer, bytes, peer, nullptr,
-                                    failed_ranks_hint_buffer);
+            return comm->impl->recvCpu(recv_buffer, bytes, peer,
+                                       failed_ranks_hint_buffer);
         });
 }
 
@@ -1017,7 +1007,7 @@ mooncakePgResult_t mooncakePgCommGetPeerState(mooncakePgComm_t comm,
             throw std::invalid_argument("peer-states output is null");
         }
         const auto states =
-            comm->impl->getPeerState(copyRanks(ranks, rank_count));
+            comm->impl->getPeerState(parseRanks(ranks, rank_count));
         for (size_t index = 0; index < states.size(); ++index) {
             peer_states[index] = states[index] ? 1 : 0;
         }
@@ -1029,8 +1019,12 @@ mooncakePgResult_t mooncakePgCommActivateRanks(
     mooncakePgProposalResponse_t* response) {
     return translateExceptions([&] {
         validateComm(comm);
-        copyProposalResp(
-            comm->impl->activateRanks(copyRanks(ranks, rank_count)), response);
+        if (!response) {
+            throw std::invalid_argument("proposal response is null");
+        }
+        const auto parsed_ranks = parseRanks(ranks, rank_count);
+        *response =
+            convertProposalResponse(comm->impl->activateRanks(parsed_ranks));
     });
 }
 
@@ -1039,16 +1033,19 @@ mooncakePgResult_t mooncakePgCommDeactivateRanks(
     mooncakePgProposalResponse_t* response) {
     return translateExceptions([&] {
         validateComm(comm);
-        copyProposalResp(
-            comm->impl->deactivateRanks(copyRanks(ranks, rank_count)),
-            response);
+        if (!response) {
+            throw std::invalid_argument("proposal response is null");
+        }
+        const auto parsed_ranks = parseRanks(ranks, rank_count);
+        *response =
+            convertProposalResponse(comm->impl->deactivateRanks(parsed_ranks));
     });
 }
 
 mooncakePgResult_t mooncakePgCommJoin(mooncakePgComm_t comm) {
     return translateExceptions([&] {
         validateComm(comm);
-        comm->impl->joinGroup();
+        return mapExpected(comm->impl->joinGroup());
     });
 }
 
@@ -1061,8 +1058,8 @@ mooncakePgResult_t mooncakePgCommSyncAfterFailure(
         std::memset(response, 0, sizeof(*response));
         response->status =
             static_cast<mooncakePgSyncAfterFailureStatus_t>(source.status);
-        copyErrorText(source.reject_reason, response->rejectReason,
-                      sizeof(response->rejectReason));
+        std::snprintf(response->rejectReason, sizeof(response->rejectReason),
+                      "%s", source.reject_reason.c_str());
     });
 }
 

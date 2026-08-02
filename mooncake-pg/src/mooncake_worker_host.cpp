@@ -255,11 +255,11 @@ void MooncakeWorker::putTaskCuda(
     const GpuDeviceGuard guard(cuda_device_index_);
     const auto issue_stream =
         GpuStream::borrow(issueStream, cuda_device_index_);
-    const auto& enq_stream = enqueue_stream_;
+    const auto& enq_stream = enqueue_stream_.value();
 
-    GpuEvent event_start;
+    GpuEvent event_start(issue_stream.deviceIndex());
     event_start.record(issue_stream);
-    event_start.block(enq_stream);
+    enq_stream.waitEvent(event_start);
 
     std::vector<CudaTaskSubmissionToken> submitted_tasks;
     submitted_tasks.reserve((tensorSize + chunkSize - 1) / chunkSize);
@@ -274,17 +274,17 @@ void MooncakeWorker::putTaskCuda(
             {.task_id = static_cast<size_t>(taskId), .sequence = taskSequence});
         copyToSendBuffer(
             (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
-            pos, realSize, enq_stream);
+            pos, realSize, enq_stream.get());
 
         hasCallback_[taskId] = false;
 
         launchEnqueueTaskKernel((int)opType, realSize, broadcastRoot,
                                 bufferOffset, taskSequence, failed_ranks_hint,
                                 pos == 0, meta.get(), tasks_device_, taskId,
-                                enq_stream);
+                                enq_stream.get());
         copyFromRecvBuffer(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
-            pos, realSize, enq_stream);
+            pos, realSize, enq_stream.get());
 
         ++cudaTaskCount;
         ++meta->taskCount;
@@ -296,9 +296,9 @@ void MooncakeWorker::putTaskCuda(
         waitUntilTasksSubmitted(submitted_tasks);
     }
 
-    GpuEvent event_end;
+    GpuEvent event_end(enq_stream.deviceIndex());
     event_end.record(enq_stream);
-    event_end.block(issue_stream);
+    issue_stream.waitEvent(event_end);
 }
 
 }  // namespace mooncake

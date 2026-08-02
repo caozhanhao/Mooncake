@@ -125,7 +125,7 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
 // P2P Work handle
 class MooncakeP2PWork : public ::c10d::Work {
    public:
-    MooncakeP2PWork(mooncakePgCompletion_t completion,
+    MooncakeP2PWork(c10d::OpType opType, mooncakePgCompletion_t completion,
                     FailedRanksHint failedRanksHint,
                     std::shared_ptr<MooncakeWorkTracker> tracker,
                     std::vector<at::Tensor> keepAlive = {},

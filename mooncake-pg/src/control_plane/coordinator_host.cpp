@@ -71,15 +71,11 @@ CoordinatorHost::CoordinatorHost(const std::string& host_ip, int max_world_size,
       executor_("CoordinatorHost"),
       host_ip_(host_ip),
       max_world_size_(max_world_size),
-      rpc_client_(
-          std::make_unique<RpcClient>(rpcTimeoutForFaultReconciliationWindow(
-              fault_reconciliation_window_us))) {}
+      rpc_client_(std::make_unique<RpcClient>()) {}
 
 CoordinatorHost::~CoordinatorHost() { shutdown(); }
 
 void CoordinatorHost::setFaultReconciliationWindow(int64_t timeout_us) {
-    rpc_client_->setRequestTimeout(
-        rpcTimeoutForFaultReconciliationWindow(timeout_us));
     executor_.postAndWait([this, timeout_us] {
         state_machine_.setFaultReconciliationWindow(
             std::chrono::microseconds(timeout_us));

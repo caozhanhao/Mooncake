@@ -13,6 +13,7 @@
 
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -132,7 +133,7 @@ class MooncakeWorker {
     std::atomic<bool> running_{false};
     std::atomic<bool> started_{false};
     int cuda_device_index_;
-    GpuStream enqueue_stream_;
+    std::optional<GpuStream> enqueue_stream_;
 
     Task *tasks_, *tasks_device_;
     bool hasCallback_[kNumTasks_]{};

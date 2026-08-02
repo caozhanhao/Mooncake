@@ -1,7 +1,6 @@
 #ifndef MOONCAKE_PG_RPC_RUNTIME_H
 #define MOONCAKE_PG_RPC_RUNTIME_H
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -53,7 +52,7 @@ class RpcClient {
         std::chrono::milliseconds(30000);
 
     explicit RpcClient(
-        std::chrono::milliseconds request_timeout,
+        std::chrono::milliseconds request_timeout = kDefaultRequestTimeout,
         std::chrono::milliseconds connect_timeout = kConnectTimeout);
     ~RpcClient() = default;
 
@@ -65,7 +64,7 @@ class RpcClient {
         static_assert(std::is_same_v<Response, ResponseType>);
 
         auto client = createSyncClient();
-        auto request_timeout = timeout.value_or(state_->request_timeout.load());
+        auto request_timeout = timeout.value_or(state_->request_timeout);
 
         auto ec = async_simple::coro::syncAwait(client->connect(addr));
         if (ec) {
@@ -100,30 +99,10 @@ class RpcClient {
 
     bool isConnected(const std::string& addr) const;
     bool tryReconnect(const std::string& addr);
-    void setRequestTimeout(std::chrono::milliseconds request_timeout);
-    void setConnectTimeout(std::chrono::milliseconds connect_timeout);
 
     void shutdown() { state_->shutdown.store(true, std::memory_order_release); }
 
    private:
-    class AtomicTimeout {
-       public:
-        explicit AtomicTimeout(std::chrono::milliseconds timeout) noexcept
-            : milliseconds_(timeout.count()) {}
-
-        std::chrono::milliseconds load() const noexcept {
-            return std::chrono::milliseconds(
-                milliseconds_.load(std::memory_order_relaxed));
-        }
-
-        void store(std::chrono::milliseconds timeout) noexcept {
-            milliseconds_.store(timeout.count(), std::memory_order_relaxed);
-        }
-
-       private:
-        std::atomic<std::chrono::milliseconds::rep> milliseconds_;
-    };
-
     struct SharedState {
         SharedState(std::chrono::milliseconds request_timeout,
                     std::chrono::milliseconds connect_timeout)
@@ -135,8 +114,8 @@ class RpcClient {
                            std::shared_ptr<coro_rpc::coro_rpc_client>>
             clients;
         std::atomic<bool> shutdown{false};
-        AtomicTimeout request_timeout;
-        AtomicTimeout connect_timeout;
+        const std::chrono::milliseconds request_timeout;
+        const std::chrono::milliseconds connect_timeout;
     };
 
     // Coroutine-based connect + cache lookup.
@@ -159,7 +138,7 @@ class RpcClient {
         if (!client) co_return;
         try {
             coro_rpc::request_config_t config;
-            config.request_timeout_duration = state->request_timeout.load();
+            config.request_timeout_duration = state->request_timeout;
             auto send_lazy = co_await client->template send_request<Func>(
                 std::move(config), std::move(req));
             co_await std::move(send_lazy);
@@ -188,7 +167,7 @@ class RpcClient {
         }
         try {
             coro_rpc::request_config_t config;
-            config.request_timeout_duration = state->request_timeout.load();
+            config.request_timeout_duration = state->request_timeout;
             auto send_lazy = co_await client->template send_request<Func>(
                 std::move(config), std::move(req));
             auto res = co_await std::move(send_lazy);
@@ -212,18 +191,6 @@ class RpcClient {
 
     std::shared_ptr<SharedState> state_;
 };
-
-inline std::chrono::milliseconds rpcTimeoutForFaultReconciliationWindow(
-    int64_t timeout_us) {
-    const auto reconciliation_timeout =
-        std::chrono::ceil<std::chrono::milliseconds>(
-            std::chrono::microseconds(timeout_us));
-
-    // A syncAfterFailure request can remain pending for the entire
-    // reconciliation window.
-    return std::max(RpcClient::kDefaultRequestTimeout,
-                    2 * reconciliation_timeout);
-}
 
 }  // namespace mooncake
 

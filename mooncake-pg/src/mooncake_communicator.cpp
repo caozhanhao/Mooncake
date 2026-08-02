@@ -5,7 +5,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
-#include <numeric>
 #include <stdexcept>
 #include <utility>
 
@@ -24,6 +23,10 @@ constexpr const char* kRegisterBufferError =
 // task for the barrier.
 constexpr size_t kBarrierDummySize = 1;
 
+void checkCuda(cudaError_t error, const char* operation) {
+    PG_CHECK(error == cudaSuccess, operation, ": ", cudaGetErrorString(error));
+}
+
 void copyDeviceToDevice(void* dst, const void* src, size_t bytes,
                         cudaStream_t stream) {
     checkCuda(
@@ -35,7 +38,12 @@ void copyDeviceToDevice(void* dst, const void* src, size_t bytes,
 
 MooncakePGContext::~MooncakePGContext() {
     try {
-        shutdown();
+        auto result = shutdown();
+        if (!result.has_value()) {
+            LOG(ERROR)
+                << "Mooncake PG context shutdown failed during destruction: "
+                << result.error().message;
+        }
     } catch (const std::exception& error) {
         LOG(ERROR) << "Mooncake PG context shutdown failed during destruction: "
                    << error.what();
@@ -46,26 +54,28 @@ MooncakePGContext::~MooncakePGContext() {
 
 void MooncakePGContext::requireRunning() const {
     if (shutdown_requested_) {
-        throw std::invalid_argument("Mooncake PG context is shut down");
+        throw std::invalid_argument("Mooncake PG context is shutting down");
     }
 }
 
-void MooncakePGContext::initializeDataPlane(int rank, int world_size) {
+void MooncakePGContext::initialize(int rank, int world_size) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     requireRunning();
-    PG_CHECK(rank >= 0 && rank < world_size,
-             "global rank is outside the process world");
-    PG_CHECK(world_size > 0 && world_size <= kMaxNumRanks,
-             "max_world_size is outside the supported range");
-    if (max_world_size != 0) {
-        PG_CHECK(global_rank == rank && max_world_size == world_size,
-                 "Mooncake process context was initialized with a "
-                 "different rank or world size");
+    if (world_size <= 0 || world_size > kMaxNumRanks) {
+        throw std::invalid_argument(
+            "max_world_size is outside the supported range");
+    }
+    if (rank < 0 || rank >= world_size) {
+        throw std::invalid_argument("global rank is outside the process world");
+    }
+    if (initialized_) {
+        if (global_rank != rank || max_world_size != world_size) {
+            throw std::invalid_argument(
+                "Mooncake process context was initialized with a "
+                "different rank or world size");
+        }
         return;
     }
-
-    global_rank = rank;
-    max_world_size = world_size;
 
     // Ordering constraint: AgentHost::start() sends registerAgent immediately,
     // which includes LinkManager's localServerName() and getWarmupRecvAddr().
@@ -82,13 +92,18 @@ void MooncakePGContext::initializeDataPlane(int rank, int world_size) {
     if (!link_manager.isInitialized()) {
         link_manager.init(rank, world_size, engine);
     }
+
+    global_rank = rank;
+    max_world_size = world_size;
+    initialized_ = true;
 }
 
 std::string MooncakePGContext::launchCoordinator() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     requireRunning();
-    PG_CHECK(max_world_size > 0,
-             "initializeDataPlane must run before launchCoordinator");
+    PG_CHECK(initialized_,
+             "Mooncake PG context must be initialized before launching the "
+             "coordinator");
     PG_CHECK(global_rank == 0, "only global rank 0 may start the coordinator");
     if (!coordinator_host) {
         coordinator_host = std::make_unique<CoordinatorHost>(
@@ -102,8 +117,9 @@ AgentHost& MooncakePGContext::connectCoordinator(
     const std::string& coordinator_address) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     requireRunning();
-    PG_CHECK(max_world_size > 0,
-             "initializeDataPlane must run before connectCoordinator");
+    PG_CHECK(initialized_,
+             "Mooncake PG context must be initialized before connecting to "
+             "the coordinator");
     if (!agent_host) {
         agent_host = std::make_unique<AgentHost>(
             coordinator_address, host_ip, global_rank, max_world_size,
@@ -116,6 +132,8 @@ AgentHost& MooncakePGContext::connectCoordinator(
 void MooncakePGContext::setHostIp(std::string value) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     requireRunning();
+    PG_CHECK(!initialized_,
+             "host IP cannot be changed after context initialization");
     host_ip = std::move(value);
 }
 
@@ -176,13 +194,13 @@ void MooncakePGContext::decrementCommUseCount() noexcept {
     --comm_use_count_;
 }
 
-void MooncakePGContext::shutdown() {
+Expected<void, ResourceBusyError> MooncakePGContext::shutdown() {
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        if (shutdown_requested_) return;
+        if (shutdown_requested_) return {};
         if (comm_use_count_ != 0) {
-            throw ContextBusyError(
-                "Mooncake PG context still has active communicators");
+            return Unexpected<ResourceBusyError>{ResourceBusyError{
+                "Mooncake PG context still has active communicators"}};
         }
         shutdown_requested_ = true;
     }
@@ -193,6 +211,7 @@ void MooncakePGContext::shutdown() {
     if (coordinator_host) coordinator_host->shutdown();
     coordinator_host.reset();
     engine = nullptr;
+    return {};
 }
 
 /**
@@ -204,39 +223,62 @@ MooncakeCommunicator::MooncakeCommunicator(MooncakePGContext& context,
     : context_(context),
       agent_(*context_.agent_host),
       rank_(config.rank),
-      size_(config.size),
+      initial_size_(config.size),
       max_group_size_(config.max_group_size > 0 ? config.max_group_size
                                                 : config.size),
       device_index_(config.device_index),
       is_cpu_(config.is_cpu),
       active_ranks_mirror_(config.active_ranks_mirror),
-      active_ranks_mirror_is_device_(config.active_ranks_mirror_is_device) {
-    PG_CHECK(size_ > 0 && size_ <= max_group_size_,
-             "group size exceeds max_group_size");
-    PG_CHECK(max_group_size_ > 0 && max_group_size_ <= kMaxNumRanks,
-             "max_group_size is outside the supported range");
-    PG_CHECK(rank_ >= 0 && rank_ < size_, "rank is outside the initial group");
-    PG_CHECK(!config.group_bootstrap_id.empty(),
-             "group bootstrap id must not be empty");
-    PG_CHECK(!config.auto_sync_on_failure || config.auto_deactivate_on_failure,
-             "auto_sync_on_failure requires "
-             "auto_deactivate_on_failure");
-    if (active_ranks_mirror_) {
-        PG_CHECK(config.active_ranks_mirror_count >=
-                     static_cast<size_t>(max_group_size_),
-                 "active-ranks mirror is too small");
+      active_ranks_mirror_is_device_(config.active_ranks_mirror_is_device),
+      active_ranks_mirror_device_index_(
+          config.active_ranks_mirror_device_index) {
+    if (initial_size_ <= 0 || initial_size_ > max_group_size_) {
+        throw std::invalid_argument("group size exceeds max_group_size");
+    }
+    if (max_group_size_ <= 0 || max_group_size_ > kMaxNumRanks) {
+        throw std::invalid_argument(
+            "max_group_size is outside the supported range");
+    }
+    if (rank_ < 0 || rank_ >= initial_size_) {
+        throw std::invalid_argument("rank is outside the initial group");
+    }
+    if (config.group_bootstrap_id.empty()) {
+        throw std::invalid_argument("group bootstrap id must not be empty");
+    }
+    if (config.auto_sync_on_failure && !config.auto_deactivate_on_failure) {
+        throw std::invalid_argument(
+            "auto_sync_on_failure requires auto_deactivate_on_failure");
+    }
+    if (active_ranks_mirror_ && config.active_ranks_mirror_count <
+                                    static_cast<size_t>(max_group_size_)) {
+        throw std::invalid_argument("active-ranks mirror is too small");
+    }
+    if (active_ranks_mirror_ && active_ranks_mirror_is_device_ &&
+        active_ranks_mirror_device_index_ < 0) {
+        throw std::invalid_argument(
+            "device active-ranks mirror requires a valid device index");
     }
 
-    // Build rank order from global_ranks. rank order is a mapping from in-group
-    // rank to global rank.
-    std::vector<GlobalRank> initial_rank_order;
-    if (config.global_ranks.size() == static_cast<size_t>(size_)) {
-        initial_rank_order = config.global_ranks;
-    } else {
-        // Fallback with identical mapping.
-        initial_rank_order.resize(size_);
-        std::iota(initial_rank_order.begin(), initial_rank_order.end(), 0);
+    if (config.global_ranks.size() != static_cast<size_t>(initial_size_)) {
+        throw std::invalid_argument(
+            "global rank count must equal communicator size");
     }
+    std::array<bool, kMaxNumRanks> seen_global_ranks{};
+    for (const auto global_rank : config.global_ranks) {
+        if (global_rank < 0 || global_rank >= context_.max_world_size) {
+            throw std::invalid_argument(
+                "global rank is outside the process world");
+        }
+        if (seen_global_ranks[global_rank]) {
+            throw std::invalid_argument("global ranks contains duplicates");
+        }
+        seen_global_ranks[global_rank] = true;
+    }
+    if (config.global_ranks[rank_] != context_.global_rank) {
+        throw std::invalid_argument(
+            "communicator rank does not map to the process global rank");
+    }
+    auto initial_rank_order = std::move(config.global_ranks);
 
     // Memory location for device-specific buffers. Always kWildcardLocation for
     // a CPU communicator.
@@ -248,10 +290,10 @@ MooncakeCommunicator::MooncakeCommunicator(MooncakePGContext& context,
         }
         device_guard = std::make_unique<GpuDeviceGuard>(device_index_);
         location = GPU_PREFIX + std::to_string(device_index_);
-        if (active_ranks_mirror_ && active_ranks_mirror_is_device_) {
-            active_ranks_mirror_stream_ =
-                GpuStream::createNonBlocking(device_index_);
-        }
+    }
+    if (active_ranks_mirror_ && active_ranks_mirror_is_device_) {
+        active_ranks_mirror_stream_ =
+            GpuStream::createNonBlocking(active_ranks_mirror_device_index_);
     }
 
     // Register collective buffers.
@@ -313,18 +355,15 @@ MooncakeCommunicator::MooncakeCommunicator(MooncakePGContext& context,
         meta_->segmentIDs[index] = static_cast<TransferMetadata::SegmentID>(-1);
         meta_->rankEpochs[index] = 0;
         meta_->rankStates[index] = RankState::Offline;
+        meta_->rank_order[index] = kInvalidGlobalRank;
     }
     meta_->rank = rank_;
     meta_->globalRank = initial_rank_order[rank_];
-    for (int index = 0; index < max_group_size_; ++index) {
-        // initial_rank_order only has `size_` entries; for remaining extension
-        // slots default to identity so that in-group rank i maps to global rank
-        // i until applyViewUpdate overwrites it.
-        meta_->rank_order[index] =
-            index < size_ ? initial_rank_order[index] : index;
+    for (int index = 0; index < initial_size_; ++index) {
+        meta_->rank_order[index] = initial_rank_order[index];
     }
     meta_->maxGroupSize = max_group_size_;  // slot capacity
-    meta_->activeSize.store(size_, std::memory_order_relaxed);
+    meta_->activeSize.store(initial_size_, std::memory_order_relaxed);
     meta_->taskCount = 0;
     meta_->collectiveTimeoutUs = &context_.collective_timeout_us;
     meta_->engine = context_.engine;
@@ -370,7 +409,7 @@ MooncakeCommunicator::MooncakeCommunicator(MooncakePGContext& context,
     PG_CHECK(agent_.waitUntilRegistered(std::chrono::seconds(30)),
              "Agent registration timed out");
 
-    // The framework-provided group id is only a bootstrap id. The Coordinator
+    // The PyTorch-provided group id is only a bootstrap id. The Coordinator
     // resolves it together with rank order into a process-lifetime GroupId. CPU
     // and device communicators use independent namespaces.
     auto bootstrap_id = std::string(is_cpu_ ? "cpu:" : "device:") +
@@ -420,7 +459,7 @@ MooncakeCommunicator::~MooncakeCommunicator() {
 int MooncakeCommunicator::getSize() const {
     if (!meta_ || meta_->extensionMode.load(std::memory_order_acquire) !=
                       CollectiveExtensionState::Normal) {
-        return size_;
+        return initial_size_;
     }
     return meta_->activeSize.load(std::memory_order_acquire);
 }
@@ -445,7 +484,20 @@ void MooncakeCommunicator::prepareOp(OpType op) const {
     }
 }
 
-std::unique_ptr<WorkCompletion> MooncakeCommunicator::send(
+std::unique_ptr<WorkCompletion> MooncakeCommunicator::sendCpu(
+    const void* buffer, size_t bytes, int peer, int32_t* failed_ranks_hint) {
+    PG_CHECK(is_cpu_, "sendCpu requires a CPU communicator");
+    return enqueueSend(buffer, bytes, peer, nullptr, failed_ranks_hint);
+}
+
+std::unique_ptr<WorkCompletion> MooncakeCommunicator::sendGpu(
+    const void* buffer, size_t bytes, int peer, cudaStream_t stream,
+    int32_t* failed_ranks_hint) {
+    PG_CHECK(!is_cpu_, "sendGpu requires a GPU communicator");
+    return enqueueSend(buffer, bytes, peer, stream, failed_ranks_hint);
+}
+
+std::unique_ptr<WorkCompletion> MooncakeCommunicator::enqueueSend(
     const void* buffer, size_t bytes, int peer, cudaStream_t stream,
     int32_t* failed_ranks_hint) {
     PG_CHECK(buffer || bytes == 0, "send buffer is null");
@@ -461,14 +513,27 @@ std::unique_ptr<WorkCompletion> MooncakeCommunicator::send(
         .buffer_ = buffer,
         .size_ = bytes,
         .peer_rank_ = peer,
-        .cuda_stream_ = is_cpu_ ? nullptr : stream,
+        .cuda_stream_ = stream,
         .completion_ = completion,
         .failed_ranks_hint_ = failed_ranks_hint,
     });
     return result;
 }
 
-std::unique_ptr<WorkCompletion> MooncakeCommunicator::recv(
+std::unique_ptr<WorkCompletion> MooncakeCommunicator::recvCpu(
+    void* buffer, size_t bytes, int peer, int32_t* failed_ranks_hint) {
+    PG_CHECK(is_cpu_, "recvCpu requires a CPU communicator");
+    return enqueueRecv(buffer, bytes, peer, nullptr, failed_ranks_hint);
+}
+
+std::unique_ptr<WorkCompletion> MooncakeCommunicator::recvGpu(
+    void* buffer, size_t bytes, int peer, cudaStream_t stream,
+    int32_t* failed_ranks_hint) {
+    PG_CHECK(!is_cpu_, "recvGpu requires a GPU communicator");
+    return enqueueRecv(buffer, bytes, peer, stream, failed_ranks_hint);
+}
+
+std::unique_ptr<WorkCompletion> MooncakeCommunicator::enqueueRecv(
     void* buffer, size_t bytes, int peer, cudaStream_t stream,
     int32_t* failed_ranks_hint) {
     PG_CHECK(buffer || bytes == 0, "recv buffer is null");
@@ -484,7 +549,7 @@ std::unique_ptr<WorkCompletion> MooncakeCommunicator::recv(
         .buffer_ = buffer,
         .size_ = bytes,
         .peer_rank_ = peer,
-        .cuda_stream_ = is_cpu_ ? nullptr : stream,
+        .cuda_stream_ = stream,
         .completion_ = completion,
         .failed_ranks_hint_ = failed_ranks_hint,
     });
@@ -1025,10 +1090,10 @@ void MooncakeCommunicator::syncActiveRanksMirror() const {
     auto active_ranks = getActiveRanks();
     const size_t bytes = max_group_size_ * sizeof(int32_t);
     if (active_ranks_mirror_is_device_) {
-        const GpuDeviceGuard device_guard(device_index_);
+        const GpuDeviceGuard device_guard(active_ranks_mirror_device_index_);
         checkCuda(cudaMemcpyAsync(active_ranks_mirror_, active_ranks.data(),
                                   bytes, cudaMemcpyHostToDevice,
-                                  active_ranks_mirror_stream_),
+                                  active_ranks_mirror_stream_.value().get()),
                   "copy active-ranks mirror");
     } else {
         std::memcpy(active_ranks_mirror_, active_ranks.data(), bytes);
@@ -1087,7 +1152,7 @@ ProposeViewUpdateResponse MooncakeCommunicator::deactivateRanks(
     return response;
 }
 
-void MooncakeCommunicator::joinGroup() {
+Expected<void, TimeoutError> MooncakeCommunicator::joinGroup() {
     requireValidGroup("joinGroup");
     auto mode = meta_->extensionMode.load(std::memory_order_acquire);
     PG_CHECK(mode == CollectiveExtensionState::Isolated,
@@ -1105,8 +1170,11 @@ void MooncakeCommunicator::joinGroup() {
     }
     agent_.confirmReadyForActivation(meta_->group_id);
     // Block until the Coordinator activates this rank in the group.
-    agent_.waitUntilRankActive(meta_->group_id, meta_->globalRank,
-                               std::chrono::seconds(300));
+    auto wait_result = agent_.waitUntilRankActive(
+        meta_->group_id, meta_->globalRank, std::chrono::seconds(300));
+    if (!wait_result.has_value()) {
+        return Unexpected<TimeoutError>{std::move(wait_result).error()};
+    }
     const bool normal_and_active =
         meta_->extensionMode.load(std::memory_order_acquire) ==
             CollectiveExtensionState::Normal &&
@@ -1114,6 +1182,7 @@ void MooncakeCommunicator::joinGroup() {
     PG_CHECK(normal_and_active, "Bad waitUntilRankActive");
     LOG(INFO) << "joinGroup rank=" << meta_->globalRank
               << " group=" << meta_->group_id << " activated";
+    return {};
 }
 
 uint64_t MooncakeCommunicator::getCurrentEpoch() const {

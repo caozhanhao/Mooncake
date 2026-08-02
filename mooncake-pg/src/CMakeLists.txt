@@ -89,6 +89,7 @@ add_library(mooncake_pg SHARED
     control_plane/agent.cpp
     control_plane/agent_host.cpp
     control_plane/rpc_runtime.cpp
+    gpu_utils.cpp
     mooncake_communicator.cpp
     mooncake_pg.cpp
     "${_pg_device_input}"

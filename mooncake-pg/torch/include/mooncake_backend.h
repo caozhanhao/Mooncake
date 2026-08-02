@@ -8,6 +8,8 @@
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/torch.h>
 
+#include <c10/cuda/CUDAStream.h>
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -235,17 +237,19 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     mooncakePgSyncAfterFailureResponse_t syncAfterFailure();
 
    private:
-    c10::intrusive_ptr<c10d::Work> wrapCpuCompletion(
+    c10::intrusive_ptr<c10d::Work> makeCpuWork(
         c10d::OpType opType, mooncakePgCompletion_t completion,
         FailedRanksHint failedRanksHint, std::vector<at::Tensor> keepAlive = {},
         std::function<void()> postCompletion = {});
-    c10::intrusive_ptr<c10d::Work> wrapCudaEvent(
-        c10d::OpType opType, std::shared_ptr<c10::Event> event,
+    c10::intrusive_ptr<c10d::Work> makeCudaWork(
+        c10d::OpType opType, const c10::cuda::CUDAStream& stream,
+        FailedRanksHint failedRanksHint,
+        std::vector<at::Tensor> keepAlive = {});
+    c10::intrusive_ptr<c10d::Work> makeCudaBarrierWork(
+        const c10::cuda::CUDAStream& stream, FailedRanksHint failedRanksHint);
+    c10::intrusive_ptr<c10d::Work> makeP2PWork(
+        c10d::OpType opType, mooncakePgCompletion_t completion,
         FailedRanksHint failedRanksHint, std::vector<at::Tensor> keepAlive = {},
-        bool isBarrier = false);
-    c10::intrusive_ptr<c10d::Work> wrapP2PWork(
-        mooncakePgCompletion_t completion, FailedRanksHint failedRanksHint,
-        std::vector<at::Tensor> keepAlive = {},
         std::function<void()> postCompletion = {});
 
     const c10::intrusive_ptr<MooncakeBackendOptions> options_;
