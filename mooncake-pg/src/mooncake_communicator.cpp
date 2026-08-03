@@ -39,6 +39,18 @@ PGResult<void> checkRoot(int root, int max_group_size, const char* operation) {
     return {};
 }
 
+PGResult<void> checkP2PPeer(const TransferGroupMeta& meta, int peer,
+                            int max_group_size, const char* operation) {
+    PG_VALIDATE_ARG(peer >= 0 && peer < max_group_size,
+                    std::string(operation) + " peer is out of range");
+    // P2P may target inactive members, but reserved extension slots are not
+    // valid targets until they have an assigned global-rank mapping.
+    PG_VALIDATE_ARG(
+        meta.rank_order[peer] != kInvalidGlobalRank,
+        std::string(operation) + " peer is not assigned in this group");
+    return {};
+}
+
 PGResult<size_t> getByteCount(size_t count, DataType datatype) {
     switch (datatype) {
         case DataType::Int8:
@@ -644,8 +656,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::enqueueSend(
     PG_TRY(checkOpState(OpType::Send));
     PG_TRY(auto bytes, getByteCount(count, datatype));
     PG_VALIDATE_ARG(buffer || bytes == 0, "send buffer is null");
-    PG_VALIDATE_ARG(peer >= 0 && peer < max_group_size_,
-                    "P2P send peer is out of range");
+    PG_TRY(checkP2PPeer(*meta_, peer, max_group_size_, "P2P send"));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
     auto completion = std::make_shared<std::promise<void>>();
@@ -686,8 +697,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::enqueueRecv(
     PG_TRY(checkOpState(OpType::Recv));
     PG_TRY(auto bytes, getByteCount(count, datatype));
     PG_VALIDATE_ARG(buffer || bytes == 0, "recv buffer is null");
-    PG_VALIDATE_ARG(peer >= 0 && peer < max_group_size_,
-                    "P2P recv peer is out of range");
+    PG_TRY(checkP2PPeer(*meta_, peer, max_group_size_, "P2P recv"));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
     auto completion = std::make_shared<std::promise<void>>();
@@ -1387,8 +1397,7 @@ PGResult<void> MooncakeCommunicator::checkValidGroup(
         return makePGError(
             PGErrorCode::NotSupported,
             std::string(operation) +
-                " is unavailable because this communicator is running "
-                "local-only collectives");
+                " is unavailable because this communicator is invalid");
     }
     return {};
 }

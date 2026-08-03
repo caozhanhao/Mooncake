@@ -212,8 +212,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     bool shutdown_confirmed_ = false;
     std::unordered_set<GlobalRank> shutdown_pending_ranks_;
 
-    static constexpr auto kProposalAdmissionTimeout = std::chrono::seconds(20);
-    static constexpr auto kViewUpdateAckTimeout = std::chrono::seconds(20);
     static constexpr auto kHeartbeatTimeout = std::chrono::seconds(30);
 
     bool invalidateAgentSession(GlobalRank rank);

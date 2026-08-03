@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_PG_CONTROL_PLANE_RPC_H
 #define MOONCAKE_PG_CONTROL_PLANE_RPC_H
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <variant>
@@ -13,6 +14,9 @@
 #include "control_plane/control_types.h"
 
 namespace mooncake {
+
+inline constexpr auto kProposalAdmissionTimeout = std::chrono::seconds(20);
+inline constexpr auto kViewUpdateAckTimeout = std::chrono::seconds(20);
 
 // Agent -> Coordinator RPC messages
 

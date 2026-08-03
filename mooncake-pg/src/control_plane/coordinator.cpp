@@ -754,7 +754,7 @@ void CentralizedCoordinatorStateMachine::tryConfirmShutdown(
 bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
     GlobalRank a, GlobalRank b) const {
     PG_ASSERT(rankInRange(a) && rankInRange(b),
-              "linkStatus called with an out-of-range rank");
+              "isMutuallyConnected called with an out-of-range rank");
     if (ranks_[a].state == RankState::Offline ||
         ranks_[b].state == RankState::Offline)
         return false;

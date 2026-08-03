@@ -360,8 +360,15 @@ PGResult<ProposeViewUpdateResponse> AgentHost::proposeViewUpdateInternal(
     req.agent_session_id = agent_.getAgentSessionId();
     req.requested_ranks = ranks;
     req.is_activation = is_activation;
+
+    const auto coordinator_timeout =
+        kProposalAdmissionTimeout + kViewUpdateAckTimeout;
+    const auto rpc_timeout =
+        std::max(RpcClient::kDefaultRequestTimeout,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     2 * coordinator_timeout));
     return rpc_client_->call<&CoordinatorRpcService::proposeViewUpdate>(
-        coordinator_addr_, std::move(req));
+        coordinator_addr_, std::move(req), rpc_timeout);
 }
 
 PGResult<ProposeViewUpdateResponse> AgentHost::proposeActivate(

@@ -261,7 +261,7 @@ class MooncakeCommunicator {
         cudaStream_t stream, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count);
 
-    // Guard: checks that the rank is Healthy (always) and, for collectives,
+    // Guard: checks that the rank is not Offline (always) and, for collectives,
     // that it is active in this group. Called at the top of every operation.
     PGResult<void> checkOpState(OpType op) const;
 

@@ -100,7 +100,6 @@ typedef struct mooncakePgCommConfig {
     int32_t* activeRanksMirror;
     size_t activeRanksMirrorCount;
     int activeRanksMirrorIsDevice;
-    /* Device index for a device mirror; ignored for a CPU mirror. */
     int activeRanksMirrorDeviceIndex;
 } mooncakePgCommConfig_t;
 
