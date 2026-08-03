@@ -51,8 +51,7 @@ GpuStream& GpuStream::operator=(GpuStream&& other) noexcept {
 GpuStream GpuStream::createNonBlocking(int device) {
     const GpuDeviceGuard device_guard(device);
     cudaStream_t stream = nullptr;
-    PG_ASSERT_CUDA(
-        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    PG_ASSERT_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     return GpuStream(stream, device, true);
 }
 
@@ -124,7 +123,7 @@ GpuEvent& GpuEvent::operator=(GpuEvent&& other) noexcept {
 
 void GpuEvent::record(const GpuStream& stream) {
     PG_ASSERT(device_index_ == stream.deviceIndex(),
-             "CUDA event device does not match recording stream device");
+              "CUDA event device does not match recording stream device");
 
     const GpuDeviceGuard device_guard(device_index_);
     PG_ASSERT_CUDA(cudaEventRecord(event_, stream.get()));

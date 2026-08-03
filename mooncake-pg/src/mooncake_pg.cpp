@@ -106,8 +106,8 @@ mooncakePgResult_t asCApiResult(Function&& function) {
     }
 }
 
-PGResult<void> parseCommConfig(const mooncakePgCommConfig_t* config,
-                               MooncakeCommunicatorConfig& output) {
+PGResult<MooncakeCommunicatorConfig> parseCommConfig(
+    const mooncakePgCommConfig_t* config) {
     PG_VALIDATE_ARG(config, "communicator config is null");
     PG_VALIDATE_ARG(config->structSize >= sizeof(*config) &&
                         config->magic == MOONCAKE_PG_COMM_CONFIG_MAGIC &&
@@ -171,102 +171,76 @@ PGResult<void> parseCommConfig(const mooncakePgCommConfig_t* config,
                 ? -1
                 : config->activeRanksMirrorDeviceIndex;
     }
-    output = std::move(internal);
-    return {};
+    return internal;
 }
 
-PGResult<void> convertDataType(mooncakePgDataType_t data_type,
-                               DataType& output) {
+PGResult<DataType> convertDataType(mooncakePgDataType_t data_type) {
     switch (data_type) {
         case mooncakePgInt8:
-            output = DataType::Int8;
-            break;
+            return DataType::Int8;
         case mooncakePgUint8:
-            output = DataType::Uint8;
-            break;
+            return DataType::Uint8;
         case mooncakePgInt16:
-            output = DataType::Int16;
-            break;
+            return DataType::Int16;
         case mooncakePgUint16:
-            output = DataType::Uint16;
-            break;
+            return DataType::Uint16;
         case mooncakePgInt32:
-            output = DataType::Int32;
-            break;
+            return DataType::Int32;
         case mooncakePgUint32:
-            output = DataType::Uint32;
-            break;
+            return DataType::Uint32;
         case mooncakePgInt64:
-            output = DataType::Int64;
-            break;
+            return DataType::Int64;
         case mooncakePgUint64:
-            output = DataType::Uint64;
-            break;
+            return DataType::Uint64;
         case mooncakePgFloat16:
-            output = DataType::Float16;
-            break;
+            return DataType::Float16;
         case mooncakePgFloat32:
-            output = DataType::Float32;
-            break;
+            return DataType::Float32;
         case mooncakePgFloat64:
-            output = DataType::Float64;
-            break;
+            return DataType::Float64;
         case mooncakePgBfloat16:
-            output = DataType::Bfloat16;
-            break;
+            return DataType::Bfloat16;
         case mooncakePgBool:
-            output = DataType::Bool;
-            break;
+            return DataType::Bool;
         case mooncakePgFloat8e4m3fn:
-            output = DataType::Float8e4m3fn;
-            break;
+            return DataType::Float8e4m3fn;
         case mooncakePgFloat8e5m2:
-            output = DataType::Float8e5m2;
-            break;
+            return DataType::Float8e5m2;
         case mooncakePgFloat8e4m3fnuz:
-            output = DataType::Float8e4m3fnuz;
-            break;
+            return DataType::Float8e4m3fnuz;
         case mooncakePgFloat8e5m2fnuz:
-            output = DataType::Float8e5m2fnuz;
-            break;
+            return DataType::Float8e5m2fnuz;
         case mooncakePgFloat8e8m0fnu:
-            output = DataType::Float8e8m0fnu;
-            break;
+            return DataType::Float8e8m0fnu;
         default:
             return makePGError(PGErrorCode::InvalidArgument,
                                "unsupported Mooncake PG datatype");
     }
-    return {};
 }
 
-PGResult<void> convertReduceOp(mooncakePgReduceOp_t reduce_op,
-                               ReduceOp& output) {
+PGResult<ReduceOp> convertReduceOp(mooncakePgReduceOp_t reduce_op) {
     switch (reduce_op) {
         case mooncakePgSum:
-            output = ReduceOp::Sum;
-            break;
+            return ReduceOp::Sum;
         case mooncakePgAvg:
-            output = ReduceOp::Avg;
-            break;
+            return ReduceOp::Avg;
         case mooncakePgProduct:
-            output = ReduceOp::Product;
-            break;
+            return ReduceOp::Product;
         case mooncakePgMin:
-            output = ReduceOp::Min;
-            break;
+            return ReduceOp::Min;
         case mooncakePgMax:
-            output = ReduceOp::Max;
-            break;
+            return ReduceOp::Max;
         default:
             return makePGError(PGErrorCode::InvalidArgument,
                                "unsupported Mooncake PG reduction operation");
     }
-    return {};
 }
 
 cudaStream_t convertStream(mooncakePgStream_t stream) {
     return reinterpret_cast<cudaStream_t>(stream);
 }
+
+using CompletionResult = PGResult<std::unique_ptr<WorkCompletion>>;
 
 template <typename Launch>
 mooncakePgResult_t invokeCommOpWithCompletion(
@@ -278,9 +252,7 @@ mooncakePgResult_t invokeCommOpWithCompletion(
         PG_VALIDATE_ARG(comm && comm->impl, "invalid communicator");
 
         auto output = std::make_unique<mooncakePgCompletion>();
-        auto result = launch();
-        PG_TRY(result);
-        auto completion = std::move(result).value();
+        PG_TRY(auto completion, launch(*comm->impl));
         PG_ASSERT(completion, "operation returned no completion");
 
         output->impl = std::move(completion);
@@ -293,21 +265,19 @@ template <typename Launch>
 mooncakePgResult_t invokeCommOp(mooncakePgComm_t comm, Launch&& launch) {
     return asCApiResult([&]() -> PGResult<void> {
         PG_VALIDATE_ARG(comm && comm->impl, "invalid communicator");
-        return launch();
+        return launch(*comm->impl);
     });
 }
 
-PGResult<void> parseRanks(const int32_t* ranks, size_t rank_count,
-                          std::vector<int>& output) {
+PGResult<std::vector<int>> parseRanks(const int32_t* ranks, size_t rank_count) {
     PG_VALIDATE_ARG(rank_count <= MOONCAKE_PG_MAX_RANKS,
                     "rank count exceeds maximum");
     PG_VALIDATE_ARG(rank_count == 0 || ranks, "ranks are null");
-    if (rank_count == 0) {
-        output.clear();
-    } else {
+    std::vector<int> output;
+    if (rank_count != 0) {
         output.assign(ranks, ranks + rank_count);
     }
-    return {};
+    return output;
 }
 
 mooncakePgProposalResponse_t convertProposalResponse(
@@ -383,9 +353,7 @@ mooncakePgResult_t mooncakePgContextLaunchCoordinator(
         PG_VALIDATE_ARG(context && context->impl, "invalid context");
         PG_VALIDATE_ARG(coordinator_address_buf,
                         "coordinator-address output is null");
-        auto result = context->impl->launchCoordinator();
-        PG_TRY(result);
-        const auto& value = result.value();
+        PG_TRY(auto value, context->impl->launchCoordinator());
         PG_VALIDATE_ARG(value.size() < coordinator_address_buf_size,
                         "coordinator-address output is too small");
         std::memcpy(coordinator_address_buf, value.c_str(), value.size() + 1);
@@ -399,8 +367,7 @@ mooncakePgResult_t mooncakePgContextConnectCoordinator(
         PG_VALIDATE_ARG(context && context->impl, "invalid context");
         PG_VALIDATE_ARG(coordinator_address && coordinator_address[0] != '\0',
                         "coordinator address is null or empty");
-        PG_TRY(context->impl->connectCoordinator(coordinator_address));
-        return {};
+        return context->impl->connectCoordinator(coordinator_address);
     });
 }
 
@@ -480,17 +447,13 @@ mooncakePgResult_t mooncakePgCommCreate(mooncakePgContext_t context,
         PG_VALIDATE_ARG(comm, "communicator output is null");
         *comm = nullptr;
         PG_VALIDATE_ARG(context && context->impl, "invalid context");
-        MooncakeCommunicatorConfig internal;
-        PG_TRY(parseCommConfig(config, internal));
+        PG_TRY(auto internal, parseCommConfig(config));
 
         auto output = std::make_unique<mooncakePgComm>(*context->impl);
-        auto use_count_result = context->impl->incrementCommUseCount();
-        PG_TRY(use_count_result);
+        PG_TRY(context->impl->incrementCommUseCount());
         output->context_use_counted = true;
-        auto communicator_result =
-            MooncakeCommunicator::create(*context->impl, std::move(internal));
-        PG_TRY(communicator_result);
-        output->impl = std::move(communicator_result.value());
+        PG_TRY(output->impl, MooncakeCommunicator::create(*context->impl,
+                                                          std::move(internal)));
         *comm = output.release();
         return {};
     });
@@ -541,13 +504,14 @@ mooncakePgResult_t mooncakePgBroadcastGpu(const void* send_buffer,
                                           mooncakePgStream_t stream,
                                           int32_t* failed_ranks_hint,
                                           size_t failed_ranks_hint_count) {
-    return invokeCommOp(comm, [&]() -> PGResult<void> {
-        DataType converted_data_type;
-        PG_TRY(convertDataType(data_type, converted_data_type));
-        return comm->impl->broadcastGpu(
-            send_buffer, recv_buffer, count, converted_data_type, root,
-            convertStream(stream), failed_ranks_hint, failed_ranks_hint_count);
-    });
+    return invokeCommOp(
+        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.broadcastGpu(send_buffer, recv_buffer, count,
+                                     converted_data_type, root,
+                                     convertStream(stream), failed_ranks_hint,
+                                     failed_ranks_hint_count);
+        });
 }
 
 mooncakePgResult_t mooncakePgAllReduceGpu(
@@ -555,16 +519,15 @@ mooncakePgResult_t mooncakePgAllReduceGpu(
     mooncakePgDataType_t data_type, mooncakePgReduceOp_t reduce_op,
     mooncakePgComm_t comm, mooncakePgStream_t stream,
     int32_t* failed_ranks_hint, size_t failed_ranks_hint_count) {
-    return invokeCommOp(comm, [&]() -> PGResult<void> {
-        DataType converted_data_type;
-        PG_TRY(convertDataType(data_type, converted_data_type));
-        ReduceOp converted_reduce_op;
-        PG_TRY(convertReduceOp(reduce_op, converted_reduce_op));
-        return comm->impl->allReduceGpu(
-            send_buffer, recv_buffer, count, converted_data_type,
-            converted_reduce_op, convertStream(stream), failed_ranks_hint,
-            failed_ranks_hint_count);
-    });
+    return invokeCommOp(
+        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            PG_TRY(auto converted_reduce_op, convertReduceOp(reduce_op));
+            return impl.allReduceGpu(send_buffer, recv_buffer, count,
+                                     converted_data_type, converted_reduce_op,
+                                     convertStream(stream), failed_ranks_hint,
+                                     failed_ranks_hint_count);
+        });
 }
 
 mooncakePgResult_t mooncakePgAllGatherGpu(const void* send_buffer,
@@ -574,13 +537,14 @@ mooncakePgResult_t mooncakePgAllGatherGpu(const void* send_buffer,
                                           mooncakePgStream_t stream,
                                           int32_t* failed_ranks_hint,
                                           size_t failed_ranks_hint_count) {
-    return invokeCommOp(comm, [&]() -> PGResult<void> {
-        DataType converted_data_type;
-        PG_TRY(convertDataType(data_type, converted_data_type));
-        return comm->impl->allGatherGpu(
-            send_buffer, recv_buffer, count, converted_data_type,
-            convertStream(stream), failed_ranks_hint, failed_ranks_hint_count);
-    });
+    return invokeCommOp(
+        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.allGatherGpu(send_buffer, recv_buffer, count,
+                                     converted_data_type, convertStream(stream),
+                                     failed_ranks_hint,
+                                     failed_ranks_hint_count);
+        });
 }
 
 mooncakePgResult_t mooncakePgReduceScatterGpu(
@@ -588,16 +552,15 @@ mooncakePgResult_t mooncakePgReduceScatterGpu(
     mooncakePgDataType_t data_type, mooncakePgReduceOp_t reduce_op,
     mooncakePgComm_t comm, mooncakePgStream_t stream,
     int32_t* failed_ranks_hint, size_t failed_ranks_hint_count) {
-    return invokeCommOp(comm, [&]() -> PGResult<void> {
-        DataType converted_data_type;
-        PG_TRY(convertDataType(data_type, converted_data_type));
-        ReduceOp converted_reduce_op;
-        PG_TRY(convertReduceOp(reduce_op, converted_reduce_op));
-        return comm->impl->reduceScatterGpu(
-            send_buffer, recv_buffer, count, converted_data_type,
-            converted_reduce_op, convertStream(stream), failed_ranks_hint,
-            failed_ranks_hint_count);
-    });
+    return invokeCommOp(
+        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            PG_TRY(auto converted_reduce_op, convertReduceOp(reduce_op));
+            return impl.reduceScatterGpu(
+                send_buffer, recv_buffer, count, converted_data_type,
+                converted_reduce_op, convertStream(stream), failed_ranks_hint,
+                failed_ranks_hint_count);
+        });
 }
 
 mooncakePgResult_t mooncakePgAllToAllGpu(const void* send_buffer,
@@ -607,13 +570,13 @@ mooncakePgResult_t mooncakePgAllToAllGpu(const void* send_buffer,
                                          mooncakePgStream_t stream,
                                          int32_t* failed_ranks_hint,
                                          size_t failed_ranks_hint_count) {
-    return invokeCommOp(comm, [&]() -> PGResult<void> {
-        DataType converted_data_type;
-        PG_TRY(convertDataType(data_type, converted_data_type));
-        return comm->impl->allToAllGpu(
-            send_buffer, recv_buffer, count, converted_data_type,
-            convertStream(stream), failed_ranks_hint, failed_ranks_hint_count);
-    });
+    return invokeCommOp(
+        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.allToAllGpu(send_buffer, recv_buffer, count,
+                                    converted_data_type, convertStream(stream),
+                                    failed_ranks_hint, failed_ranks_hint_count);
+        });
 }
 
 mooncakePgResult_t mooncakePgReduceGpu(
@@ -621,16 +584,15 @@ mooncakePgResult_t mooncakePgReduceGpu(
     mooncakePgDataType_t data_type, mooncakePgReduceOp_t reduce_op, int root,
     mooncakePgComm_t comm, mooncakePgStream_t stream,
     int32_t* failed_ranks_hint, size_t failed_ranks_hint_count) {
-    return invokeCommOp(comm, [&]() -> PGResult<void> {
-        DataType converted_data_type;
-        PG_TRY(convertDataType(data_type, converted_data_type));
-        ReduceOp converted_reduce_op;
-        PG_TRY(convertReduceOp(reduce_op, converted_reduce_op));
-        return comm->impl->reduceGpu(
-            send_buffer, recv_buffer, count, converted_data_type,
-            converted_reduce_op, root, convertStream(stream), failed_ranks_hint,
-            failed_ranks_hint_count);
-    });
+    return invokeCommOp(
+        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            PG_TRY(auto converted_reduce_op, convertReduceOp(reduce_op));
+            return impl.reduceGpu(send_buffer, recv_buffer, count,
+                                  converted_data_type, converted_reduce_op,
+                                  root, convertStream(stream),
+                                  failed_ranks_hint, failed_ranks_hint_count);
+        });
 }
 
 mooncakePgResult_t mooncakePgGatherGpu(const void* send_buffer,
@@ -640,13 +602,14 @@ mooncakePgResult_t mooncakePgGatherGpu(const void* send_buffer,
                                        mooncakePgStream_t stream,
                                        int32_t* failed_ranks_hint,
                                        size_t failed_ranks_hint_count) {
-    return invokeCommOp(comm, [&]() -> PGResult<void> {
-        DataType converted_data_type;
-        PG_TRY(convertDataType(data_type, converted_data_type));
-        return comm->impl->gatherGpu(
-            send_buffer, recv_buffer, count, converted_data_type, root,
-            convertStream(stream), failed_ranks_hint, failed_ranks_hint_count);
-    });
+    return invokeCommOp(
+        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.gatherGpu(send_buffer, recv_buffer, count,
+                                  converted_data_type, root,
+                                  convertStream(stream), failed_ranks_hint,
+                                  failed_ranks_hint_count);
+        });
 }
 
 mooncakePgResult_t mooncakePgScatterGpu(const void* send_buffer,
@@ -656,22 +619,23 @@ mooncakePgResult_t mooncakePgScatterGpu(const void* send_buffer,
                                         mooncakePgStream_t stream,
                                         int32_t* failed_ranks_hint,
                                         size_t failed_ranks_hint_count) {
-    return invokeCommOp(comm, [&]() -> PGResult<void> {
-        DataType converted_data_type;
-        PG_TRY(convertDataType(data_type, converted_data_type));
-        return comm->impl->scatterGpu(
-            send_buffer, recv_buffer, count, converted_data_type, root,
-            convertStream(stream), failed_ranks_hint, failed_ranks_hint_count);
-    });
+    return invokeCommOp(
+        comm, [&](MooncakeCommunicator& impl) -> PGResult<void> {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.scatterGpu(send_buffer, recv_buffer, count,
+                                   converted_data_type, root,
+                                   convertStream(stream), failed_ranks_hint,
+                                   failed_ranks_hint_count);
+        });
 }
 
 mooncakePgResult_t mooncakePgBarrierGpu(mooncakePgComm_t comm,
                                         mooncakePgStream_t stream,
                                         int32_t* failed_ranks_hint,
                                         size_t failed_ranks_hint_count) {
-    return invokeCommOp(comm, [&]() -> PGResult<void> {
-        return comm->impl->barrierGpu(convertStream(stream), failed_ranks_hint,
-                                      failed_ranks_hint_count);
+    return invokeCommOp(comm, [&](MooncakeCommunicator& impl) {
+        return impl.barrierGpu(convertStream(stream), failed_ranks_hint,
+                               failed_ranks_hint_count);
     });
 }
 
@@ -683,10 +647,9 @@ mooncakePgResult_t mooncakePgBroadcastCpu(const void* send_buffer,
                                           size_t failed_ranks_hint_count,
                                           mooncakePgCompletion_t* completion) {
     return invokeCommOpWithCompletion(
-        comm, completion, [&]() -> PGResult<std::unique_ptr<WorkCompletion>> {
-            DataType converted_data_type;
-            PG_TRY(convertDataType(data_type, converted_data_type));
-            return comm->impl->broadcastCpu(
+        comm, completion, [&](MooncakeCommunicator& impl) -> CompletionResult {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.broadcastCpu(
                 send_buffer, recv_buffer, count, converted_data_type, root,
                 failed_ranks_hint, failed_ranks_hint_count);
         });
@@ -698,15 +661,13 @@ mooncakePgResult_t mooncakePgAllReduceCpu(
     mooncakePgComm_t comm, int32_t* failed_ranks_hint,
     size_t failed_ranks_hint_count, mooncakePgCompletion_t* completion) {
     return invokeCommOpWithCompletion(
-        comm, completion, [&]() -> PGResult<std::unique_ptr<WorkCompletion>> {
-            DataType converted_data_type;
-            PG_TRY(convertDataType(data_type, converted_data_type));
-            ReduceOp converted_reduce_op;
-            PG_TRY(convertReduceOp(reduce_op, converted_reduce_op));
-            return comm->impl->allReduceCpu(
-                send_buffer, recv_buffer, count, converted_data_type,
-                converted_reduce_op, failed_ranks_hint,
-                failed_ranks_hint_count);
+        comm, completion, [&](MooncakeCommunicator& impl) -> CompletionResult {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            PG_TRY(auto converted_reduce_op, convertReduceOp(reduce_op));
+            return impl.allReduceCpu(send_buffer, recv_buffer, count,
+                                     converted_data_type, converted_reduce_op,
+                                     failed_ranks_hint,
+                                     failed_ranks_hint_count);
         });
 }
 
@@ -718,12 +679,11 @@ mooncakePgResult_t mooncakePgAllGatherCpu(const void* send_buffer,
                                           size_t failed_ranks_hint_count,
                                           mooncakePgCompletion_t* completion) {
     return invokeCommOpWithCompletion(
-        comm, completion, [&]() -> PGResult<std::unique_ptr<WorkCompletion>> {
-            DataType converted_data_type;
-            PG_TRY(convertDataType(data_type, converted_data_type));
-            return comm->impl->allGatherCpu(
-                send_buffer, recv_buffer, count, converted_data_type,
-                failed_ranks_hint, failed_ranks_hint_count);
+        comm, completion, [&](MooncakeCommunicator& impl) -> CompletionResult {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.allGatherCpu(send_buffer, recv_buffer, count,
+                                     converted_data_type, failed_ranks_hint,
+                                     failed_ranks_hint_count);
         });
 }
 
@@ -733,15 +693,13 @@ mooncakePgResult_t mooncakePgReduceScatterCpu(
     mooncakePgComm_t comm, int32_t* failed_ranks_hint,
     size_t failed_ranks_hint_count, mooncakePgCompletion_t* completion) {
     return invokeCommOpWithCompletion(
-        comm, completion, [&]() -> PGResult<std::unique_ptr<WorkCompletion>> {
-            DataType converted_data_type;
-            PG_TRY(convertDataType(data_type, converted_data_type));
-            ReduceOp converted_reduce_op;
-            PG_TRY(convertReduceOp(reduce_op, converted_reduce_op));
-            return comm->impl->reduceScatterCpu(
-                send_buffer, recv_buffer, count, converted_data_type,
-                converted_reduce_op, failed_ranks_hint,
-                failed_ranks_hint_count);
+        comm, completion, [&](MooncakeCommunicator& impl) -> CompletionResult {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            PG_TRY(auto converted_reduce_op, convertReduceOp(reduce_op));
+            return impl.reduceScatterCpu(send_buffer, recv_buffer, count,
+                                         converted_data_type,
+                                         converted_reduce_op, failed_ranks_hint,
+                                         failed_ranks_hint_count);
         });
 }
 
@@ -753,12 +711,11 @@ mooncakePgResult_t mooncakePgAllToAllCpu(const void* send_buffer,
                                          size_t failed_ranks_hint_count,
                                          mooncakePgCompletion_t* completion) {
     return invokeCommOpWithCompletion(
-        comm, completion, [&]() -> PGResult<std::unique_ptr<WorkCompletion>> {
-            DataType converted_data_type;
-            PG_TRY(convertDataType(data_type, converted_data_type));
-            return comm->impl->allToAllCpu(
-                send_buffer, recv_buffer, count, converted_data_type,
-                failed_ranks_hint, failed_ranks_hint_count);
+        comm, completion, [&](MooncakeCommunicator& impl) -> CompletionResult {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.allToAllCpu(send_buffer, recv_buffer, count,
+                                    converted_data_type, failed_ranks_hint,
+                                    failed_ranks_hint_count);
         });
 }
 
@@ -768,15 +725,13 @@ mooncakePgResult_t mooncakePgReduceCpu(
     mooncakePgComm_t comm, int32_t* failed_ranks_hint,
     size_t failed_ranks_hint_count, mooncakePgCompletion_t* completion) {
     return invokeCommOpWithCompletion(
-        comm, completion, [&]() -> PGResult<std::unique_ptr<WorkCompletion>> {
-            DataType converted_data_type;
-            PG_TRY(convertDataType(data_type, converted_data_type));
-            ReduceOp converted_reduce_op;
-            PG_TRY(convertReduceOp(reduce_op, converted_reduce_op));
-            return comm->impl->reduceCpu(
-                send_buffer, recv_buffer, count, converted_data_type,
-                converted_reduce_op, root, failed_ranks_hint,
-                failed_ranks_hint_count);
+        comm, completion, [&](MooncakeCommunicator& impl) -> CompletionResult {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            PG_TRY(auto converted_reduce_op, convertReduceOp(reduce_op));
+            return impl.reduceCpu(send_buffer, recv_buffer, count,
+                                  converted_data_type, converted_reduce_op,
+                                  root, failed_ranks_hint,
+                                  failed_ranks_hint_count);
         });
 }
 
@@ -788,12 +743,11 @@ mooncakePgResult_t mooncakePgGatherCpu(const void* send_buffer,
                                        size_t failed_ranks_hint_count,
                                        mooncakePgCompletion_t* completion) {
     return invokeCommOpWithCompletion(
-        comm, completion, [&]() -> PGResult<std::unique_ptr<WorkCompletion>> {
-            DataType converted_data_type;
-            PG_TRY(convertDataType(data_type, converted_data_type));
-            return comm->impl->gatherCpu(
-                send_buffer, recv_buffer, count, converted_data_type, root,
-                failed_ranks_hint, failed_ranks_hint_count);
+        comm, completion, [&](MooncakeCommunicator& impl) -> CompletionResult {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.gatherCpu(send_buffer, recv_buffer, count,
+                                  converted_data_type, root, failed_ranks_hint,
+                                  failed_ranks_hint_count);
         });
 }
 
@@ -805,12 +759,11 @@ mooncakePgResult_t mooncakePgScatterCpu(const void* send_buffer,
                                         size_t failed_ranks_hint_count,
                                         mooncakePgCompletion_t* completion) {
     return invokeCommOpWithCompletion(
-        comm, completion, [&]() -> PGResult<std::unique_ptr<WorkCompletion>> {
-            DataType converted_data_type;
-            PG_TRY(convertDataType(data_type, converted_data_type));
-            return comm->impl->scatterCpu(
-                send_buffer, recv_buffer, count, converted_data_type, root,
-                failed_ranks_hint, failed_ranks_hint_count);
+        comm, completion, [&](MooncakeCommunicator& impl) -> CompletionResult {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.scatterCpu(send_buffer, recv_buffer, count,
+                                   converted_data_type, root, failed_ranks_hint,
+                                   failed_ranks_hint_count);
         });
 }
 
@@ -819,9 +772,8 @@ mooncakePgResult_t mooncakePgBarrierCpu(mooncakePgComm_t comm,
                                         size_t failed_ranks_hint_count,
                                         mooncakePgCompletion_t* completion) {
     return invokeCommOpWithCompletion(
-        comm, completion, [&]() -> PGResult<std::unique_ptr<WorkCompletion>> {
-            return comm->impl->barrierCpu(failed_ranks_hint,
-                                          failed_ranks_hint_count);
+        comm, completion, [&](MooncakeCommunicator& impl) {
+            return impl.barrierCpu(failed_ranks_hint, failed_ranks_hint_count);
         });
 }
 
@@ -833,13 +785,11 @@ mooncakePgResult_t mooncakePgSendGpu(const void* send_buffer, size_t count,
                                      size_t failed_ranks_hint_count,
                                      mooncakePgCompletion_t* completion) {
     return invokeCommOpWithCompletion(
-        comm, completion, [&]() -> PGResult<std::unique_ptr<WorkCompletion>> {
-            DataType converted_data_type;
-            PG_TRY(convertDataType(data_type, converted_data_type));
-            return comm->impl->sendGpu(send_buffer, count, converted_data_type,
-                                       peer, convertStream(stream),
-                                       failed_ranks_hint,
-                                       failed_ranks_hint_count);
+        comm, completion, [&](MooncakeCommunicator& impl) -> CompletionResult {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.sendGpu(send_buffer, count, converted_data_type, peer,
+                                convertStream(stream), failed_ranks_hint,
+                                failed_ranks_hint_count);
         });
 }
 
@@ -851,13 +801,11 @@ mooncakePgResult_t mooncakePgRecvGpu(void* recv_buffer, size_t count,
                                      size_t failed_ranks_hint_count,
                                      mooncakePgCompletion_t* completion) {
     return invokeCommOpWithCompletion(
-        comm, completion, [&]() -> PGResult<std::unique_ptr<WorkCompletion>> {
-            DataType converted_data_type;
-            PG_TRY(convertDataType(data_type, converted_data_type));
-            return comm->impl->recvGpu(recv_buffer, count, converted_data_type,
-                                       peer, convertStream(stream),
-                                       failed_ranks_hint,
-                                       failed_ranks_hint_count);
+        comm, completion, [&](MooncakeCommunicator& impl) -> CompletionResult {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.recvGpu(recv_buffer, count, converted_data_type, peer,
+                                convertStream(stream), failed_ranks_hint,
+                                failed_ranks_hint_count);
         });
 }
 
@@ -868,12 +816,10 @@ mooncakePgResult_t mooncakePgSendCpu(const void* send_buffer, size_t count,
                                      size_t failed_ranks_hint_count,
                                      mooncakePgCompletion_t* completion) {
     return invokeCommOpWithCompletion(
-        comm, completion, [&]() -> PGResult<std::unique_ptr<WorkCompletion>> {
-            DataType converted_data_type;
-            PG_TRY(convertDataType(data_type, converted_data_type));
-            return comm->impl->sendCpu(send_buffer, count, converted_data_type,
-                                       peer, failed_ranks_hint,
-                                       failed_ranks_hint_count);
+        comm, completion, [&](MooncakeCommunicator& impl) -> CompletionResult {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.sendCpu(send_buffer, count, converted_data_type, peer,
+                                failed_ranks_hint, failed_ranks_hint_count);
         });
 }
 
@@ -884,12 +830,10 @@ mooncakePgResult_t mooncakePgRecvCpu(void* recv_buffer, size_t count,
                                      size_t failed_ranks_hint_count,
                                      mooncakePgCompletion_t* completion) {
     return invokeCommOpWithCompletion(
-        comm, completion, [&]() -> PGResult<std::unique_ptr<WorkCompletion>> {
-            DataType converted_data_type;
-            PG_TRY(convertDataType(data_type, converted_data_type));
-            return comm->impl->recvCpu(recv_buffer, count, converted_data_type,
-                                       peer, failed_ranks_hint,
-                                       failed_ranks_hint_count);
+        comm, completion, [&](MooncakeCommunicator& impl) -> CompletionResult {
+            PG_TRY(auto converted_data_type, convertDataType(data_type));
+            return impl.recvCpu(recv_buffer, count, converted_data_type, peer,
+                                failed_ranks_hint, failed_ranks_hint_count);
         });
 }
 
@@ -948,11 +892,8 @@ mooncakePgResult_t mooncakePgCommGetPeerState(mooncakePgComm_t comm,
         PG_VALIDATE_ARG(comm && comm->impl, "invalid communicator");
         PG_VALIDATE_ARG(rank_count == 0 || peer_states,
                         "peer-states output is null");
-        std::vector<int> parsed_ranks;
-        PG_TRY(parseRanks(ranks, rank_count, parsed_ranks));
-        auto result = comm->impl->getPeerState(parsed_ranks);
-        PG_TRY(result);
-        const auto& states = result.value();
+        PG_TRY(auto parsed_ranks, parseRanks(ranks, rank_count));
+        PG_TRY(auto states, comm->impl->getPeerState(parsed_ranks));
         for (size_t index = 0; index < states.size(); ++index) {
             peer_states[index] = states[index] ? 1 : 0;
         }
@@ -966,11 +907,9 @@ mooncakePgResult_t mooncakePgCommActivateRanks(
     return asCApiResult([&]() -> PGResult<void> {
         PG_VALIDATE_ARG(comm && comm->impl, "invalid communicator");
         PG_VALIDATE_ARG(response, "proposal response is null");
-        std::vector<int> parsed_ranks;
-        PG_TRY(parseRanks(ranks, rank_count, parsed_ranks));
-        auto result = comm->impl->activateRanks(parsed_ranks);
-        PG_TRY(result);
-        *response = convertProposalResponse(result.value());
+        PG_TRY(auto parsed_ranks, parseRanks(ranks, rank_count));
+        PG_TRY(auto proposal_response, comm->impl->activateRanks(parsed_ranks));
+        *response = convertProposalResponse(proposal_response);
         return {};
     });
 }
@@ -981,11 +920,10 @@ mooncakePgResult_t mooncakePgCommDeactivateRanks(
     return asCApiResult([&]() -> PGResult<void> {
         PG_VALIDATE_ARG(comm && comm->impl, "invalid communicator");
         PG_VALIDATE_ARG(response, "proposal response is null");
-        std::vector<int> parsed_ranks;
-        PG_TRY(parseRanks(ranks, rank_count, parsed_ranks));
-        auto result = comm->impl->deactivateRanks(parsed_ranks);
-        PG_TRY(result);
-        *response = convertProposalResponse(result.value());
+        PG_TRY(auto parsed_ranks, parseRanks(ranks, rank_count));
+        PG_TRY(auto proposal_response,
+               comm->impl->deactivateRanks(parsed_ranks));
+        *response = convertProposalResponse(proposal_response);
         return {};
     });
 }
@@ -1002,9 +940,7 @@ mooncakePgResult_t mooncakePgCommSyncAfterFailure(
     return asCApiResult([&]() -> PGResult<void> {
         PG_VALIDATE_ARG(comm && comm->impl, "invalid communicator");
         PG_VALIDATE_ARG(response, "sync response is null");
-        auto result = comm->impl->syncAfterFailure();
-        PG_TRY(result);
-        const auto& sync_response = result.value();
+        PG_TRY(auto sync_response, comm->impl->syncAfterFailure());
         std::memset(response, 0, sizeof(*response));
         response->status = static_cast<mooncakePgSyncAfterFailureStatus_t>(
             sync_response.status);
@@ -1042,9 +978,7 @@ mooncakePgResult_t mooncakePgCommGetPreferredHca(mooncakePgComm_t comm,
         PG_VALIDATE_ARG(comm && comm->impl, "invalid communicator");
         PG_VALIDATE_ARG(location && hca_buf && hca_buf_size != 0,
                         "invalid preferred-HCA output arguments");
-        auto result = comm->impl->getPreferredHca(location);
-        PG_TRY(result);
-        const auto& value = result.value();
+        PG_TRY(auto value, comm->impl->getPreferredHca(location));
         PG_VALIDATE_ARG(value.size() < hca_buf_size,
                         "preferred-HCA output is too small");
         std::memcpy(hca_buf, value.c_str(), value.size() + 1);

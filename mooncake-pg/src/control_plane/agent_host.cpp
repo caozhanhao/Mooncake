@@ -26,10 +26,7 @@ uint64_t generateInitialAgentSessionId() {
 template <auto Func, typename Request>
 PGResult<void> callAndCheck(RpcClient& client, const std::string& addr,
                             Request request) {
-    auto result = client.call<Func>(addr, std::move(request));
-    PG_TRY(result);
-
-    auto response = std::move(result).value();
+    PG_TRY(auto response, client.call<Func>(addr, std::move(request)));
     if (!response.success) {
         return makePGError(PGErrorCode::InvalidState,
                            std::string(coro_rpc::get_func_name<Func>()) +
@@ -112,8 +109,7 @@ PGResult<void> AgentHost::start() {
     executor_.setTickCallback([this]() { tick(); });
     executor_.start();
 
-    PG_TRY(executor_.post([this]() { startAgentRegistration(); }));
-    return {};
+    return executor_.post([this]() { startAgentRegistration(); });
 }
 
 void AgentHost::shutdown() {
@@ -270,11 +266,9 @@ PGResult<GroupId> AgentHost::registerGroup(
             req.resolve_policy = resolve_policy;
             req.auto_deactivate = auto_deactivate;
 
-            auto result =
-                rpc_client_->call<&CoordinatorRpcService::registerGroup>(
-                    coordinator_addr_, std::move(req));
-            PG_TRY(result);
-            auto resp = std::move(result).value();
+            PG_TRY(auto resp,
+                   rpc_client_->call<&CoordinatorRpcService::registerGroup>(
+                       coordinator_addr_, std::move(req)));
 
             if (!resp.success) {
                 // A rejected group must not affect the process-scoped Agent.
@@ -406,10 +400,9 @@ PGResult<SyncAfterFailureResponse> AgentHost::syncAfterFailure(
         std::chrono::ceil<std::chrono::milliseconds>(reconciliation_window);
     const auto rpc_timeout =
         std::max(RpcClient::kDefaultRequestTimeout, 2 * reconciliation_timeout);
-    auto result = rpc_client_->call<&CoordinatorRpcService::syncAfterFailure>(
-        coordinator_addr_, req, rpc_timeout);
-    PG_TRY(result);
-    auto response = std::move(result).value();
+    PG_TRY(auto response,
+           rpc_client_->call<&CoordinatorRpcService::syncAfterFailure>(
+               coordinator_addr_, req, rpc_timeout));
     if (response.status == SyncAfterFailureStatus::Rejected) {
         return makePGError(
             PGErrorCode::InvalidState,
@@ -425,9 +418,8 @@ PGResult<SyncAfterFailureResponse> AgentHost::syncAfterFailure(
             agent_.handleLinkEventReportAck(*response.link_event_report_ack);
         }
 
-        auto apply_result = agent_.applyGroupView(response.view);
-        PG_TRY(apply_result);
-        runEffects(std::move(apply_result).value());
+        PG_TRY(auto effects, agent_.applyGroupView(response.view));
+        runEffects(effects);
         return {};
     }));
     return response;

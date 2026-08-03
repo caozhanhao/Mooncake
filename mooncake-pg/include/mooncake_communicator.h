@@ -66,8 +66,7 @@ struct MooncakePGContext {
 
     PGResult<void> initialize(int rank, int world_size);
     PGResult<std::string> launchCoordinator();
-    PGResult<AgentHost*> connectCoordinator(
-        const std::string& coordinator_address);
+    PGResult<void> connectCoordinator(const std::string& coordinator_address);
     PGResult<void> setHostIp(std::string value);
     PGResult<void> setExternalEngine(TransferEngine* transfer_engine);
     PGResult<void> setDeviceFilter(std::vector<std::string> filters);
@@ -81,6 +80,7 @@ struct MooncakePGContext {
    private:
     PGResult<void> checkRunning() const;
 
+    std::vector<std::string> device_filters_;
     std::mutex state_mutex_;
     size_t comm_use_count_ = 0;
     bool initialized_ = false;

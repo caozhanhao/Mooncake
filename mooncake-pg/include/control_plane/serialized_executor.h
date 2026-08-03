@@ -126,17 +126,16 @@ class SerializedExecutor {
     // Returns InvalidState if the executor is not running.
     PGResult<void> post(std::function<void()> task) {
         PG_VALIDATE_STATE(running_.load(std::memory_order_acquire),
-                          "SerializedExecutor(" + name_ +
-                              ") is not running");
+                          "SerializedExecutor(" + name_ + ") is not running");
         {
             std::lock_guard<std::mutex> lock(mutex_);
             // Double-check: running_ may have flipped between the check above
             // and acquiring the mutex.  If the executor has stopped, drop
             // the task to avoid leaking it (shutdown already drained the
             // queue).
-            PG_VALIDATE_STATE(running_.load(std::memory_order_acquire),
-                              "SerializedExecutor(" + name_ +
-                                  ") is not running");
+            PG_VALIDATE_STATE(
+                running_.load(std::memory_order_acquire),
+                "SerializedExecutor(" + name_ + ") is not running");
             queue_.push_back(std::move(task));
         }
         cv_.notify_one();
