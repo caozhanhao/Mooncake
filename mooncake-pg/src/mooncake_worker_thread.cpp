@@ -1,6 +1,5 @@
 #include <cuda_alike.h>
 #include <algorithm>
-#include <exception>
 #include <thread>
 #include <mooncake_worker.cuh>
 #include <mooncake_communicator.h>
@@ -413,26 +412,13 @@ void MooncakeWorker::startWorker() {
 
                         if (task_detected_failure[i] &&
                             group->autoSyncOnFailure) {
-                            SyncAfterFailureResponse response;
-                            try {
-                                response =
-                                    group->communicator->syncAfterFailure();
-                            } catch (const std::exception& e) {
-                                LOG(FATAL)
-                                    << "syncAfterFailure RPC failed for rank "
-                                    << group->globalRank << ": " << e.what();
-                            } catch (...) {
-                                LOG(FATAL)
-                                    << "syncAfterFailure RPC failed for rank "
-                                    << group->globalRank
-                                    << " with an unknown exception";
-                            }
-                            if (response.status ==
-                                SyncAfterFailureStatus::Rejected) {
-                                LOG(FATAL)
-                                    << "syncAfterFailure rejected for rank "
+                            auto result =
+                                group->communicator->syncAfterFailure();
+                            if (!result.has_value()) {
+                                LOG(ERROR)
+                                    << "syncAfterFailure failed for rank "
                                     << group->globalRank << ": "
-                                    << response.reject_reason;
+                                    << result.error().message;
                             }
                         }
 

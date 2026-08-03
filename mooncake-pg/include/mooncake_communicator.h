@@ -16,10 +16,10 @@
 #include "control_plane/agent_host.h"
 #include "control_plane/coordinator_host.h"
 #include "control_plane/link_manager.h"
+#include "error_types.h"
 #include "mooncake_pg.h"
 #include "mooncake_worker.cuh"
 #include "p2p_proxy.h"
-#include "pg_utils.h"
 #include "comm_types.h"
 
 namespace mooncake {
@@ -64,21 +64,22 @@ struct MooncakePGContext {
     MooncakePGContext(const MooncakePGContext&) = delete;
     MooncakePGContext& operator=(const MooncakePGContext&) = delete;
 
-    void initialize(int rank, int world_size);
-    std::string launchCoordinator();
-    AgentHost& connectCoordinator(const std::string& coordinator_address);
-    void setHostIp(std::string value);
-    void setExternalEngine(TransferEngine* transfer_engine);
-    void setDeviceFilter(std::vector<std::string> filters);
-    void setCollectiveTimeout(size_t timeout_us);
-    void setP2PTimeout(int64_t timeout_us);
-    void setFaultReconciliationWindow(int64_t timeout_us);
-    void incrementCommUseCount();
+    PGResult<void> initialize(int rank, int world_size);
+    PGResult<std::string> launchCoordinator();
+    PGResult<AgentHost*> connectCoordinator(
+        const std::string& coordinator_address);
+    PGResult<void> setHostIp(std::string value);
+    PGResult<void> setExternalEngine(TransferEngine* transfer_engine);
+    PGResult<void> setDeviceFilter(std::vector<std::string> filters);
+    PGResult<void> setCollectiveTimeout(size_t timeout_us);
+    PGResult<void> setP2PTimeout(int64_t timeout_us);
+    PGResult<void> setFaultReconciliationWindow(int64_t timeout_us);
+    PGResult<void> incrementCommUseCount();
     void decrementCommUseCount() noexcept;
-    Expected<void, ResourceBusyError> shutdown();
+    PGResult<void> shutdown();
 
    private:
-    void requireRunning() const;
+    PGResult<void> checkRunning() const;
 
     std::mutex state_mutex_;
     size_t comm_use_count_ = 0;
@@ -109,8 +110,8 @@ struct MooncakeCommunicatorConfig {
 
 class MooncakeCommunicator {
    public:
-    MooncakeCommunicator(MooncakePGContext& context,
-                         MooncakeCommunicatorConfig config);
+    static PGResult<std::unique_ptr<MooncakeCommunicator>> create(
+        MooncakePGContext& context, MooncakeCommunicatorConfig config);
     ~MooncakeCommunicator();
 
     MooncakeCommunicator(const MooncakeCommunicator&) = delete;
@@ -121,87 +122,103 @@ class MooncakeCommunicator {
     int getMaxGroupSize() const { return max_group_size_; }
     bool isCpu() const { return is_cpu_; }
 
-    std::unique_ptr<WorkCompletion> sendCpu(const void* buffer, size_t bytes,
-                                            int peer,
-                                            int32_t* failed_ranks_hint);
-    std::unique_ptr<WorkCompletion> sendGpu(const void* buffer, size_t bytes,
-                                            int peer, cudaStream_t stream,
-                                            int32_t* failed_ranks_hint);
-    std::unique_ptr<WorkCompletion> recvCpu(void* buffer, size_t bytes,
-                                            int peer,
-                                            int32_t* failed_ranks_hint);
-    std::unique_ptr<WorkCompletion> recvGpu(void* buffer, size_t bytes,
-                                            int peer, cudaStream_t stream,
-                                            int32_t* failed_ranks_hint);
+    PGResult<std::unique_ptr<WorkCompletion>> sendCpu(
+        const void* buffer, size_t count, DataType datatype, int peer,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count);
+    PGResult<std::unique_ptr<WorkCompletion>> sendGpu(
+        const void* buffer, size_t count, DataType datatype, int peer,
+        cudaStream_t stream, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count);
+    PGResult<std::unique_ptr<WorkCompletion>> recvCpu(
+        void* buffer, size_t count, DataType datatype, int peer,
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count);
+    PGResult<std::unique_ptr<WorkCompletion>> recvGpu(
+        void* buffer, size_t count, DataType datatype, int peer,
+        cudaStream_t stream, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count);
 
-    std::unique_ptr<WorkCompletion> broadcastCpu(const void* send_buffer,
-                                                 void* recv_buffer,
-                                                 size_t bytes, int root,
-                                                 int32_t* failed_ranks_hint);
-    void broadcastGpu(const void* send_buffer, void* recv_buffer, size_t bytes,
-                      int root, cudaStream_t stream,
-                      int32_t* failed_ranks_hint);
-    std::unique_ptr<WorkCompletion> allReduceCpu(const void* send_buffer,
-                                                 void* recv_buffer,
-                                                 size_t bytes,
-                                                 DataType datatype, ReduceOp op,
-                                                 int32_t* failed_ranks_hint);
-    void allReduceGpu(const void* send_buffer, void* recv_buffer, size_t bytes,
-                      DataType datatype, ReduceOp op, cudaStream_t stream,
-                      int32_t* failed_ranks_hint);
-    std::unique_ptr<WorkCompletion> allGatherCpu(const void* send_buffer,
-                                                 void* recv_buffer,
-                                                 size_t send_bytes,
-                                                 int32_t* failed_ranks_hint);
-    void allGatherGpu(const void* send_buffer, void* recv_buffer,
-                      size_t send_bytes, cudaStream_t stream,
-                      int32_t* failed_ranks_hint);
-    std::unique_ptr<WorkCompletion> reduceScatterCpu(
-        const void* send_buffer, void* recv_buffer, size_t recv_bytes,
-        DataType datatype, ReduceOp op, int32_t* failed_ranks_hint);
-    void reduceScatterGpu(const void* send_buffer, void* recv_buffer,
-                          size_t recv_bytes, DataType datatype, ReduceOp op,
-                          cudaStream_t stream, int32_t* failed_ranks_hint);
-    std::unique_ptr<WorkCompletion> allToAllCpu(const void* send_buffer,
-                                                void* recv_buffer,
-                                                size_t peer_bytes,
-                                                int32_t* failed_ranks_hint);
-    void allToAllGpu(const void* send_buffer, void* recv_buffer,
-                     size_t peer_bytes, cudaStream_t stream,
-                     int32_t* failed_ranks_hint);
-    std::unique_ptr<WorkCompletion> barrierCpu(int32_t* failed_ranks_hint);
-    void barrierGpu(cudaStream_t stream, int32_t* failed_ranks_hint);
-    std::unique_ptr<WorkCompletion> reduceCpu(const void* send_buffer,
-                                              void* recv_buffer, size_t bytes,
-                                              DataType datatype, ReduceOp op,
-                                              int root,
-                                              int32_t* failed_ranks_hint);
-    void reduceGpu(const void* send_buffer, void* recv_buffer, size_t bytes,
-                   DataType datatype, ReduceOp op, int root,
-                   cudaStream_t stream, int32_t* failed_ranks_hint);
-    std::unique_ptr<WorkCompletion> gatherCpu(const void* send_buffer,
-                                              void* recv_buffer,
-                                              size_t send_bytes, int root,
-                                              int32_t* failed_ranks_hint);
-    void gatherGpu(const void* send_buffer, void* recv_buffer,
-                   size_t send_bytes, int root, cudaStream_t stream,
-                   int32_t* failed_ranks_hint);
-    std::unique_ptr<WorkCompletion> scatterCpu(const void* send_buffer,
-                                               void* recv_buffer,
-                                               size_t recv_bytes, int root,
-                                               int32_t* failed_ranks_hint);
-    void scatterGpu(const void* send_buffer, void* recv_buffer,
-                    size_t recv_bytes, int root, cudaStream_t stream,
-                    int32_t* failed_ranks_hint);
+    PGResult<std::unique_ptr<WorkCompletion>> broadcastCpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, int root, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count);
+    PGResult<void> broadcastGpu(const void* send_buffer, void* recv_buffer,
+                                size_t count, DataType datatype, int root,
+                                cudaStream_t stream, int32_t* failed_ranks_hint,
+                                size_t failed_ranks_hint_count);
+    PGResult<std::unique_ptr<WorkCompletion>> allReduceCpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, ReduceOp op, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count);
+    PGResult<void> allReduceGpu(const void* send_buffer, void* recv_buffer,
+                                size_t count, DataType datatype, ReduceOp op,
+                                cudaStream_t stream, int32_t* failed_ranks_hint,
+                                size_t failed_ranks_hint_count);
+    PGResult<std::unique_ptr<WorkCompletion>> allGatherCpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count);
+    PGResult<void> allGatherGpu(const void* send_buffer, void* recv_buffer,
+                                size_t count, DataType datatype,
+                                cudaStream_t stream, int32_t* failed_ranks_hint,
+                                size_t failed_ranks_hint_count);
+    PGResult<std::unique_ptr<WorkCompletion>> reduceScatterCpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, ReduceOp op, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count);
+    PGResult<void> reduceScatterGpu(const void* send_buffer, void* recv_buffer,
+                                    size_t count, DataType datatype,
+                                    ReduceOp op, cudaStream_t stream,
+                                    int32_t* failed_ranks_hint,
+                                    size_t failed_ranks_hint_count);
+    PGResult<std::unique_ptr<WorkCompletion>> allToAllCpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count);
+    PGResult<void> allToAllGpu(const void* send_buffer, void* recv_buffer,
+                               size_t count, DataType datatype,
+                               cudaStream_t stream, int32_t* failed_ranks_hint,
+                               size_t failed_ranks_hint_count);
+    PGResult<std::unique_ptr<WorkCompletion>> barrierCpu(
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count);
+    PGResult<void> barrierGpu(cudaStream_t stream, int32_t* failed_ranks_hint,
+                              size_t failed_ranks_hint_count);
+    PGResult<std::unique_ptr<WorkCompletion>> reduceCpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, ReduceOp op, int root, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count);
+    PGResult<void> reduceGpu(const void* send_buffer, void* recv_buffer,
+                             size_t count, DataType datatype, ReduceOp op,
+                             int root, cudaStream_t stream,
+                             int32_t* failed_ranks_hint,
+                             size_t failed_ranks_hint_count);
+    PGResult<std::unique_ptr<WorkCompletion>> gatherCpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, int root, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count);
+    PGResult<void> gatherGpu(const void* send_buffer, void* recv_buffer,
+                             size_t count, DataType datatype, int root,
+                             cudaStream_t stream, int32_t* failed_ranks_hint,
+                             size_t failed_ranks_hint_count);
+    PGResult<std::unique_ptr<WorkCompletion>> scatterCpu(
+        const void* send_buffer, void* recv_buffer, size_t count,
+        DataType datatype, int root, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count);
+    PGResult<void> scatterGpu(const void* send_buffer, void* recv_buffer,
+                              size_t count, DataType datatype, int root,
+                              cudaStream_t stream, int32_t* failed_ranks_hint,
+                              size_t failed_ranks_hint_count);
 
-    void shutdown();
-    std::string getPreferredHca(const std::string& location) const;
+    PGResult<void> shutdown();
+    PGResult<std::string> getPreferredHca(const std::string& location) const;
     std::vector<int32_t> getActiveRanks() const;
     int getNumSyncedRanks() const;
-    std::vector<bool> getPeerState(const std::vector<int>& ranks) const;
-    ProposeViewUpdateResponse activateRanks(const std::vector<int>& ranks);
-    ProposeViewUpdateResponse deactivateRanks(const std::vector<int>& ranks);
-    Expected<void, TimeoutError> joinGroup();
+    PGResult<std::vector<bool>> getPeerState(
+        const std::vector<int>& ranks) const;
+    PGResult<ProposeViewUpdateResponse> activateRanks(
+        const std::vector<int>& ranks);
+    PGResult<ProposeViewUpdateResponse> deactivateRanks(
+        const std::vector<int>& ranks);
+    PGResult<void> joinGroup();
 
     // Returns the current GroupView epoch.
     // Epoch starts at 0 (bootstrap) and increments on membership changes,
@@ -210,7 +227,7 @@ class MooncakeCommunicator {
 
     // Notify the Coordinator of a detected failure and block until a membership
     // decision has been made and the Agent has ACKed the resulting ViewUpdate.
-    SyncAfterFailureResponse syncAfterFailure();
+    PGResult<SyncAfterFailureResponse> syncAfterFailure();
 
     // Update the data-plane view. Called by AgentHost when a ViewUpdatePush is
     // received or rank states change. rank_states and activatable are computed
@@ -231,20 +248,29 @@ class MooncakeCommunicator {
     AgentInterface& getAgent() { return agent_; }
 
    private:
-    std::unique_ptr<WorkCompletion> enqueueSend(const void* buffer,
-                                                size_t bytes, int peer,
-                                                cudaStream_t stream,
-                                                int32_t* failed_ranks_hint);
-    std::unique_ptr<WorkCompletion> enqueueRecv(void* buffer, size_t bytes,
-                                                int peer, cudaStream_t stream,
-                                                int32_t* failed_ranks_hint);
+    MooncakeCommunicator(MooncakePGContext& context,
+                         const MooncakeCommunicatorConfig& config);
+    PGResult<void> initialize(MooncakeCommunicatorConfig config);
+
+    PGResult<std::unique_ptr<WorkCompletion>> enqueueSend(
+        const void* buffer, size_t count, DataType datatype, int peer,
+        cudaStream_t stream, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count);
+    PGResult<std::unique_ptr<WorkCompletion>> enqueueRecv(
+        void* buffer, size_t count, DataType datatype, int peer,
+        cudaStream_t stream, int32_t* failed_ranks_hint,
+        size_t failed_ranks_hint_count);
 
     // Guard: checks that the rank is Healthy (always) and, for collectives,
     // that it is active in this group. Called at the top of every operation.
-    void prepareOp(OpType op) const;
+    PGResult<void> checkOpState(OpType op) const;
+
+    // Validate and initialize the caller-owned failed-ranks output.
+    PGResult<void> initializeFailedRanksHint(
+        int32_t* failed_ranks_hint, size_t failed_ranks_hint_count) const;
 
     // Reject operations if this communicator is invalid.
-    void requireValidGroup(const char* operation) const;
+    PGResult<void> checkValidGroup(const char* operation) const;
 
     // A rejected registration has no Coordinator-assigned group id and is
     // restricted to local-only collectives.

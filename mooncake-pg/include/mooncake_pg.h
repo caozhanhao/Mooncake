@@ -27,13 +27,18 @@ typedef struct mooncakePgComm* mooncakePgComm_t;
 typedef struct mooncakePgCompletion* mooncakePgCompletion_t;
 typedef void* mooncakePgStream_t;
 
+/* Keep non-success entries synchronized with C++ PGErrorCode. */
 typedef enum mooncakePgResult {
     mooncakePgSuccess = 0,
-    mooncakePgSystemError = 1,
-    mooncakePgInternalError = 2,
-    mooncakePgInvalidArgument = 3,
+    mooncakePgInvalidArgument = 1,
+    mooncakePgInvalidState = 2,
+    mooncakePgNotSupported = 3,
     mooncakePgTimeout = 4,
     mooncakePgResourceBusy = 5,
+    mooncakePgTransferEngineError = 6,
+    mooncakePgRpcError = 7,
+    mooncakePgSystemError = 8,
+    mooncakePgInternalError = 9,
 } mooncakePgResult_t;
 
 typedef enum mooncakePgDataType {

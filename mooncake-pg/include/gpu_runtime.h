@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_GPU_UTILS_H
-#define MOONCAKE_PG_GPU_UTILS_H
+#ifndef MOONCAKE_PG_GPU_RUNTIME_H
+#define MOONCAKE_PG_GPU_RUNTIME_H
 
 #include <cuda_alike.h>
 
@@ -78,4 +78,4 @@ class GpuEvent {
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_GPU_UTILS_H
+#endif  // MOONCAKE_PG_GPU_RUNTIME_H

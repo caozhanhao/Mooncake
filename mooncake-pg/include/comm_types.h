@@ -5,8 +5,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <future>
-#include <stdexcept>
 #include <utility>
+
+#include "error_types.h"
 
 namespace mooncake {
 
@@ -71,7 +72,8 @@ inline size_t elementSize(DataType dataType) {
         case DataType::Float64:
             return 8;
     }
-    throw std::invalid_argument("unsupported Mooncake datatype");
+    PG_ASSERT(false,
+              "unsupported Mooncake datatype: ", static_cast<int>(dataType));
 }
 
 enum class ReduceOp : uint8_t {

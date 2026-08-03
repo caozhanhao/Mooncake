@@ -16,7 +16,7 @@
 #include "serialized_executor.h"
 #include "link_manager.h"
 
-#include "pg_utils.h"
+#include "error_types.h"
 namespace mooncake {
 
 class RpcServer;
@@ -60,41 +60,43 @@ class AgentInterface {
    public:
     virtual ~AgentInterface() = default;
 
-    virtual bool waitUntilRegistered(std::chrono::milliseconds timeout) = 0;
+    virtual PGResult<void> waitUntilRegistered(
+        std::chrono::milliseconds timeout) = 0;
 
-    virtual GroupView waitUntilGroupReady(
+    virtual PGResult<GroupView> waitUntilGroupReady(
         GroupId group_id, std::chrono::milliseconds timeout) = 0;
 
-    virtual Expected<void, TimeoutError> waitUntilRankActive(
+    virtual PGResult<void> waitUntilRankActive(
         GroupId group_id, GlobalRank rank,
         std::chrono::milliseconds timeout) = 0;
 
     // Returns an empty GroupId when the Coordinator rejects this group. The
     // rejected group is not inserted into the process-scoped Agent state.
-    virtual GroupId registerGroup(GroupBootstrapId group_bootstrap_id,
-                                  int32_t max_group_size,
-                                  std::vector<GlobalRank> rank_order,
-                                  GroupBootstrapIdResolvePolicy resolve_policy,
-                                  bool auto_deactivate,
-                                  MooncakeCommunicator* communicator) = 0;
+    virtual PGResult<GroupId> registerGroup(
+        GroupBootstrapId group_bootstrap_id, int32_t max_group_size,
+        std::vector<GlobalRank> rank_order,
+        GroupBootstrapIdResolvePolicy resolve_policy, bool auto_deactivate,
+        MooncakeCommunicator* communicator) = 0;
 
     virtual void detachCommunicator(GroupId group_id) = 0;
 
-    virtual void unregisterGroup(GroupId group_id) = 0;
+    virtual PGResult<void> unregisterGroup(GroupId group_id) = 0;
 
-    virtual void confirmReadyForActivation(GroupId group_id) = 0;
+    virtual PGResult<void> confirmReadyForActivation(GroupId group_id) = 0;
 
-    virtual void publishLocalEndpoint(GroupEndpointPublication endpoint) = 0;
+    virtual PGResult<void> publishLocalEndpoint(
+        GroupEndpointPublication endpoint) = 0;
 
-    virtual ProposeViewUpdateResponse proposeActivate(
+    virtual PGResult<ProposeViewUpdateResponse> proposeActivate(
         GroupId group_id, const std::vector<InGroupRank>& ranks) = 0;
 
-    virtual ProposeViewUpdateResponse proposeDeactivate(
+    virtual PGResult<ProposeViewUpdateResponse> proposeDeactivate(
         GroupId group_id, const std::vector<InGroupRank>& ranks) = 0;
 
     virtual void pushLinkEvent(const LinkEvent& event) = 0;
 
-    virtual SyncAfterFailureResponse syncAfterFailure(GroupId group_id) = 0;
+    virtual PGResult<SyncAfterFailureResponse> syncAfterFailure(
+        GroupId group_id) = 0;
 };
 
 class AgentHost;
@@ -127,37 +129,39 @@ class AgentHost : public AgentInterface {
 
     ~AgentHost() override;
 
-    void start();
+    PGResult<void> start();
     void shutdown();
     void setFaultReconciliationWindow(int64_t timeout_us);
 
-    bool waitUntilRegistered(std::chrono::milliseconds timeout) override;
-    GroupView waitUntilGroupReady(GroupId group_id,
-                                  std::chrono::milliseconds timeout) override;
-    Expected<void, TimeoutError> waitUntilRankActive(
+    PGResult<void> waitUntilRegistered(
+        std::chrono::milliseconds timeout) override;
+    PGResult<GroupView> waitUntilGroupReady(
+        GroupId group_id, std::chrono::milliseconds timeout) override;
+    PGResult<void> waitUntilRankActive(
         GroupId group_id, GlobalRank rank,
         std::chrono::milliseconds timeout) override;
 
-    GroupId registerGroup(GroupBootstrapId group_bootstrap_id,
-                          int32_t max_group_size,
-                          std::vector<GlobalRank> rank_order,
-                          GroupBootstrapIdResolvePolicy resolve_policy,
-                          bool auto_deactivate,
-                          MooncakeCommunicator* communicator) override;
+    PGResult<GroupId> registerGroup(
+        GroupBootstrapId group_bootstrap_id, int32_t max_group_size,
+        std::vector<GlobalRank> rank_order,
+        GroupBootstrapIdResolvePolicy resolve_policy, bool auto_deactivate,
+        MooncakeCommunicator* communicator) override;
     void detachCommunicator(GroupId group_id) override;
-    void unregisterGroup(GroupId group_id) override;
-    void confirmReadyForActivation(GroupId group_id) override;
-    void publishLocalEndpoint(GroupEndpointPublication endpoint) override;
+    PGResult<void> unregisterGroup(GroupId group_id) override;
+    PGResult<void> confirmReadyForActivation(GroupId group_id) override;
+    PGResult<void> publishLocalEndpoint(
+        GroupEndpointPublication endpoint) override;
 
-    ProposeViewUpdateResponse proposeActivate(
+    PGResult<ProposeViewUpdateResponse> proposeActivate(
         GroupId group_id, const std::vector<InGroupRank>& ranks) override;
 
-    ProposeViewUpdateResponse proposeDeactivate(
+    PGResult<ProposeViewUpdateResponse> proposeDeactivate(
         GroupId group_id, const std::vector<InGroupRank>& ranks) override;
 
     void pushLinkEvent(const LinkEvent& event) override;
 
-    SyncAfterFailureResponse syncAfterFailure(GroupId group_id) override;
+    PGResult<SyncAfterFailureResponse> syncAfterFailure(
+        GroupId group_id) override;
 
     void postPeerJoined(PeerJoinedPush push);
     void postRankStateUpdate(RankStatePush push);
@@ -218,11 +222,11 @@ class AgentHost : public AgentInterface {
     void unregisterAgent();
     void tick();
 
-    void sendPublishEndpointRpc(GroupEndpointPublication endpoint);
+    PGResult<void> sendPublishEndpointRpc(GroupEndpointPublication endpoint);
 
     void sendLinkEventReport(LinkEventReport report);
 
-    ProposeViewUpdateResponse proposeViewUpdateInternal(
+    PGResult<ProposeViewUpdateResponse> proposeViewUpdateInternal(
         GroupId group_id, const std::vector<InGroupRank>& ranks,
         bool is_activation);
 

@@ -11,7 +11,7 @@
 #include <cuda_bf16.h>
 #endif
 
-#include "pg_utils.h"
+#include "error_types.h"
 
 namespace mooncake {
 
@@ -186,8 +186,8 @@ void preloadReduceKernels() {
     auto preload = [](const char* name, auto kernel_ptr) {
         cudaFuncAttributes attr{};
         auto err = cudaFuncGetAttributes(&attr, kernel_ptr);
-        PG_CHECK(err == cudaSuccess, "Failed to preload kernel ", name, ": ",
-                 cudaGetErrorString(err));
+        PG_ASSERT(err == cudaSuccess, "Failed to preload kernel ", name, ": ",
+                  cudaGetErrorString(err));
     };
     preload("reduceKernel<uint8_t>",
             reinterpret_cast<const void*>(reduceKernel<uint8_t>));

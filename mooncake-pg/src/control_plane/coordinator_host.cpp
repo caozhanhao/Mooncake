@@ -75,14 +75,18 @@ CoordinatorHost::CoordinatorHost(const std::string& host_ip, int max_world_size,
 
 CoordinatorHost::~CoordinatorHost() { shutdown(); }
 
-void CoordinatorHost::setFaultReconciliationWindow(int64_t timeout_us) {
-    executor_.postAndWait([this, timeout_us] {
+PGResult<void> CoordinatorHost::setFaultReconciliationWindow(
+    int64_t timeout_us) {
+    return executor_.postAndWait([this, timeout_us] {
         state_machine_.setFaultReconciliationWindow(
             std::chrono::microseconds(timeout_us));
     });
 }
 
-void CoordinatorHost::start() {
+PGResult<void> CoordinatorHost::start() {
+    PG_VALIDATE_STATE(!shutdown_requested_.load(std::memory_order_acquire),
+                      "CoordinatorHost cannot start after shutdown");
+
     rpc_server_ = std::make_unique<RpcServer>(/*port=*/0, /*thread_num=*/2);
     rpc_impl_ = std::make_unique<CoordinatorRpcServiceImpl>(*this);
     rpc_server_
@@ -100,7 +104,10 @@ void CoordinatorHost::start() {
 
     bool server_started = rpc_server_->start();
     if (!server_started) {
-        LOG(FATAL) << "CoordinatorHost: failed to start RPC server";
+        rpc_impl_.reset();
+        rpc_server_.reset();
+        return makePGError(PGErrorCode::SystemError,
+                           "CoordinatorHost failed to start RPC server");
     }
 
     listen_addr_ = rpc_server_->getListenAddr(host_ip_);
@@ -111,6 +118,7 @@ void CoordinatorHost::start() {
     });
 
     executor_.start();
+    return {};
 }
 
 void CoordinatorHost::shutdown() {
@@ -118,13 +126,16 @@ void CoordinatorHost::shutdown() {
 
     if (rpc_server_) {
         auto shutdown_confirmation = shutdown_confirmation_.get_future();
-        executor_.postAndWait([this]() {
+        auto post_result = executor_.postAndWait([this]() {
             auto result = state_machine_.requestShutdown();
             runEffects(result.effects);
         });
 
-        if (shutdown_confirmation.wait_for(kShutdownDrainTimeout) !=
-            std::future_status::ready) {
+        if (!post_result.has_value()) {
+            LOG(WARNING) << "[COORD] failed to request shutdown: "
+                         << post_result.error().message;
+        } else if (shutdown_confirmation.wait_for(kShutdownDrainTimeout) !=
+                   std::future_status::ready) {
             LOG(WARNING) << "[COORD] shutdown drain timed out";
         }
         rpc_server_->shutdown();
@@ -317,9 +328,9 @@ void CoordinatorHost::pushViewUpdate(const PushViewUpdate& effect) {
 
         rpc_client_->callAsync<&AgentRpcService::onViewUpdate>(
             addr, push,
-            [this, group_id, rank = i](coro_rpc::rpc_error error,
-                                       ViewUpdateAck ack) {
-                if (error) return;
+            [this, group_id, rank = i](PGResult<ViewUpdateAck> result) {
+                if (!result.has_value()) return;
+                auto ack = std::move(result).value();
                 postViewUpdateAck(group_id, rank, ack.epoch, ack.applied);
             });
     }

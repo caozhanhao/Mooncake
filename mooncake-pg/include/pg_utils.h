@@ -6,54 +6,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <sstream>
-#include <stdexcept>
-#include <string>
 #include <thread>
-#include <utility>
 
 // For PAUSE macro
 #include <transfer_engine.h>
-#include <ylt/util/expected.hpp>
 
 namespace mooncake {
-
-class PgCheckError : public std::runtime_error {
-   public:
-    using std::runtime_error::runtime_error;
-};
-
-namespace detail {
-
-template <typename... Args>
-[[noreturn]] inline void throwPgCheckFailure(Args&&... args) {
-    std::ostringstream message;
-    (message << ... << std::forward<Args>(args));
-    throw PgCheckError(message.str());
-}
-
-}  // namespace detail
-
-#define PG_CHECK(condition, ...)                                  \
-    do {                                                          \
-        if (!(condition)) {                                       \
-            ::mooncake::detail::throwPgCheckFailure(__VA_ARGS__); \
-        }                                                         \
-    } while (false)
-
-template <typename T, typename E>
-using Expected = ylt::expected<T, E>;
-
-template <typename E>
-using Unexpected = ylt::unexpected<E>;
-
-struct ResourceBusyError {
-    std::string message;
-};
-
-struct TimeoutError {
-    std::string message;
-};
 
 /**
  * @brief Configuration parameters for the BackoffWaiter.

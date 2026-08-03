@@ -12,6 +12,7 @@
 #include "rpc.h"
 #include "rpc_runtime.h"
 #include "serialized_executor.h"
+#include "error_types.h"
 
 namespace mooncake {
 
@@ -103,9 +104,9 @@ class CoordinatorHost {
 
     ~CoordinatorHost();
 
-    void start();
+    PGResult<void> start();
     void shutdown();
-    void setFaultReconciliationWindow(int64_t timeout_us);
+    PGResult<void> setFaultReconciliationWindow(int64_t timeout_us);
 
     const std::string& getListenAddr() const { return listen_addr_; }
 

@@ -1,13 +1,13 @@
 #include "control_plane/coordinator.h"
 
 #include <algorithm>
-#include <cassert>
 #include <iterator>
 #include <limits>
 #include <set>
 
 #include <glog/logging.h>
 
+#include "error_types.h"
 #include "pg_utils.h"
 
 namespace mooncake {
@@ -16,10 +16,8 @@ CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
     int max_world_size, std::chrono::microseconds fault_reconciliation_window)
     : max_world_size_(max_world_size),
       fault_reconciliation_window_(fault_reconciliation_window) {
-    CHECK_GT(max_world_size_, 0);
-    CHECK_LE(max_world_size_, kMaxNumRanks)
-        << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
-        << kMaxNumRanks << ")";
+    PG_ASSERT(max_world_size_ > 0 && max_world_size_ <= kMaxNumRanks,
+              "invalid max_world_size: ", max_world_size_);
     ranks_.resize(max_world_size_);
     endpoint_epochs_.assign(max_world_size_, 0);
     for (int r = 0; r < max_world_size_; ++r) {
@@ -755,7 +753,8 @@ void CentralizedCoordinatorStateMachine::tryConfirmShutdown(
 
 bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
     GlobalRank a, GlobalRank b) const {
-    assert(rankInRange(a) && rankInRange(b));
+    PG_ASSERT(rankInRange(a) && rankInRange(b),
+              "linkStatus called with an out-of-range rank");
     if (ranks_[a].state == RankState::Offline ||
         ranks_[b].state == RankState::Offline)
         return false;

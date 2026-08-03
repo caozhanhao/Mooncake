@@ -25,7 +25,7 @@ elseif(USE_MUSA OR USE_MACA)
   set(_pg_device_dependencies
       "${_pg_device_source}"
       "${CMAKE_CURRENT_SOURCE_DIR}/../include/mooncake_worker_kernels.cuh"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../include/pg_utils.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../include/error_types.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include/common.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include/cuda_alike.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include/transfer_engine.h")
@@ -89,7 +89,7 @@ add_library(mooncake_pg SHARED
     control_plane/agent.cpp
     control_plane/agent_host.cpp
     control_plane/rpc_runtime.cpp
-    gpu_utils.cpp
+    gpu_runtime.cpp
     mooncake_communicator.cpp
     mooncake_pg.cpp
     "${_pg_device_input}"

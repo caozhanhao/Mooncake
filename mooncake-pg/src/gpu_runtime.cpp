@@ -1,18 +1,14 @@
-#include "gpu_utils.h"
+#include "gpu_runtime.h"
 
 #include <exception>
 #include <utility>
 
 #include <glog/logging.h>
 
-#include "pg_utils.h"
+#include "error_types.h"
 
 namespace mooncake {
 namespace {
-
-void checkCuda(cudaError_t error, const char* operation) {
-    PG_CHECK(error == cudaSuccess, operation, ": ", cudaGetErrorString(error));
-}
 
 void warnCleanupFailure(const char* operation, const char* error) noexcept {
     LOG(WARNING) << "Mooncake PG CUDA cleanup failed while " << operation
@@ -22,12 +18,12 @@ void warnCleanupFailure(const char* operation, const char* error) noexcept {
 }  // namespace
 
 GpuDeviceGuard::GpuDeviceGuard(int device) {
-    PG_CHECK(device >= 0, "invalid CUDA device index");
+    PG_ASSERT(device >= 0, "invalid CUDA device index");
 
-    checkCuda(cudaGetDevice(&previous_device_), "get current CUDA device");
+    PG_ASSERT_CUDA(cudaGetDevice(&previous_device_));
     if (previous_device_ == device) return;
 
-    checkCuda(cudaSetDevice(device), "set CUDA device");
+    PG_ASSERT_CUDA(cudaSetDevice(device));
     restore_device_ = true;
 }
 
@@ -42,9 +38,7 @@ GpuDeviceGuard::~GpuDeviceGuard() noexcept {
 
 GpuStream::~GpuStream() noexcept { reset(); }
 
-GpuStream::GpuStream(GpuStream&& other) noexcept {
-    moveFrom(std::move(other));
-}
+GpuStream::GpuStream(GpuStream&& other) noexcept { moveFrom(std::move(other)); }
 
 GpuStream& GpuStream::operator=(GpuStream&& other) noexcept {
     if (this != &other) {
@@ -57,27 +51,25 @@ GpuStream& GpuStream::operator=(GpuStream&& other) noexcept {
 GpuStream GpuStream::createNonBlocking(int device) {
     const GpuDeviceGuard device_guard(device);
     cudaStream_t stream = nullptr;
-    checkCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
-              "create stream");
+    PG_ASSERT_CUDA(
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     return GpuStream(stream, device, true);
 }
 
 GpuStream GpuStream::borrow(cudaStream_t stream, int device) {
-    PG_CHECK(device >= 0, "invalid CUDA device index");
+    PG_ASSERT(device >= 0, "invalid CUDA device index");
     return GpuStream(stream, device, false);
 }
 
 bool GpuStream::isCapturing() const {
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    checkCuda(cudaStreamIsCapturing(stream_, &capture_status),
-              "cudaStreamIsCapturing");
+    PG_ASSERT_CUDA(cudaStreamIsCapturing(stream_, &capture_status));
     return capture_status != cudaStreamCaptureStatusNone;
 }
 
 void GpuStream::waitEvent(const GpuEvent& event) const {
     const GpuDeviceGuard device_guard(device_index_);
-    checkCuda(cudaStreamWaitEvent(stream_, event.event_, 0),
-              "wait for CUDA event");
+    PG_ASSERT_CUDA(cudaStreamWaitEvent(stream_, event.event_, 0));
 }
 
 GpuStream::GpuStream(cudaStream_t stream, int device, bool owns_stream) noexcept
@@ -112,10 +104,10 @@ void GpuStream::moveFrom(GpuStream&& other) noexcept {
 }
 
 GpuEvent::GpuEvent(int device, unsigned int flags) : device_index_(device) {
-    PG_CHECK(device >= 0, "invalid CUDA device index");
+    PG_ASSERT(device >= 0, "invalid CUDA device index");
 
     const GpuDeviceGuard device_guard(device);
-    checkCuda(cudaEventCreateWithFlags(&event_, flags), "create CUDA event");
+    PG_ASSERT_CUDA(cudaEventCreateWithFlags(&event_, flags));
 }
 
 GpuEvent::~GpuEvent() noexcept { reset(); }
@@ -131,11 +123,11 @@ GpuEvent& GpuEvent::operator=(GpuEvent&& other) noexcept {
 }
 
 void GpuEvent::record(const GpuStream& stream) {
-    PG_CHECK(device_index_ == stream.deviceIndex(),
+    PG_ASSERT(device_index_ == stream.deviceIndex(),
              "CUDA event device does not match recording stream device");
 
     const GpuDeviceGuard device_guard(device_index_);
-    checkCuda(cudaEventRecord(event_, stream.get()), "record CUDA event");
+    PG_ASSERT_CUDA(cudaEventRecord(event_, stream.get()));
 }
 
 void GpuEvent::reset() noexcept {

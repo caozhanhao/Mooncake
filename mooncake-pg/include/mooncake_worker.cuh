@@ -5,7 +5,7 @@
 #include <functional>
 
 #include "control_plane/control_types.h"
-#include "gpu_utils.h"
+#include "gpu_runtime.h"
 
 #include <transfer_engine.h>
 #include <mooncake_worker_kernels.cuh>

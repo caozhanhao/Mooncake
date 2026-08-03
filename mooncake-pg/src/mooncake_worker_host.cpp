@@ -7,16 +7,16 @@
 #include <mooncake_worker.cuh>
 #include <mooncake_worker_kernels.cuh>
 
-#include "pg_utils.h"
+#include "error_types.h"
 
 namespace mooncake {
 
 void launchReduceKernel(void* dst, DataType dataType, size_t pos,
                         size_t realSize, void* src, size_t numRanks,
                         ReduceOp op, bool* activeRanks, cudaStream_t stream) {
-    PG_CHECK(op == ReduceOp::Sum || op == ReduceOp::Min ||
-                 op == ReduceOp::Max || op == ReduceOp::Product,
-             "Only support SUM/MIN/MAX/PRODUCT for reduction.");
+    PG_ASSERT(op == ReduceOp::Sum || op == ReduceOp::Min ||
+                  op == ReduceOp::Max || op == ReduceOp::Product,
+              "Only support SUM/MIN/MAX/PRODUCT for reduction.");
     auto ptr = (char*)dst + pos;
     size_t num = realSize / elementSize(dataType);
 
@@ -58,7 +58,7 @@ void launchReduceKernel(void* dst, DataType dataType, size_t pos,
                                     activeRanks, stream);
             break;
         default:
-            PG_CHECK(false, "Unsupported reduce dtype: ", (int)dataType);
+            PG_ASSERT(false, "Unsupported reduce dtype: ", (int)dataType);
     }
 }
 
@@ -74,7 +74,7 @@ T applyReduceOp(const T& a, const T& b, ReduceOp op) {
         case ReduceOp::Max:
             return std::max(a, b);
         default:
-            PG_CHECK(false, "Unsupported reduce op: ", (int)op);
+            PG_ASSERT(false, "Unsupported reduce op: ", (int)op);
     }
 }
 
@@ -135,7 +135,7 @@ void launchReduceCpu(void* dst, DataType dataType, size_t pos, size_t realSize,
             reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op, activeRanks);
             break;
         default:
-            PG_CHECK(false, "Unsupported reduce dtype: ", (int)dataType);
+            PG_ASSERT(false, "Unsupported reduce dtype: ", (int)dataType);
     }
 }
 
@@ -177,7 +177,7 @@ std::unique_ptr<WorkCompletion> MooncakeWorker::putTaskCpu(
         copyToSendBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize)>&
         copyFromRecvBuffer) {
-    PG_CHECK(failed_ranks_hint, "failed-ranks hint is null");
+    PG_ASSERT(failed_ranks_hint, "failed-ranks hint is null");
     size_t chunkSize = ((kBufferSize - 1) / meta->maxGroupSize) & ~(size_t)7;
     auto completion = std::make_shared<std::promise<void>>();
     auto future = completion->get_future().share();
@@ -203,8 +203,8 @@ std::unique_ptr<WorkCompletion> MooncakeWorker::putTaskCpu(
         }
 
         int taskId = cpuTaskCount % 2;
-        PG_CHECK(!tasks_[taskId].active,
-                 "collective CPU task slot is still active");
+        PG_ASSERT(!tasks_[taskId].active,
+                  "collective CPU task slot is still active");
         size_t realSize = std::min(chunkSize, tensorSize - state->currentPos);
         int bufferOffset = meta->taskCount % 2;
         tasks_[taskId].opType = (int)opType;
