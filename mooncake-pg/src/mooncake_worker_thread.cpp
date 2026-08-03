@@ -414,12 +414,11 @@ void MooncakeWorker::startWorker() {
                             group->autoSyncOnFailure) {
                             auto result =
                                 group->communicator->syncAfterFailure();
-                            if (!result.has_value()) {
-                                LOG(ERROR)
-                                    << "syncAfterFailure failed for rank "
-                                    << group->globalRank << ": "
-                                    << result.error().message;
-                            }
+                            PG_ASSERT(result.has_value() &&
+                                          result.value().status !=
+                                              SyncAfterFailureStatus::Rejected,
+                                      "syncAfterFailure failed for rank ",
+                                      group->globalRank);
                         }
 
                         task_status[i].store(DONE, std::memory_order_release);

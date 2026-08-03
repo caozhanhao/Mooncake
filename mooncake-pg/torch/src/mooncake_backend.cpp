@@ -551,11 +551,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     validateSingleBufferTensors(
         outputBuffer, inputBuffer,
         isCpu_ ? c10::DeviceType::CPU : c10::DeviceType::CUDA);
-    const int active_size = getSize();
-    TORCH_CHECK(
-        outputBuffer.numel() == inputBuffer.numel() * active_size,
-        "All-gather output must contain active group size times the input "
-        "number of elements");
 
     return launchCollective<mooncakePgAllGatherCpu, mooncakePgAllGatherGpu>(
         c10d::OpType::_ALLGATHER_BASE, "mooncakePgAllGather", inputBuffer,

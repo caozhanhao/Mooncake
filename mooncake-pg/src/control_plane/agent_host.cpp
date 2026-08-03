@@ -403,11 +403,6 @@ PGResult<SyncAfterFailureResponse> AgentHost::syncAfterFailure(
     PG_TRY(auto response,
            rpc_client_->call<&CoordinatorRpcService::syncAfterFailure>(
                coordinator_addr_, req, rpc_timeout));
-    if (response.status == SyncAfterFailureStatus::Rejected) {
-        return makePGError(
-            PGErrorCode::InvalidState,
-            "syncAfterFailure rejected: " + response.reject_reason);
-    }
 
     PG_TRY(executor_.postAndWait([this, request_session = req.agent_session_id,
                                   &response]() -> PGResult<void> {
@@ -418,8 +413,10 @@ PGResult<SyncAfterFailureResponse> AgentHost::syncAfterFailure(
             agent_.handleLinkEventReportAck(*response.link_event_report_ack);
         }
 
-        PG_TRY(auto effects, agent_.applyGroupView(response.view));
-        runEffects(effects);
+        if (response.status != SyncAfterFailureStatus::Rejected) {
+            PG_TRY(auto effects, agent_.applyGroupView(response.view));
+            runEffects(effects);
+        }
         return {};
     }));
     return response;
