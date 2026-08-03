@@ -355,6 +355,8 @@ AgentApplyResult AgentStateMachine::pushLinkEvent(const LinkEvent& event) {
     for (int peer = 0; peer < max_world_size_; ++peer) {
         auto type = event.events[peer];
         if (type == LinkEvent::EventType::None) continue;
+        const bool has_prior_link_observation =
+            observed_link_state_[peer] != LinkEvent::EventType::None;
         if (!recordLinkEvent(peer, event.target_rank_epochs[peer], type))
             continue;
 
@@ -364,7 +366,7 @@ AgentApplyResult AgentStateMachine::pushLinkEvent(const LinkEvent& event) {
         } else if (peer != rank_) {
             // Reset only when this success follows an earlier bservation,
             // i.e. a recovery or a new peer incarnation.
-            if (observed_link_state_[peer] != LinkEvent::EventType::None) {
+            if (has_prior_link_observation) {
                 effects.push_back(ResetPeerState{peer});
             }
             effects.push_back(NotifyLinkRefreshed{peer});
