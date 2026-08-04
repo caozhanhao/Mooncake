@@ -21,6 +21,7 @@ constexpr size_t kCoordinatorAddressBufSize = 256;
 
 struct MooncakeProcessContext {
     mooncakePgContext_t handle = nullptr;
+    c10::intrusive_ptr<c10d::Store> bootstrap_store;
 
     ~MooncakeProcessContext() {
         if (handle) (void)mooncakePgContextDestroy(handle);
@@ -71,6 +72,11 @@ static mooncakePgContext_t initControlPlane(
                     "invalid Mooncake coordinator address in Store");
         checkResult(mooncakePgContextConnectCoordinator(context, value.c_str()),
                     "mooncakePgContextConnectCoordinator");
+
+        // Keep the first rendezvous Store alive for the process-wide control
+        // plane. In particular, this keeps rank 0's TCPStore server alive while
+        // the default ProcessGroup is destroyed and re-created.
+        g_ctx.bootstrap_store = store;
     });
     return context;
 }
@@ -247,6 +253,7 @@ void shutdownProcessContext() {
     // fallback instead of losing ownership.
     if (mooncakePgContextDestroy(context) == mooncakePgSuccess) {
         g_ctx.handle = nullptr;
+        g_ctx.bootstrap_store.reset();
     }
 }
 

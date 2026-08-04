@@ -364,7 +364,7 @@ AgentApplyResult AgentStateMachine::pushLinkEvent(const LinkEvent& event) {
         if (type == LinkEvent::EventType::Failure) {
             effects.push_back(RequestLinkHealthCheck{peer});
         } else if (peer != rank_) {
-            // Reset only when this success follows an earlier bservation,
+            // Reset only when this success follows an earlier observation,
             // i.e. a recovery or a new peer incarnation.
             if (has_prior_link_observation) {
                 effects.push_back(ResetPeerState{peer});
