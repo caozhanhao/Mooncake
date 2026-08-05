@@ -168,15 +168,6 @@ CollectiveBindingView GroupCollectiveBindings::deviceView(
     };
 }
 
-bool GroupCollectiveBindings::readyForRecovery(
-    CollectiveBindingId binding_id, uint64_t failed_view_epoch) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    PG_ASSERT(binding_id < bindings_.size(),
-              "collective binding id is invalid");
-    const auto& entry = *bindings_[binding_id];
-    return entry.ready && entry.view_epoch > failed_view_epoch;
-}
-
 void GroupCollectiveBindings::retainForProcessLifetime() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (retained_) return;

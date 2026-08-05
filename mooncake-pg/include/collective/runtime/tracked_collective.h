@@ -16,7 +16,6 @@ namespace mooncake {
 
 struct CollectiveFailureTarget {
     uint64_t failure_cookie = 0;
-    CollectiveBindingId binding_id = kInvalidCollectiveBindingId;
     int32_t* failed_ranks_hint = nullptr;
     size_t failed_ranks_hint_count = 0;
 };

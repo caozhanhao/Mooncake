@@ -63,7 +63,6 @@ class CollectiveResourcePool {
 
     PGResult<CollectiveResourceLease> tryAcquire(uint32_t preferred_lane);
     static const CollectiveBufferLayout& bufferLayout();
-    bool readyForRetry(const CollectiveResourceLease& resources) const;
     bool release(const CollectiveResourceLease& resources, bool resource_idle);
 
    private:

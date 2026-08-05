@@ -17,23 +17,22 @@ enum class CollectiveProtocolError : int32_t {
     Unsupported,
 };
 
-enum class CollectiveFailureGateState : uint32_t {
-    Open = 0,
-    FailurePending,
-    Recovering,
-    Closed,
+enum class CollectiveFailureState : uint32_t {
+    Idle = 0,
+    Pending,
+    Handling,
+    Acknowledged,
 };
 
-// A captured kernel cannot call the control plane. It closes this
-// mapped gate after publishing failure evidence; CPU progress applies the
-// Coordinator's new GroupView and only reopens the same stable address when
-// both the new binding and the transport resources are safe to reuse.
-struct CollectiveFailureGate {
-    uint32_t state = static_cast<uint32_t>(CollectiveFailureGateState::Open);
+// Device-to-host failure handshake. A failed invocation publishes evidence and
+// waits until CPU progress has finished its sync-after-failure attempt. The
+// acknowledgement only lets that invocation finish; it never authorizes the
+// same invocation to run the collective again.
+struct CollectiveFailureReport {
+    uint32_t state = static_cast<uint32_t>(CollectiveFailureState::Idle);
     int32_t error_code = 0;
     InGroupRank failed_peer = -1;
     uint64_t failure_cookie = 0;
-    uint64_t failure_view_epoch = 0;
 };
 
 // Common host-visible state for device and host transports. It is not owned by
@@ -43,7 +42,7 @@ struct alignas(64) CollectiveControlBlock {
     int32_t first_error_code = 0;
     InGroupRank failed_peer = -1;
     uint32_t resource_idle = 1;
-    CollectiveFailureGate failure_gate;
+    CollectiveFailureReport failure;
 };
 
 }  // namespace mooncake

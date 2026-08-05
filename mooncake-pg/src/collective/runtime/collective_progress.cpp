@@ -82,7 +82,7 @@ bool CollectiveProgressEngine::retireCompletedCollective() {
     return false;
 }
 
-bool CollectiveProgressEngine::recoverOneFailure() {
+bool CollectiveProgressEngine::handleOneFailure() {
     std::optional<CollectiveFailureHandler::Claim> failure;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -101,7 +101,7 @@ void CollectiveProgressEngine::progressLoop() noexcept {
         return;
     }
     while (!stopping_.load(std::memory_order_acquire)) {
-        bool progressed = recoverOneFailure();
+        bool progressed = handleOneFailure();
         progressed |= retireCompletedCollective();
         if (!progressed) {
             std::this_thread::sleep_for(std::chrono::microseconds(10));

@@ -16,8 +16,9 @@ struct FlatRingPlan {
 };
 
 // The first vertical slice does not select this algorithm. Keeping the plan
-// alternative exposes the algorithm boundary required by failure recovery and
-// future topology-aware policy without adding an incomplete implementation.
+// alternative exposes the boundary for future topology-aware policy and plan
+// changes across application invocations without adding an incomplete
+// implementation.
 struct HierarchicalPlan {
     bool operator==(const HierarchicalPlan&) const = default;
 };

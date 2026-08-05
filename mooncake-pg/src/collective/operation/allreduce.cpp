@@ -24,12 +24,11 @@ PGResult<AllReduceInvocation> AllReduceInvocation::create(
 }
 
 void AllReduceInvocation::launch(const CollectiveKernelContext& context,
-                                 void* retry_input, cudaStream_t stream) const {
+                                 cudaStream_t stream) const {
     launchAllReduceExecutor(
         AllReduceExecutorArgs{
             .input = input_,
             .output = output_,
-            .retry_input = retry_input,
             .context = context,
             .element_count = element_count_,
             .datatype = datatype_,

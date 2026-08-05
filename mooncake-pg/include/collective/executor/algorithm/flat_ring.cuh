@@ -49,18 +49,14 @@ inline __device__ uint64_t mixToken(uint64_t value) {
 
 inline __device__ uint64_t protocolToken(uint64_t view_epoch,
                                          uint64_t collective_sequence,
-                                         uint32_t retry_attempt,
                                          uint64_t transfer_chunk, Phase phase,
                                          uint32_t round) {
     // Signals are deliberately not cleared between invocations. View epoch,
-    // view-scoped monotonic per-lane sequence, retry attempt and transfer
-    // coordinates jointly separate wire domains across replay and membership
-    // changes. Attempt is needed because a parked invocation keeps its old
-    // sequence while the new view resets counters for future invocations.
+    // view-scoped monotonic per-lane sequence and transfer coordinates jointly
+    // separate wire domains across graph replay and membership changes.
     uint64_t token = mixToken(0x464c415452494e47ULL);
     token = mixToken(token ^ mixToken(view_epoch + 0x101ULL));
     token = mixToken(token ^ mixToken(collective_sequence + 0x202ULL));
-    token = mixToken(token ^ mixToken(retry_attempt + 0x303ULL));
     token = mixToken(token ^ mixToken(transfer_chunk + 0x404ULL));
     token = mixToken(token ^ mixToken(static_cast<uint32_t>(phase) + 0x505ULL));
     token = mixToken(token ^ mixToken(round + 0x606ULL));
@@ -201,9 +197,8 @@ inline __device__ bool transferFailed(const AllReduceExecutorArgs& args,
 inline __device__ bool runReduceScatter(
     const AllReduceExecutorArgs& args, const FlatRingKernelPlan& ring,
     const void* input, uint64_t view_epoch, uint64_t collective_sequence,
-    uint32_t retry_attempt, uint64_t transfer_offset,
-    uint64_t transfer_elements, uint64_t transfer_index, void* work_stages[2],
-    uint32_t* current_stage) {
+    uint64_t transfer_offset, uint64_t transfer_elements,
+    uint64_t transfer_index, void* work_stages[2], uint32_t* current_stage) {
     const auto& resources = args.context.resources;
     const uint32_t count = ring.participant_count;
     const uint32_t self = ring.self_ordinal;
@@ -236,8 +231,8 @@ inline __device__ bool runReduceScatter(
         const uint32_t inbox = round & 1U;
         const uint32_t next_stage = *current_stage ^ 1U;
         const uint64_t token =
-            protocolToken(view_epoch, collective_sequence, retry_attempt,
-                          transfer_index, Phase::ReduceScatter, round);
+            protocolToken(view_epoch, collective_sequence, transfer_index,
+                          Phase::ReduceScatter, round);
         const uint64_t command_id =
             (transfer_index << 16) |
             (static_cast<uint64_t>(Phase::ReduceScatter) << 8) | round;
@@ -285,9 +280,9 @@ inline __device__ bool runReduceScatter(
 
 inline __device__ bool runAllGather(
     const AllReduceExecutorArgs& args, const FlatRingKernelPlan& ring,
-    uint64_t view_epoch, uint64_t collective_sequence, uint32_t retry_attempt,
-    uint64_t transfer_offset, uint64_t transfer_elements,
-    uint64_t transfer_index, void* work_stages[2], uint32_t* current_stage) {
+    uint64_t view_epoch, uint64_t collective_sequence, uint64_t transfer_offset,
+    uint64_t transfer_elements, uint64_t transfer_index, void* work_stages[2],
+    uint32_t* current_stage) {
     const auto& resources = args.context.resources;
     const uint32_t count = ring.participant_count;
     const uint32_t self = ring.self_ordinal;
@@ -309,8 +304,8 @@ inline __device__ bool runAllGather(
         const uint32_t inbox = round & 1U;
         const uint32_t next_stage = *current_stage ^ 1U;
         const uint64_t token =
-            protocolToken(view_epoch, collective_sequence, retry_attempt,
-                          transfer_index, Phase::AllGather, round);
+            protocolToken(view_epoch, collective_sequence, transfer_index,
+                          Phase::AllGather, round);
         const uint64_t command_id =
             (transfer_index << 16) |
             (static_cast<uint64_t>(Phase::AllGather) << 8) | round;
@@ -368,8 +363,7 @@ inline __device__ bool runAllGather(
 
 inline __device__ bool run(const AllReduceExecutorArgs& args,
                            const FlatRingKernelPlan& ring, const void* input,
-                           uint64_t view_epoch, uint64_t collective_sequence,
-                           uint32_t retry_attempt) {
+                           uint64_t view_epoch, uint64_t collective_sequence) {
     const auto& resources = args.context.resources;
     if (args.element_count == 0) return true;
     if (ring.participant_count <= 1) {
@@ -403,9 +397,8 @@ inline __device__ bool run(const AllReduceExecutorArgs& args,
         };
     }
     __syncthreads();
-    const uint64_t binding_token =
-        protocolToken(view_epoch, collective_sequence, retry_attempt, 0,
-                      Phase::BufferBinding, 0);
+    const uint64_t binding_token = protocolToken(
+        view_epoch, collective_sequence, 0, Phase::BufferBinding, 0);
     if (!materializePeerBuffers(resources, buffer_exchanges, binding_token,
                                 0)) {
         return false;
@@ -437,11 +430,11 @@ inline __device__ bool run(const AllReduceExecutorArgs& args,
          transfer_offset += transfer_elements, ++transfer_index) {
         uint32_t current_stage = 0;
         if (!runReduceScatter(args, materialized_ring, input, view_epoch,
-                              collective_sequence, retry_attempt,
-                              transfer_offset, transfer_elements,
-                              transfer_index, work_stages, &current_stage) ||
+                              collective_sequence, transfer_offset,
+                              transfer_elements, transfer_index, work_stages,
+                              &current_stage) ||
             !runAllGather(args, materialized_ring, view_epoch,
-                          collective_sequence, retry_attempt, transfer_offset,
+                          collective_sequence, transfer_offset,
                           transfer_elements, transfer_index, work_stages,
                           &current_stage)) {
             return false;

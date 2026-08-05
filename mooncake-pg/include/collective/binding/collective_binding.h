@@ -57,10 +57,6 @@ class GroupCollectiveBindings {
     PGResult<void> requireReady(CollectiveBindingId binding_id,
                                 uint64_t view_epoch) const;
     CollectiveBindingView deviceView(CollectiveBindingId binding_id) const;
-    // A parked executor must never retry the exact view that failed. CPU
-    // progress reopens its stable gate only after a newer binding is ready.
-    bool readyForRecovery(CollectiveBindingId binding_id,
-                          uint64_t failed_view_epoch) const;
 
     void retainForProcessLifetime();
 

@@ -13,23 +13,20 @@
 namespace mooncake {
 
 class CollectiveProgressEngine;
-class GroupCollectiveBindings;
 
-using CollectiveFailureRecoveryCallback =
+using CollectiveFailureReportCallback =
     std::function<PGResult<void>(InGroupRank failed_peer)>;
 
-// Owns the CPU side of the failure gate. Completion polling only supplies the
-// collectives to inspect; this class correlates failure evidence, synchronizes
-// membership recovery and decides whether the parked executor may retry.
+// Owns the CPU side of the device-to-host failure handshake. It correlates
+// failure evidence with the caller's failed-ranks hint, reports it to the
+// control plane, and acknowledges the failed invocation. When configured, the
+// report callback also fences the authoritative view. It never waits for ranks
+// that completed the collective without observing a failure.
 class CollectiveFailureHandler {
    public:
-    CollectiveFailureHandler(
-        CollectiveResourcePool* resource_pool,
-        GroupCollectiveBindings* bindings,
-        CollectiveFailureRecoveryCallback recovery_callback)
-        : resource_pool_(resource_pool),
-          bindings_(bindings),
-          recovery_callback_(std::move(recovery_callback)) {}
+    explicit CollectiveFailureHandler(
+        CollectiveFailureReportCallback report_callback)
+        : report_callback_(std::move(report_callback)) {}
 
    private:
     friend class CollectiveProgressEngine;
@@ -37,7 +34,6 @@ class CollectiveFailureHandler {
     struct Claim {
         std::shared_ptr<TrackedCollective> collective;
         CollectiveFailureTarget target;
-        uint64_t view_epoch = 0;
         InGroupRank failed_peer = -1;
     };
 
@@ -45,9 +41,7 @@ class CollectiveFailureHandler {
         const std::vector<std::shared_ptr<TrackedCollective>>& collectives);
     void handle(const Claim& failure);
 
-    CollectiveResourcePool* resource_pool_ = nullptr;
-    GroupCollectiveBindings* bindings_ = nullptr;
-    CollectiveFailureRecoveryCallback recovery_callback_;
+    CollectiveFailureReportCallback report_callback_;
 };
 
 }  // namespace mooncake

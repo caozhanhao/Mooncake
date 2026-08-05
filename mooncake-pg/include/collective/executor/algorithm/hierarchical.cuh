@@ -5,13 +5,13 @@
 
 namespace mooncake::hierarchical_allreduce {
 
-// The alternative deliberately lives inside the same stable executor
-// envelope as Flat Ring. A later Coordinator view may replace a failed
-// hierarchical policy with a Ring policy without recapturing the graph. The
-// kernel never makes that fallback decision from local timeout evidence.
+// The alternative deliberately lives inside the same stable executor envelope
+// as Flat Ring. A later application invocation may observe a Coordinator plan
+// that replaces hierarchical AllReduce with Ring without graph recapture. The
+// failed invocation itself never retries or chooses a fallback algorithm.
 inline __device__ bool run(const AllReduceExecutorArgs& args,
                            const HierarchicalKernelPlan&, const void*, uint64_t,
-                           uint64_t, uint32_t) {
+                           uint64_t) {
     setCollectiveError(
         args, static_cast<int32_t>(CollectiveProtocolError::Unsupported), -1);
     __syncthreads();

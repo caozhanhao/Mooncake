@@ -20,10 +20,7 @@ class AllReduceInvocation final : public CollectiveInvocation {
                                                 DataType datatype, ReduceOp op);
 
     CollectiveBindingId bindingId() const override { return binding_id_; }
-    uint64_t snapshotBytes() const override {
-        return element_count_ * elementSize(datatype_);
-    }
-    void launch(const CollectiveKernelContext& context, void* retry_input,
+    void launch(const CollectiveKernelContext& context,
                 cudaStream_t stream) const override;
 
    private:

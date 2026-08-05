@@ -265,7 +265,7 @@ class MooncakeCommunicator {
 
     PGResult<void> initializePlannedCollectives(
         const std::string& device_location);
-    PGResult<void> recoverCollectiveFailure(InGroupRank failed_peer);
+    PGResult<void> reportCollectiveFailure(InGroupRank failed_peer);
 
     PGResult<std::unique_ptr<WorkCompletion>> enqueueSend(
         const void* buffer, size_t count, DataType datatype, int peer,

@@ -19,10 +19,9 @@
 
 namespace mooncake {
 
-// Host progress is collective-independent: it observes completion events and
-// delegates failure recovery, and retires eager collectives after their CUDA
-// completion event. Captured collectives remain tracked until the runtime
-// explicitly removes them.
+// Host progress is collective-independent: it observes failure reports and
+// completion events, and retires eager collectives after their CUDA completion
+// event. Captured collectives remain tracked until the runtime removes them.
 class CollectiveProgressEngine {
    public:
     static PGResult<std::unique_ptr<CollectiveProgressEngine>> create(
@@ -49,7 +48,7 @@ class CollectiveProgressEngine {
           failure_handler_(std::move(failure_handler)) {}
 
     bool retireCompletedCollective();
-    bool recoverOneFailure();
+    bool handleOneFailure();
     void progressLoop() noexcept;
 
     CollectiveResourcePool* resource_pool_ = nullptr;

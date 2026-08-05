@@ -11,16 +11,15 @@
 namespace mooncake {
 
 // Per-call operation plugin. Collective-independent runtime code owns lane,
-// snapshot allocation, capture lifetime, progress and recovery. A plugin only
-// translates operation arguments into its typed device executor ABI.
+// capture lifetime, progress and failure reporting. A plugin only translates
+// operation arguments into its typed device executor ABI.
 class CollectiveInvocation {
    public:
     virtual ~CollectiveInvocation() = default;
 
     virtual CollectiveBindingId bindingId() const = 0;
-    virtual uint64_t snapshotBytes() const = 0;
     virtual void launch(const CollectiveKernelContext& context,
-                        void* retry_input, cudaStream_t stream) const = 0;
+                        cudaStream_t stream) const = 0;
 };
 
 }  // namespace mooncake

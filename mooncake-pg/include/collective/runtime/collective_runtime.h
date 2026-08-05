@@ -44,7 +44,7 @@ class GroupCollectiveBindings;
 
 // One runtime per communicator and shared by all collective plugins. The first
 // vertical slice registers only AllReduce; the admission, lane, graph and
-// recovery boundaries are intentionally collective-neutral.
+// failure-reporting boundaries are intentionally collective-neutral.
 class GroupCollectiveRuntime {
    public:
     static PGResult<std::unique_ptr<GroupCollectiveRuntime>> create(
@@ -53,7 +53,7 @@ class GroupCollectiveRuntime {
         CollectiveLanePool* lanes, std::string te_location,
         TransferEngine* engine, GroupCollectiveBindings* bindings,
         DeviceId device, size_t collective_timeout_us,
-        CollectiveFailureRecoveryCallback failure_recovery_callback);
+        CollectiveFailureReportCallback failure_report_callback);
     ~GroupCollectiveRuntime() noexcept;
 
     PGResult<void> execute(CollectiveInvocation& invocation,

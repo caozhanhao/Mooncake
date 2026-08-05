@@ -3,8 +3,6 @@
 #include <limits>
 #include <utility>
 
-#include <glog/logging.h>
-
 #include "collective/binding/collective_binding.h"
 #include "gpu_runtime.h"
 #include "pg_utils.h"
@@ -35,7 +33,7 @@ GroupCollectiveRuntime::create(
     std::string te_location, TransferEngine* engine,
     GroupCollectiveBindings* bindings, DeviceId device,
     size_t collective_timeout_us,
-    CollectiveFailureRecoveryCallback failure_recovery_callback) {
+    CollectiveFailureReportCallback failure_report_callback) {
     const GpuDeviceGuard guard(device);
     int clock_rate_khz = 0;
     PG_TRY_CUDA(
@@ -52,8 +50,7 @@ GroupCollectiveRuntime::create(
             buffer_pool, control_pool, host_transfer_proxy, lanes,
             std::move(te_location), engine, bindings, device, timeout_ticks));
     auto failure_handler = std::make_unique<CollectiveFailureHandler>(
-        &runtime->resource_pool_, bindings,
-        std::move(failure_recovery_callback));
+        std::move(failure_report_callback));
     PG_TRY(runtime->progress_,
            CollectiveProgressEngine::create(&runtime->resource_pool_, device,
                                             std::move(failure_handler)));
@@ -185,7 +182,6 @@ PGResult<void> GroupCollectiveRuntime::execute(CollectiveInvocation& invocation,
         collective->resources, invocation.bindingId(), failure_cookie);
     CollectiveFailureTarget failure_target{
         .failure_cookie = failure_cookie,
-        .binding_id = invocation.bindingId(),
         .failed_ranks_hint = failed_ranks_hint,
         .failed_ranks_hint_count = failed_ranks_hint_count,
     };
@@ -207,29 +203,10 @@ PGResult<void> GroupCollectiveRuntime::execute(CollectiveInvocation& invocation,
             cudaEventCreateWithFlags(&completion, cudaEventDisableTiming));
     }
 
-    void* retry_input = nullptr;
-    auto retry_input_cleanup = makeScopeExit([&]() noexcept {
-        if (retry_input) (void)cudaFreeAsync(retry_input, stream);
-    });
-    const auto snapshot_bytes = invocation.snapshotBytes();
-    if (snapshot_bytes != 0) {
-        PG_TRY_CUDA(cudaMallocAsync(&retry_input, snapshot_bytes, stream));
-    }
-
     (void)cudaGetLastError();
-    invocation.launch(context, retry_input, stream);
+    invocation.launch(context, stream);
     PG_TRY_CUDA(cudaGetLastError());
     resource_idle = false;
-
-    if (retry_input) {
-        const auto free_error = cudaFreeAsync(retry_input, stream);
-        if (free_error != cudaSuccess) {
-            LOG(WARNING) << "Failed to enqueue collective retry-input free: "
-                         << cudaGetErrorString(free_error);
-        } else {
-            retry_input = nullptr;
-        }
-    }
 
     if (!capture_id) {
         PG_TRY_CUDA(cudaEventRecord(completion, stream));

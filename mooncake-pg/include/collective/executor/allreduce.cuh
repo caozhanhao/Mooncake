@@ -14,9 +14,6 @@ namespace mooncake {
 struct AllReduceExecutorArgs {
     const void* input = nullptr;
     void* output = nullptr;
-    // Every invocation snapshots input before its first attempt. A retry must
-    // never consume an output partially committed by an earlier attempt.
-    void* retry_input = nullptr;
     CollectiveKernelContext context;
 
     uint64_t element_count = 0;

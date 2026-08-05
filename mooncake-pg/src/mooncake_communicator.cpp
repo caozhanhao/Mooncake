@@ -416,12 +416,10 @@ PGResult<void> MooncakeCommunicator::initializePlannedCollectives(
                std::make_unique<AllReduceBindingMaterializer>(
                    &context_.device_link_manager, &context_.link_manager,
                    device_index_, rank_)));
-    CollectiveFailureRecoveryCallback failure_recovery_callback;
-    if (meta_->autoSyncOnFailure) {
-        failure_recovery_callback = [this](InGroupRank failed_peer) {
-            return recoverCollectiveFailure(failed_peer);
+    CollectiveFailureReportCallback failure_report_callback =
+        [this](InGroupRank failed_peer) {
+            return reportCollectiveFailure(failed_peer);
         };
-    }
     PG_TRY(
         collective_runtime_,
         GroupCollectiveRuntime::create(
@@ -429,7 +427,7 @@ PGResult<void> MooncakeCommunicator::initializePlannedCollectives(
             &context_.collective_host_proxy, collective_lanes_.get(),
             device_location, context_.engine, collective_bindings_.get(),
             device_index_, context_.collective_timeout_us,
-            std::move(failure_recovery_callback)));
+            std::move(failure_report_callback)));
 
     const auto& arena = collective_arena;
     collective_endpoint_ = GroupEndpointV2{
@@ -451,7 +449,7 @@ PGResult<void> MooncakeCommunicator::initializePlannedCollectives(
     return {};
 }
 
-PGResult<void> MooncakeCommunicator::recoverCollectiveFailure(
+PGResult<void> MooncakeCommunicator::reportCollectiveFailure(
     InGroupRank failed_peer) {
     const auto global_peer = meta_->rank_order[failed_peer];
     const auto target_rank_epoch = meta_->rankEpochs[global_peer];
@@ -475,6 +473,8 @@ PGResult<void> MooncakeCommunicator::recoverCollectiveFailure(
             .reachable = false,
         },
     }});
+    if (!meta_->autoSyncOnFailure) return {};
+
     PG_TRY(auto response, syncAfterFailure());
     if (response.status == SyncAfterFailureStatus::Rejected) {
         return makePGError(PGErrorCode::InvalidState,

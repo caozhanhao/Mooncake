@@ -61,66 +61,65 @@ inline __device__ void copyCollectiveBytes(void* destination,
     copyCollectiveBytes(destination, source, bytes, threadIdx.x, blockDim.x);
 }
 
-// Failure recovery is part of every invocation, including eager invocation.
-// CUDA Graph only changes the lane lifetime; it does not select a different
-// device protocol. The CPU may publish a new binding while this kernel is
-// parked, but only the Coordinator decides whether its plan changes the
-// algorithm or membership.
-inline __device__ bool publishAndWaitForCollectiveRecovery(
-    const CollectiveKernelContext& context, uint64_t failure_view_epoch) {
-    __shared__ int retry;
+// A graph-pinned invocation may reuse its control block after a preceding
+// failure. It can start only when the preceding transport no longer references
+// the pooled data-plane resources. Resource availability is a lifetime rule,
+// not an authorization to retry the failed invocation.
+inline __device__ bool prepareCollectiveInvocation(
+    const CollectiveKernelContext& context) {
+    __shared__ int resource_available;
     if (threadIdx.x == 0) {
         const auto& resources = context.resources;
         auto& control = *resources.control;
-        auto& gate = control.failure_gate;
-        gate.error_code = control.first_error_code;
-        gate.failed_peer = control.failed_peer;
-        gate.failure_cookie = context.failure_cookie;
-        gate.failure_view_epoch = failure_view_epoch;
-        mc_st_release_u32(
-            &gate.state,
-            static_cast<uint32_t>(CollectiveFailureGateState::FailurePending));
-        while (true) {
-            const auto state = static_cast<CollectiveFailureGateState>(
-                mc_ld_acquire(reinterpret_cast<const int*>(&gate.state)));
-            if (state == CollectiveFailureGateState::Open ||
-                state == CollectiveFailureGateState::Closed) {
-                retry = state == CollectiveFailureGateState::Open ? 1 : 0;
-                break;
-            }
+        auto& failure = control.failure;
+        if (static_cast<CollectiveFailureState>(
+                mc_ld_acquire(reinterpret_cast<const int*>(&failure.state))) ==
+            CollectiveFailureState::Acknowledged) {
+            mc_st_release_u32(
+                &failure.state,
+                static_cast<uint32_t>(CollectiveFailureState::Idle));
+        }
+        const bool asynchronous_resource_idle =
+            mc_ld_acquire(
+                reinterpret_cast<const int*>(&control.resource_idle)) != 0;
+        const auto host_command_state =
+            static_cast<HostTransferCommandState>(mc_ld_acquire(
+                reinterpret_cast<const int*>(&resources.host_command->state)));
+        const bool host_command_reusable =
+            host_command_state == HostTransferCommandState::Idle ||
+            host_command_state == HostTransferCommandState::Completed ||
+            host_command_state == HostTransferCommandState::Failed;
+        resource_available =
+            asynchronous_resource_idle && host_command_reusable ? 1 : 0;
+        if (resource_available) {
+            control.first_error_code = 0;
+            control.failed_peer = -1;
+        } else {
+            control.first_error_code = failure.error_code;
+            control.failed_peer = failure.failed_peer;
         }
     }
     __syncthreads();
-    return retry != 0;
+    return resource_available != 0;
 }
 
-// A graph-pinned lane outlives one kernel invocation. If its preceding attempt
-// could not prove the underlying transport idle, the gate remains closed
-// across replay. The next invocation may ask CPU progress to recover again,
-// but it must not touch the snapshot or transport arena until CPU explicitly
-// reopens the gate.
-inline __device__ bool enterCollectiveFailureGate(
+inline __device__ void reportCollectiveFailureAndWait(
     const CollectiveKernelContext& context) {
-    __shared__ int gate_closed;
-    __shared__ uint64_t failure_view_epoch;
     if (threadIdx.x == 0) {
         const auto& resources = context.resources;
         auto& control = *resources.control;
-        auto& gate = control.failure_gate;
-        gate_closed = static_cast<CollectiveFailureGateState>(mc_ld_acquire(
-                          reinterpret_cast<const int*>(&gate.state))) ==
-                              CollectiveFailureGateState::Closed
-                          ? 1
-                          : 0;
-        if (gate_closed) {
-            control.first_error_code = gate.error_code;
-            control.failed_peer = gate.failed_peer;
-            failure_view_epoch = gate.failure_view_epoch;
+        auto& failure = control.failure;
+        failure.error_code = control.first_error_code;
+        failure.failed_peer = control.failed_peer;
+        failure.failure_cookie = context.failure_cookie;
+        mc_st_release_u32(&failure.state, static_cast<uint32_t>(
+                                              CollectiveFailureState::Pending));
+        while (static_cast<CollectiveFailureState>(mc_ld_acquire(
+                   reinterpret_cast<const int*>(&failure.state))) !=
+               CollectiveFailureState::Acknowledged) {
         }
     }
     __syncthreads();
-    if (!gate_closed) return true;
-    return publishAndWaitForCollectiveRecovery(context, failure_view_epoch);
 }
 
 }  // namespace mooncake

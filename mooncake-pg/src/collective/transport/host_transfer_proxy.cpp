@@ -119,17 +119,6 @@ bool CollectiveHostTransferProxy::commandReusableLocked(
     return resource_idle && state == HostTransferCommandState::Idle;
 }
 
-bool CollectiveHostTransferProxy::commandReusable(
-    const HostTransferCommandLease& command, bool resource_idle) {
-    std::lock_guard<std::mutex> lock(command_mutex_);
-    PG_ASSERT(command.index < commands_.size() &&
-                  commands_[command.index].in_use &&
-                  command.host == host_commands_ + command.index &&
-                  command.device == device_commands_ + command.index,
-              "collective host command lease is invalid");
-    return commandReusableLocked(command, resource_idle);
-}
-
 bool CollectiveHostTransferProxy::releaseCommand(
     const HostTransferCommandLease& command, bool resource_idle) {
     std::lock_guard<std::mutex> lock(command_mutex_);

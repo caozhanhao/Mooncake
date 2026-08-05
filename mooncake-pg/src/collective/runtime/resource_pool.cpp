@@ -1,7 +1,5 @@
 #include "collective/runtime/resource_pool.h"
 
-#include <atomic>
-
 #include "pg_utils.h"
 
 namespace mooncake {
@@ -65,14 +63,6 @@ PGResult<CollectiveResourceLease> CollectiveResourcePool::tryAcquire(
 
 const CollectiveBufferLayout& CollectiveResourcePool::bufferLayout() {
     return collectiveBufferLayout();
-}
-
-bool CollectiveResourcePool::readyForRetry(
-    const CollectiveResourceLease& resources) const {
-    const bool resource_idle =
-        std::atomic_ref<uint32_t>(resources.control.host->resource_idle)
-            .load(std::memory_order_acquire) != 0;
-    return host_proxy_->commandReusable(resources.host_command, resource_idle);
 }
 
 bool CollectiveResourcePool::release(const CollectiveResourceLease& resources,

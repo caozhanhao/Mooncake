@@ -36,8 +36,6 @@ class CollectiveHostTransferProxy {
                               uint32_t command_count = 128);
     std::optional<HostTransferCommandLease> tryAcquireCommand(
         CollectiveControlBlock* control);
-    bool commandReusable(const HostTransferCommandLease& command,
-                         bool resource_idle);
     bool releaseCommand(const HostTransferCommandLease& command,
                         bool resource_idle);
     void shutdown();
