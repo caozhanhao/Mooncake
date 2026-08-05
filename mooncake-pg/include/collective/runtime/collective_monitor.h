@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_COLLECTIVE_RUNTIME_HOST_PROGRESS_H
-#define MOONCAKE_PG_COLLECTIVE_RUNTIME_HOST_PROGRESS_H
+#ifndef MOONCAKE_PG_COLLECTIVE_RUNTIME_COLLECTIVE_MONITOR_H
+#define MOONCAKE_PG_COLLECTIVE_RUNTIME_COLLECTIVE_MONITOR_H
 
 #include <atomic>
 #include <chrono>
@@ -29,7 +29,7 @@ struct CollectiveFailureTarget {
     size_t failed_ranks_hint_count = 0;
 };
 
-// One launched eager invocation. Host progress owns this value until its
+// One launched eager invocation. The monitor owns this value until its
 // completion event proves that the resource lease can be retired.
 struct EagerSubmission {
     explicit EagerSubmission(std::shared_ptr<CollectiveResourceLease> value)
@@ -46,11 +46,11 @@ struct EagerSubmission {
 // Communicator-scoped host loop. It observes device failure reports for eager
 // and captured resources, and owns eager submissions until completion. It does
 // not progress collective data or own graph-retention policy.
-class CollectiveHostProgress {
+class CollectiveMonitor {
    public:
-    static PGResult<std::unique_ptr<CollectiveHostProgress>> create(
+    static PGResult<std::unique_ptr<CollectiveMonitor>> create(
         DeviceId device, CollectiveFailureReportCallback report_failure);
-    ~CollectiveHostProgress() noexcept;
+    ~CollectiveMonitor() noexcept;
 
     void registerFailureTarget(
         std::shared_ptr<CollectiveResourceLease> resources,
@@ -66,8 +66,8 @@ class CollectiveHostProgress {
     bool drain(std::chrono::milliseconds timeout);
     void stop() noexcept;
 
-    CollectiveHostProgress(const CollectiveHostProgress&) = delete;
-    CollectiveHostProgress& operator=(const CollectiveHostProgress&) = delete;
+    CollectiveMonitor(const CollectiveMonitor&) = delete;
+    CollectiveMonitor& operator=(const CollectiveMonitor&) = delete;
 
    private:
     struct FailureSource {
@@ -81,8 +81,8 @@ class CollectiveHostProgress {
         InGroupRank failed_peer = -1;
     };
 
-    CollectiveHostProgress(DeviceId device,
-                           CollectiveFailureReportCallback report_failure)
+    CollectiveMonitor(DeviceId device,
+                      CollectiveFailureReportCallback report_failure)
         : device_(device), report_failure_(std::move(report_failure)) {}
 
     bool retireCompletedSubmission();
@@ -90,7 +90,7 @@ class CollectiveHostProgress {
         const FailureSource& source);
     void handleFailure(const FailureClaim& failure);
     bool handleOneFailure();
-    void progressLoop() noexcept;
+    void monitorLoop() noexcept;
     void removeFailureSourceLocked(
         const std::shared_ptr<CollectiveResourceLease>& resources);
 
@@ -107,4 +107,4 @@ class CollectiveHostProgress {
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_COLLECTIVE_RUNTIME_HOST_PROGRESS_H
+#endif  // MOONCAKE_PG_COLLECTIVE_RUNTIME_COLLECTIVE_MONITOR_H

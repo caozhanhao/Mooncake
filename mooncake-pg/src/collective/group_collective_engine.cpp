@@ -10,7 +10,7 @@
 #include "collective/runtime/runtime.h"
 #include "collective/runtime/control_block.cuh"
 #include "collective/runtime/control_pool.h"
-#include "collective/transport/host_transfer_proxy.h"
+#include "collective/transport/host_transfer_executor.h"
 #include "control_plane/control_types.h"
 #include "control_plane/device_link_manager.h"
 #include "control_plane/link_manager.h"
@@ -19,14 +19,14 @@ namespace mooncake {
 
 PGResult<std::unique_ptr<GroupCollectiveEngine>> GroupCollectiveEngine::create(
     CollectiveBufferPool& buffer_pool, CollectiveControlPool& control_pool,
-    CollectiveHostTransferProxy& host_transfer_proxy,
+    HostTransferExecutor& host_transfer_executor,
     DeviceLinkManager& device_links, LinkManager& host_links,
     TransferEngine* transfer_engine, DeviceId device,
     InGroupRank self_in_group_rank, std::string te_location,
     size_t collective_timeout_us,
     std::function<PGResult<void>(InGroupRank)> report_failure) {
     PG_TRY(control_pool.initialize());
-    PG_TRY(host_transfer_proxy.initialize(transfer_engine, &host_links));
+    PG_TRY(host_transfer_executor.initialize(transfer_engine, &host_links));
 
     auto result =
         std::unique_ptr<GroupCollectiveEngine>(new GroupCollectiveEngine(
@@ -41,7 +41,7 @@ PGResult<std::unique_ptr<GroupCollectiveEngine>> GroupCollectiveEngine::create(
            MappedPlan<AllReduceDevicePlan>::create(device));
     PG_TRY(result->runtime_,
            CollectiveRuntime::create(
-               &buffer_pool, &control_pool, &host_transfer_proxy,
+               &buffer_pool, &control_pool, &host_transfer_executor,
                result->lanes_.get(), te_location, transfer_engine, device,
                collective_timeout_us, std::move(report_failure)));
 

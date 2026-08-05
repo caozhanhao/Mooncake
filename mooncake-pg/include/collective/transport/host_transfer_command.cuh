@@ -22,7 +22,7 @@ enum class HostTransferCommandKind : uint32_t {
     Signal,
 };
 
-// Device is the single producer and CollectiveHostTransferProxy is the single
+// Device is the single producer and HostTransferExecutor is the single
 // consumer. Device-only routes never touch this command.
 struct alignas(64) HostTransferCommand {
     uint32_t state = static_cast<uint32_t>(HostTransferCommandState::Idle);

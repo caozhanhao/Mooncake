@@ -1,4 +1,4 @@
-#include "collective/transport/host_transfer_proxy.h"
+#include "collective/transport/host_transfer_executor.h"
 
 #include <chrono>
 #include <cstring>
@@ -34,20 +34,20 @@ using CudaHostMemory = std::unique_ptr<void, CudaHostMemoryDeleter>;
 
 }  // namespace
 
-CollectiveHostTransferProxy::~CollectiveHostTransferProxy() noexcept {
+HostTransferExecutor::~HostTransferExecutor() noexcept {
     try {
         shutdown();
     } catch (const std::exception& error) {
-        LOG(WARNING) << "Collective host proxy shutdown failed: "
+        LOG(WARNING) << "Host transfer executor shutdown failed: "
                      << error.what();
     } catch (...) {
-        LOG(WARNING) << "Collective host proxy shutdown failed";
+        LOG(WARNING) << "Host transfer executor shutdown failed";
     }
 }
 
-PGResult<void> CollectiveHostTransferProxy::initialize(TransferEngine* engine,
-                                                       LinkManager* links,
-                                                       uint32_t command_count) {
+PGResult<void> HostTransferExecutor::initialize(TransferEngine* engine,
+                                                LinkManager* links,
+                                                uint32_t command_count) {
     std::lock_guard<std::mutex> lock(command_mutex_);
     if (initialized()) return {};
 
@@ -69,8 +69,7 @@ PGResult<void> CollectiveHostTransferProxy::initialize(TransferEngine* engine,
         device_commands_ = static_cast<HostTransferCommand*>(device);
         command_count_ = command_count;
         stopping_.store(false, std::memory_order_release);
-        progress_thread_ =
-            std::thread(&CollectiveHostTransferProxy::progressLoop, this);
+        thread_ = std::thread(&HostTransferExecutor::runLoop, this);
         initialized_.store(true, std::memory_order_release);
     } catch (const std::exception& exception) {
         commands_.clear();
@@ -82,18 +81,18 @@ PGResult<void> CollectiveHostTransferProxy::initialize(TransferEngine* engine,
         command_count_ = 0;
         return makePGError(
             PGErrorCode::SystemError,
-            std::string("failed to start collective host proxy: ") +
+            std::string("failed to start host transfer executor: ") +
                 exception.what());
     }
     (void)host_memory.release();
     return {};
 }
 
-PGResult<HostTransferCommandLease> CollectiveHostTransferProxy::acquireCommand(
+PGResult<HostTransferCommandLease> HostTransferExecutor::acquireCommand(
     CollectiveControlBlock* control) {
     if (!initialized() || stopping_.load(std::memory_order_acquire)) {
         return makePGError(PGErrorCode::InvalidState,
-                           "collective host transfer proxy is not running");
+                           "host transfer executor is not running");
     }
     std::lock_guard<std::mutex> lock(command_mutex_);
     for (uint32_t index = 0; index < command_count_; ++index) {
@@ -109,7 +108,7 @@ PGResult<HostTransferCommandLease> CollectiveHostTransferProxy::acquireCommand(
                        "collective host commands are exhausted");
 }
 
-bool CollectiveHostTransferProxy::releaseCommand(
+bool HostTransferExecutor::releaseCommand(
     const HostTransferCommandLease& command) {
     std::lock_guard<std::mutex> lock(command_mutex_);
     PG_ASSERT(command.index < commands_.size() &&
@@ -134,7 +133,7 @@ bool CollectiveHostTransferProxy::releaseCommand(
     return true;
 }
 
-void CollectiveHostTransferProxy::abandonCommand(
+void HostTransferExecutor::abandonCommand(
     const HostTransferCommandLease& command) {
     std::lock_guard<std::mutex> lock(command_mutex_);
     PG_ASSERT(command.index < commands_.size() &&
@@ -145,9 +144,9 @@ void CollectiveHostTransferProxy::abandonCommand(
     commands_[command.index].state = SlotState::Abandoned;
 }
 
-bool CollectiveHostTransferProxy::submitPhase(uint32_t command_index,
-                                              ActiveTransfer::Phase phase,
-                                              ActiveTransfer& active) {
+bool HostTransferExecutor::submitPhase(uint32_t command_index,
+                                       ActiveTransfer::Phase phase,
+                                       ActiveTransfer& active) {
     auto& command = host_commands_[command_index];
     auto& control = *commands_[command_index].control;
     const auto segment = links_->resolvePeer(command.peer_host_link);
@@ -203,7 +202,7 @@ bool CollectiveHostTransferProxy::submitPhase(uint32_t command_index,
     return true;
 }
 
-bool CollectiveHostTransferProxy::beginCommand(uint32_t command_index) {
+bool HostTransferExecutor::beginCommand(uint32_t command_index) {
     auto& command = host_commands_[command_index];
     uint32_t expected = static_cast<uint32_t>(HostTransferCommandState::Ready);
     if (!std::atomic_ref<uint32_t>(command.state)
@@ -231,7 +230,7 @@ bool CollectiveHostTransferProxy::beginCommand(uint32_t command_index) {
     return true;
 }
 
-bool CollectiveHostTransferProxy::advanceTransfer(ActiveTransfer& active) {
+bool HostTransferExecutor::advanceTransfer(ActiveTransfer& active) {
     auto& command = host_commands_[active.command_index];
     auto& control = *commands_[active.command_index].control;
     TransferStatus status{};
@@ -267,8 +266,8 @@ bool CollectiveHostTransferProxy::advanceTransfer(ActiveTransfer& active) {
     return true;
 }
 
-void CollectiveHostTransferProxy::failCommand(uint32_t command_index,
-                                              CollectiveProtocolError error) {
+void HostTransferExecutor::failCommand(uint32_t command_index,
+                                       CollectiveProtocolError error) {
     auto& command = host_commands_[command_index];
     auto& control = *commands_[command_index].control;
     std::atomic_ref<int32_t> first_error(control.first_error_code);
@@ -281,7 +280,7 @@ void CollectiveHostTransferProxy::failCommand(uint32_t command_index,
     storeState(command, HostTransferCommandState::Failed);
 }
 
-void CollectiveHostTransferProxy::progressLoop() {
+void HostTransferExecutor::runLoop() {
     while (!stopping_.load(std::memory_order_acquire)) {
         bool progressed = false;
         for (uint32_t index = 0; index < command_count_; ++index) {
@@ -305,13 +304,13 @@ void CollectiveHostTransferProxy::progressLoop() {
     }
 }
 
-void CollectiveHostTransferProxy::shutdown() {
+void HostTransferExecutor::shutdown() {
     {
         std::lock_guard<std::mutex> lock(command_mutex_);
         if (!initialized_.exchange(false, std::memory_order_acq_rel)) return;
         stopping_.store(true, std::memory_order_release);
     }
-    if (progress_thread_.joinable()) progress_thread_.join();
+    if (thread_.joinable()) thread_.join();
 
     bool safe_to_free = active_transfers_.empty();
     {

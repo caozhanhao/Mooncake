@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_COLLECTIVE_TRANSPORT_HOST_TRANSFER_PROXY_H
-#define MOONCAKE_PG_COLLECTIVE_TRANSPORT_HOST_TRANSFER_PROXY_H
+#ifndef MOONCAKE_PG_COLLECTIVE_TRANSPORT_HOST_TRANSFER_EXECUTOR_H
+#define MOONCAKE_PG_COLLECTIVE_TRANSPORT_HOST_TRANSFER_EXECUTOR_H
 
 #include <atomic>
 #include <cstdint>
@@ -23,13 +23,13 @@ struct HostTransferCommandLease {
     HostTransferCommand* device = nullptr;
 };
 
-// Process-level TE host progress service. It owns only host-transfer commands;
-// the control block passed at acquisition remains owned by the common
-// runtime resource pool.
-class CollectiveHostTransferProxy {
+// Process-level executor for device-produced Host transfer commands. It owns
+// only command storage; the control block passed at acquisition remains owned
+// by the common runtime resource pool.
+class HostTransferExecutor {
    public:
-    CollectiveHostTransferProxy() = default;
-    ~CollectiveHostTransferProxy() noexcept;
+    HostTransferExecutor() = default;
+    ~HostTransferExecutor() noexcept;
 
     PGResult<void> initialize(TransferEngine* engine, LinkManager* links,
                               uint32_t command_count = 128);
@@ -43,9 +43,8 @@ class CollectiveHostTransferProxy {
         return initialized_.load(std::memory_order_acquire);
     }
 
-    CollectiveHostTransferProxy(const CollectiveHostTransferProxy&) = delete;
-    CollectiveHostTransferProxy& operator=(const CollectiveHostTransferProxy&) =
-        delete;
+    HostTransferExecutor(const HostTransferExecutor&) = delete;
+    HostTransferExecutor& operator=(const HostTransferExecutor&) = delete;
 
    private:
     enum class SlotState : uint8_t {
@@ -71,7 +70,7 @@ class CollectiveHostTransferProxy {
                      ActiveTransfer& active);
     bool advanceTransfer(ActiveTransfer& active);
     void failCommand(uint32_t command_index, CollectiveProtocolError error);
-    void progressLoop();
+    void runLoop();
 
     TransferEngine* engine_ = nullptr;
     LinkManager* links_ = nullptr;
@@ -83,11 +82,11 @@ class CollectiveHostTransferProxy {
     std::vector<CommandSlot> commands_;
     std::vector<ActiveTransfer> active_transfers_;
 
-    std::thread progress_thread_;
+    std::thread thread_;
     std::atomic<bool> initialized_{false};
     std::atomic<bool> stopping_{false};
 };
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_COLLECTIVE_TRANSPORT_HOST_TRANSFER_PROXY_H
+#endif  // MOONCAKE_PG_COLLECTIVE_TRANSPORT_HOST_TRANSFER_EXECUTOR_H

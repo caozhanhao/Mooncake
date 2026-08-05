@@ -21,7 +21,7 @@ PGResult<void> cudaFailure(cudaError_t error, const char* operation) {
 
 PGResult<std::unique_ptr<CollectiveRuntime>> CollectiveRuntime::create(
     CollectiveBufferPool* buffer_pool, CollectiveControlPool* control_pool,
-    CollectiveHostTransferProxy* host_transfer_proxy, CollectiveLanePool* lanes,
+    HostTransferExecutor* host_transfer_executor, CollectiveLanePool* lanes,
     std::string te_location, TransferEngine* engine, DeviceId device,
     size_t collective_timeout_us,
     CollectiveFailureReportCallback failure_report_callback) {
@@ -37,22 +37,21 @@ PGResult<std::unique_ptr<CollectiveRuntime>> CollectiveRuntime::create(
             : collective_timeout_us * clock_rate / 1000ULL;
 
     auto runtime = std::unique_ptr<CollectiveRuntime>(new CollectiveRuntime(
-        buffer_pool, control_pool, host_transfer_proxy, lanes,
+        buffer_pool, control_pool, host_transfer_executor, lanes,
         std::move(te_location), engine, device, timeout_ticks));
-    PG_TRY(runtime->host_progress_,
-           CollectiveHostProgress::create(device,
-                                          std::move(failure_report_callback)));
+    PG_TRY(runtime->monitor_, CollectiveMonitor::create(
+                                  device, std::move(failure_report_callback)));
     return runtime;
 }
 
 CollectiveRuntime::~CollectiveRuntime() noexcept {
     stopAccepting();
-    if (host_progress_) {
-        (void)host_progress_->drain(std::chrono::milliseconds(100));
-        host_progress_->stop();
+    if (monitor_) {
+        (void)monitor_->drain(std::chrono::milliseconds(100));
+        monitor_->stop();
     }
     for (const auto& [_, graph] : graph_resources_) {
-        host_progress_->stopObserving(graph.resources);
+        monitor_->stopObserving(graph.resources);
         (void)graph.resources->retire();
     }
 }
@@ -139,7 +138,7 @@ PGResult<void> CollectiveRuntime::submit(
     }
 
     const uint64_t failure_target_id = next_failure_target_id_++;
-    host_progress_->registerFailureTarget(
+    monitor_->registerFailureTarget(
         resources, CollectiveFailureTarget{
                        .failure_target_id = failure_target_id,
                        .failed_ranks_hint = failed_ranks_hint,
@@ -151,7 +150,7 @@ PGResult<void> CollectiveRuntime::submit(
     launch(common);
     const auto launch_error = cudaGetLastError();
     if (launch_error != cudaSuccess) {
-        host_progress_->unregisterFailureTarget(resources, failure_target_id);
+        monitor_->unregisterFailureTarget(resources, failure_target_id);
         if (new_graph_resources) graph_resources_.erase(capture.id);
         return cudaFailure(launch_error, "collective kernel launch");
     }
@@ -162,13 +161,13 @@ PGResult<void> CollectiveRuntime::submit(
     const auto record_error =
         cudaEventRecord(eager_submission->completion, stream);
     if (record_error != cudaSuccess) {
-        // Host progress continues to observe a possible device failure. With
+        // The monitor continues to observe a possible device failure. With
         // no completion evidence, the submitted resources are retained and
         // will be quarantined when the runtime is destroyed.
-        host_progress_->markCompletionUnproven();
+        monitor_->markCompletionUnproven();
         return cudaFailure(record_error, "collective completion event record");
     }
-    host_progress_->submit(std::move(eager_submission));
+    monitor_->submit(std::move(eager_submission));
     return {};
 }
 
@@ -179,7 +178,7 @@ void CollectiveRuntime::stopAccepting() {
 bool CollectiveRuntime::drain(std::chrono::milliseconds timeout) {
     stopAccepting();
     std::lock_guard<std::mutex> admission(admission_mutex_);
-    return !host_progress_ || host_progress_->drain(timeout);
+    return !monitor_ || monitor_->drain(timeout);
 }
 
 }  // namespace mooncake

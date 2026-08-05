@@ -9,7 +9,7 @@
 #include "collective/buffer/collective_buffer_pool.h"
 #include "collective/runtime/control_pool.h"
 #include "collective/runtime/collective_lane_pool.h"
-#include "collective/transport/host_transfer_proxy.h"
+#include "collective/transport/host_transfer_executor.h"
 #include "error_types.h"
 
 namespace mooncake {
@@ -27,7 +27,7 @@ struct CollectiveBufferLayout {
 // MooncakePGContext (process/device lifetime)
 //   |- CollectiveBufferPool       shared registered arena
 //   |- CollectiveControlPool        shared failure/resource controls
-//   `- CollectiveHostTransferProxy optional host-transfer commands
+//   `- HostTransferExecutor        optional host-transfer commands
 //
 // GroupCollectiveEngine (communicator lifetime)
 //   |- CollectiveLanePool         stable wire-control addresses + lane owners
@@ -82,13 +82,12 @@ class CollectiveResourcePool {
     CollectiveResourcePool(CollectiveBufferPool* buffer_pool,
                            CollectiveControlPool* control_pool,
                            CollectiveLanePool* lanes,
-                           CollectiveHostTransferProxy* host_proxy,
-                           DeviceId device, std::string te_location,
-                           TransferEngine* engine)
+                           HostTransferExecutor* host_executor, DeviceId device,
+                           std::string te_location, TransferEngine* engine)
         : buffer_pool_(buffer_pool),
           control_pool_(control_pool),
           lanes_(lanes),
-          host_proxy_(host_proxy),
+          host_executor_(host_executor),
           device_(device),
           te_location_(std::move(te_location)),
           engine_(engine) {}
@@ -105,7 +104,7 @@ class CollectiveResourcePool {
     CollectiveBufferPool* buffer_pool_ = nullptr;
     CollectiveControlPool* control_pool_ = nullptr;
     CollectiveLanePool* lanes_ = nullptr;
-    CollectiveHostTransferProxy* host_proxy_ = nullptr;
+    HostTransferExecutor* host_executor_ = nullptr;
     DeviceId device_ = kInvalidDeviceId;
     std::string te_location_;
     TransferEngine* engine_ = nullptr;

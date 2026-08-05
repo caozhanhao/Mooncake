@@ -48,7 +48,7 @@ Process-level services remain shared across groups:
  MooncakePGContext
  ├── CollectiveBufferPool          registered device arena per device
  ├── CollectiveControlPool         mapped host/device status blocks
- ├── CollectiveHostTransferProxy   mapped commands + Host TE progress
+ ├── HostTransferExecutor          mapped commands + Host TE execution
  ├── DeviceLinkManager             process-owned device links
  └── LinkManager                   process-owned Host TE links
 
@@ -111,7 +111,7 @@ parallel feature module and explicit typed state to the existing group owner:
 `applyView()` resolves membership and routes once, then explicitly builds and
 publishes each operation's typed plan. The finite list is intentionally visible
 instead of hidden behind a virtual builder registry. `CollectiveRuntime`,
-resource pools, Host progress, and transport code remain unchanged.
+resource pools, collective monitoring, and transport code remain unchanged.
 
 Ranks agree on algorithm and participant order. They do not need identical
 physical transports for a directed edge: `DevP2p`, `DevRdma`, and `Host` all
@@ -184,7 +184,7 @@ There is no virtual `CollectiveInvocation` hierarchy.
           |
           +--> launchAllReduce
           |
-          `--> CollectiveHostProgress
+          `--> CollectiveMonitor
                ├── eager completion retirement
                └── failure claim / report / acknowledge
 ```
@@ -211,7 +211,7 @@ There is no collective-level retry. A failed executor:
 
 1. records its failed peer and error;
 2. waits for Host acknowledgement;
-3. lets `CollectiveHostProgress` report the failure and invoke
+3. lets `CollectiveMonitor` report the failure and invoke
    sync-after-failure;
 4. finishes the failed invocation after the authoritative view is aligned.
 
@@ -226,7 +226,7 @@ Implemented on the planned path:
 - GPU AllReduce SUM for float16, bfloat16, and float32;
 - Flat Ring plan construction and execution;
 - per-peer `DevP2p`, `DevRdma`, or `Host` routes;
-- device API and Host proxy transfer paths;
+- device API and Host transfer execution paths;
 - one eager/CUDA Graph execution protocol;
 - failure publication and sync-after-failure.
 
@@ -249,9 +249,9 @@ Deferred:
    `collective/transport/peer_route.h`.
 3. Typed AllReduce request and plan:
    `collective/allreduce/allreduce.*` and `collective/plan/mapped_plan.h`.
-4. Common submission resources and progress:
+4. Common submission resources and monitoring:
    `collective/runtime/runtime.*`, `resource_pool.*`, and
-   `host_progress.*`.
+   `collective_monitor.*`.
 5. Device execution:
    `collective/device_context.cuh`, `collective/allreduce/flat_ring.cuh`, then
    `collective/transport/`.

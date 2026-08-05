@@ -18,7 +18,7 @@ namespace mooncake {
 
 class CollectiveBufferPool;
 class CollectiveControlPool;
-class CollectiveHostTransferProxy;
+class HostTransferExecutor;
 class CollectiveLanePool;
 class DeviceLinkManager;
 class CollectiveRuntime;
@@ -29,14 +29,14 @@ template <typename Plan>
 class MappedPlan;
 
 // Complete group-scoped owner for the planned collective path. Process-level
-// pools, transfer progress and link managers are borrowed shared services.
+// pools, the Host transfer executor and link managers are borrowed services.
 // The communicator only dispatches into this object and coordinates its final
 // close with legacy communicator teardown.
 class GroupCollectiveEngine {
    public:
     static PGResult<std::unique_ptr<GroupCollectiveEngine>> create(
         CollectiveBufferPool& buffer_pool, CollectiveControlPool& control_pool,
-        CollectiveHostTransferProxy& host_transfer_proxy,
+        HostTransferExecutor& host_transfer_executor,
         DeviceLinkManager& device_links, LinkManager& host_links,
         TransferEngine* transfer_engine, DeviceId device,
         InGroupRank self_in_group_rank, std::string te_location,
@@ -52,7 +52,7 @@ class GroupCollectiveEngine {
                              cudaStream_t stream, int32_t* failed_ranks_hint,
                              size_t failed_ranks_hint_count);
 
-    // Terminal execution shutdown. It drains eager work, stops Host progress,
+    // Terminal execution shutdown. It drains eager work, stops monitoring,
     // and leaves endpoint/peer-signal storage alive until close() follows the
     // control-plane group unregister.
     bool stop(std::chrono::milliseconds timeout);

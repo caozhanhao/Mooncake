@@ -1,4 +1,4 @@
-#include "collective/runtime/host_progress.h"
+#include "collective/runtime/collective_monitor.h"
 
 #include <algorithm>
 #include <atomic>
@@ -15,26 +15,24 @@ EagerSubmission::~EagerSubmission() noexcept {
     if (completion) (void)cudaEventDestroy(completion);
 }
 
-PGResult<std::unique_ptr<CollectiveHostProgress>>
-CollectiveHostProgress::create(DeviceId device,
-                               CollectiveFailureReportCallback report_failure) {
-    auto progress = std::unique_ptr<CollectiveHostProgress>(
-        new CollectiveHostProgress(device, std::move(report_failure)));
+PGResult<std::unique_ptr<CollectiveMonitor>> CollectiveMonitor::create(
+    DeviceId device, CollectiveFailureReportCallback report_failure) {
+    auto monitor = std::unique_ptr<CollectiveMonitor>(
+        new CollectiveMonitor(device, std::move(report_failure)));
     try {
-        progress->thread_ =
-            std::thread(&CollectiveHostProgress::progressLoop, progress.get());
+        monitor->thread_ =
+            std::thread(&CollectiveMonitor::monitorLoop, monitor.get());
     } catch (const std::system_error& error) {
         return makePGError(
             PGErrorCode::SystemError,
-            std::string("failed to start collective host progress: ") +
-                error.what());
+            std::string("failed to start collective monitor: ") + error.what());
     }
-    return progress;
+    return monitor;
 }
 
-CollectiveHostProgress::~CollectiveHostProgress() noexcept { stop(); }
+CollectiveMonitor::~CollectiveMonitor() noexcept { stop(); }
 
-void CollectiveHostProgress::registerFailureTarget(
+void CollectiveMonitor::registerFailureTarget(
     std::shared_ptr<CollectiveResourceLease> resources,
     CollectiveFailureTarget target) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -53,7 +51,7 @@ void CollectiveHostProgress::registerFailureTarget(
     });
 }
 
-void CollectiveHostProgress::removeFailureSourceLocked(
+void CollectiveMonitor::removeFailureSourceLocked(
     const std::shared_ptr<CollectiveResourceLease>& resources) {
     failure_sources_.erase(
         std::remove_if(
@@ -62,7 +60,7 @@ void CollectiveHostProgress::removeFailureSourceLocked(
         failure_sources_.end());
 }
 
-void CollectiveHostProgress::unregisterFailureTarget(
+void CollectiveMonitor::unregisterFailureTarget(
     const std::shared_ptr<CollectiveResourceLease>& resources,
     uint64_t failure_target_id) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -81,24 +79,23 @@ void CollectiveHostProgress::unregisterFailureTarget(
     if (source->targets.empty()) failure_sources_.erase(source);
 }
 
-void CollectiveHostProgress::stopObserving(
+void CollectiveMonitor::stopObserving(
     const std::shared_ptr<CollectiveResourceLease>& resources) {
     std::lock_guard<std::mutex> lock(mutex_);
     removeFailureSourceLocked(resources);
 }
 
-void CollectiveHostProgress::markCompletionUnproven() {
+void CollectiveMonitor::markCompletionUnproven() {
     std::lock_guard<std::mutex> lock(mutex_);
     has_unproven_completion_ = true;
 }
 
-void CollectiveHostProgress::submit(
-    std::unique_ptr<EagerSubmission> submission) {
+void CollectiveMonitor::submit(std::unique_ptr<EagerSubmission> submission) {
     std::lock_guard<std::mutex> lock(mutex_);
     eager_submissions_.push_back(std::move(submission));
 }
 
-bool CollectiveHostProgress::retireCompletedSubmission() {
+bool CollectiveMonitor::retireCompletedSubmission() {
     std::unique_ptr<EagerSubmission> completed;
     cudaError_t query = cudaErrorNotReady;
     {
@@ -134,8 +131,8 @@ bool CollectiveHostProgress::retireCompletedSubmission() {
     return true;
 }
 
-std::optional<CollectiveHostProgress::FailureClaim>
-CollectiveHostProgress::claimFailure(const FailureSource& source) {
+std::optional<CollectiveMonitor::FailureClaim> CollectiveMonitor::claimFailure(
+    const FailureSource& source) {
     auto& failure = source.resources->control.host->failure;
     auto state = std::atomic_ref<uint32_t>(failure.state);
     uint32_t expected = static_cast<uint32_t>(CollectiveFailureState::Pending);
@@ -158,7 +155,7 @@ CollectiveHostProgress::claimFailure(const FailureSource& source) {
     };
 }
 
-void CollectiveHostProgress::handleFailure(const FailureClaim& failure) {
+void CollectiveMonitor::handleFailure(const FailureClaim& failure) {
     if (failure.target.failed_ranks_hint && failure.failed_peer >= 0 &&
         static_cast<size_t>(failure.failed_peer) <
             failure.target.failed_ranks_hint_count) {
@@ -180,7 +177,7 @@ void CollectiveHostProgress::handleFailure(const FailureClaim& failure) {
                std::memory_order_release);
 }
 
-bool CollectiveHostProgress::handleOneFailure() {
+bool CollectiveMonitor::handleOneFailure() {
     std::optional<FailureClaim> failure;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -194,11 +191,11 @@ bool CollectiveHostProgress::handleOneFailure() {
     return true;
 }
 
-void CollectiveHostProgress::progressLoop() noexcept {
+void CollectiveMonitor::monitorLoop() noexcept {
     const auto select = cudaSetDevice(device_);
     if (select != cudaSuccess) {
-        LOG(ERROR) << "Collective host progress cannot select CUDA device "
-                   << device_ << ": " << cudaGetErrorString(select);
+        LOG(ERROR) << "Collective monitor cannot select CUDA device " << device_
+                   << ": " << cudaGetErrorString(select);
         return;
     }
     while (!stopping_.load(std::memory_order_acquire)) {
@@ -210,7 +207,7 @@ void CollectiveHostProgress::progressLoop() noexcept {
     }
 }
 
-bool CollectiveHostProgress::drain(std::chrono::milliseconds timeout) {
+bool CollectiveMonitor::drain(std::chrono::milliseconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (true) {
         {
@@ -223,7 +220,7 @@ bool CollectiveHostProgress::drain(std::chrono::milliseconds timeout) {
     }
 }
 
-void CollectiveHostProgress::stop() noexcept {
+void CollectiveMonitor::stop() noexcept {
     if (stopping_.exchange(true, std::memory_order_acq_rel)) return;
     if (thread_.joinable()) thread_.join();
 }

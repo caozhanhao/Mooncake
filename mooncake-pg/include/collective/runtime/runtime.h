@@ -16,22 +16,22 @@
 #include <cuda_alike.h>
 
 #include "collective/runtime/collective_lane_pool.h"
-#include "collective/runtime/host_progress.h"
+#include "collective/runtime/collective_monitor.h"
 #include "collective/runtime/resource_pool.h"
 #include "error_types.h"
 
 namespace mooncake {
 
 // Communicator-scoped submission runtime. It owns invocation resources,
-// graph retention, eager completion and failure progress; operation code owns
+// graph retention, eager completion and failure monitoring; operation code owns
 // validation, its typed plan and its kernel launcher.
 class CollectiveRuntime {
    public:
     static PGResult<std::unique_ptr<CollectiveRuntime>> create(
         CollectiveBufferPool* buffer_pool, CollectiveControlPool* control_pool,
-        CollectiveHostTransferProxy* host_transfer_proxy,
-        CollectiveLanePool* lanes, std::string te_location,
-        TransferEngine* engine, DeviceId device, size_t collective_timeout_us,
+        HostTransferExecutor* host_transfer_executor, CollectiveLanePool* lanes,
+        std::string te_location, TransferEngine* engine, DeviceId device,
+        size_t collective_timeout_us,
         CollectiveFailureReportCallback failure_report_callback);
     ~CollectiveRuntime() noexcept;
 
@@ -49,13 +49,14 @@ class CollectiveRuntime {
    private:
     CollectiveRuntime(CollectiveBufferPool* buffer_pool,
                       CollectiveControlPool* control_pool,
-                      CollectiveHostTransferProxy* host_transfer_proxy,
+                      HostTransferExecutor* host_transfer_executor,
                       CollectiveLanePool* lanes, std::string te_location,
                       TransferEngine* engine, DeviceId device,
                       uint64_t timeout_device_ticks)
         : lanes_(lanes),
-          resource_pool_(buffer_pool, control_pool, lanes_, host_transfer_proxy,
-                         device, std::move(te_location), engine),
+          resource_pool_(buffer_pool, control_pool, lanes_,
+                         host_transfer_executor, device, std::move(te_location),
+                         engine),
           device_(device),
           timeout_device_ticks_(timeout_device_ticks) {}
 
@@ -73,7 +74,7 @@ class CollectiveRuntime {
     // GroupCollectiveEngine owns the runtime and destroys it before lanes_.
     CollectiveLanePool* lanes_ = nullptr;
     CollectiveResourcePool resource_pool_;
-    std::unique_ptr<CollectiveHostProgress> host_progress_;
+    std::unique_ptr<CollectiveMonitor> monitor_;
     DeviceId device_ = kInvalidDeviceId;
     uint64_t timeout_device_ticks_ = 0;
 

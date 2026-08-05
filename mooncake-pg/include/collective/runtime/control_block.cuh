@@ -26,8 +26,8 @@ enum class CollectiveFailureState : uint32_t {
 };
 
 // Device-to-host failure handshake. A failed invocation publishes evidence and
-// waits until CPU progress has finished its sync-after-failure attempt. The
-// acknowledgement only lets that invocation finish; it never authorizes the
+// waits until CollectiveMonitor finishes its sync-after-failure attempt. Its
+// acknowledgement lets only that invocation finish; it never authorizes the
 // same invocation to run the collective again.
 struct CollectiveFailureReport {
     uint32_t state = static_cast<uint32_t>(CollectiveFailureState::Idle);
@@ -37,8 +37,8 @@ struct CollectiveFailureReport {
 };
 
 // Common host-visible state for device and host transports. It is not owned by
-// HostTransferProxy; every invocation gets the same control ABI regardless of
-// the route selected by its current plan.
+// HostTransferExecutor; every invocation gets the same control ABI regardless
+// of the route selected by its current plan.
 struct alignas(64) CollectiveControlBlock {
     int32_t first_error_code = 0;
     InGroupRank failed_peer = -1;

@@ -103,7 +103,7 @@ PGResult<CollectiveResourceLease> CollectiveResourcePool::acquire(
                                  kBufferAlignment, te_location_, engine_));
 
     PG_TRY(resources.host_command,
-           host_proxy_->acquireCommand(resources.control.host));
+           host_executor_->acquireCommand(resources.control.host));
     return resources;
 }
 
@@ -114,7 +114,7 @@ const CollectiveBufferLayout& CollectiveResourcePool::bufferLayout() {
 bool CollectiveResourcePool::release(
     CollectiveResourceLease& resources) noexcept {
     if (resources.host_command.host) {
-        if (!host_proxy_->releaseCommand(resources.host_command)) {
+        if (!host_executor_->releaseCommand(resources.host_command)) {
             resources.host_command = {};
             abandon(resources);
             return false;
@@ -140,7 +140,7 @@ bool CollectiveResourcePool::release(
 void CollectiveResourcePool::abandon(
     CollectiveResourceLease& resources) noexcept {
     if (resources.host_command.host) {
-        host_proxy_->abandonCommand(resources.host_command);
+        host_executor_->abandonCommand(resources.host_command);
         resources.host_command = {};
     }
     if (resources.buffer) {

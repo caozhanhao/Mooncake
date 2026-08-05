@@ -346,7 +346,7 @@ PGResult<void> MooncakePGContext::shutdown() {
     }
 
     if (agent_host) agent_host->shutdown();
-    collective_host_proxy.shutdown();
+    host_transfer_executor.shutdown();
     collective_control_pool.shutdown();
     // Device transport/QP state references the process collective arena and
     // must be destroyed before CollectiveBufferPool releases that arena.
@@ -399,13 +399,14 @@ PGResult<void> MooncakeCommunicator::initializePlannedCollectives(
         [this](InGroupRank failed_peer) {
             return reportCollectiveFailure(failed_peer);
         };
-    PG_TRY(planned_collectives_,
-           GroupCollectiveEngine::create(
-               context_.collective_buffer_pool,
-               context_.collective_control_pool, context_.collective_host_proxy,
-               context_.device_link_manager, context_.link_manager,
-               context_.engine, device_index_, rank_, device_location,
-               context_.collective_timeout_us, std::move(report_failure)));
+    PG_TRY(
+        planned_collectives_,
+        GroupCollectiveEngine::create(
+            context_.collective_buffer_pool, context_.collective_control_pool,
+            context_.host_transfer_executor, context_.device_link_manager,
+            context_.link_manager, context_.engine, device_index_, rank_,
+            device_location, context_.collective_timeout_us,
+            std::move(report_failure)));
     return {};
 }
 

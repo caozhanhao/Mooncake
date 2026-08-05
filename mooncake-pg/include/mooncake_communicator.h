@@ -15,7 +15,7 @@
 
 #include "collective/buffer/collective_buffer_pool.h"
 #include "collective/runtime/control_pool.h"
-#include "collective/transport/host_transfer_proxy.h"
+#include "collective/transport/host_transfer_executor.h"
 #include "control_plane/agent_host.h"
 #include "control_plane/coordinator_host.h"
 #include "control_plane/device_link_manager.h"
@@ -58,7 +58,7 @@ struct MooncakePGContext {
     CollectiveBufferPool collective_buffer_pool;
     DeviceLinkManager device_link_manager;
     CollectiveControlPool collective_control_pool;
-    CollectiveHostTransferProxy collective_host_proxy;
+    HostTransferExecutor host_transfer_executor;
     MooncakeWorkerManager worker_manager;
     P2PDeviceWorkerManager p2p_device_worker_manager;
     // Coordinator (rank 0 only).

@@ -138,9 +138,9 @@ add_library(mooncake_pg SHARED
     collective/runtime/collective_lane_pool.cpp
     collective/runtime/runtime.cpp
     collective/runtime/control_pool.cpp
-    collective/runtime/host_progress.cpp
+    collective/runtime/collective_monitor.cpp
     collective/runtime/resource_pool.cpp
-    collective/transport/host_transfer_proxy.cpp
+    collective/transport/host_transfer_executor.cpp
     control_plane/link_manager.cpp
     control_plane/device_link_manager.cpp
     control_plane/collective_policy.cpp
