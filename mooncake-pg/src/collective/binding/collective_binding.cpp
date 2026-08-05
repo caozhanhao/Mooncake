@@ -36,14 +36,28 @@ using CudaHostMemory = std::unique_ptr<void, CudaHostMemoryDeleter>;
 
 }  // namespace
 
+PGResult<CollectiveBindingView> CollectiveBinding::deviceView(
+    uint64_t view_epoch) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!ready_ || view_epoch_ != view_epoch) {
+        return makePGError(PGErrorCode::InvalidState,
+                           "collective binding does not match GroupView");
+    }
+    return CollectiveBindingView{
+        .slots = slots_device_,
+        .lane_sequences = lane_sequences_device_,
+        .active_slot = active_slot_device_,
+    };
+}
+
 GroupCollectiveBindings::~GroupCollectiveBindings() noexcept {
     if (retained_) return;
     for (auto& binding : bindings_) release(*binding);
 }
 
-PGResult<void> GroupCollectiveBindings::allocate(BindingEntry& entry) {
+PGResult<void> GroupCollectiveBindings::allocate(CollectiveBinding& binding) {
     const GpuDeviceGuard guard(device_);
-    const auto slot_bytes = kCollectiveBindingSlots * entry.slot_bytes;
+    const auto slot_bytes = kCollectiveBindingSlots * binding.slot_bytes_;
 
     void* slots_host = nullptr;
     void* slots_device = nullptr;
@@ -74,98 +88,74 @@ PGResult<void> GroupCollectiveBindings::allocate(BindingEntry& entry) {
                 uint64_t{0});
     *static_cast<uint32_t*>(active_slot.get()) = 0;
 
-    entry.slots_host = slots.release();
-    entry.slots_device = slots_device;
-    entry.lane_sequences_host = static_cast<uint64_t*>(sequences.release());
-    entry.lane_sequences_device = static_cast<uint64_t*>(sequences_device);
-    entry.active_slot_host = static_cast<uint32_t*>(active_slot.release());
-    entry.active_slot_device = static_cast<uint32_t*>(active_slot_device);
+    binding.slots_host_ = slots.release();
+    binding.slots_device_ = slots_device;
+    binding.lane_sequences_host_ = static_cast<uint64_t*>(sequences.release());
+    binding.lane_sequences_device_ = static_cast<uint64_t*>(sequences_device);
+    binding.active_slot_host_ = static_cast<uint32_t*>(active_slot.release());
+    binding.active_slot_device_ = static_cast<uint32_t*>(active_slot_device);
     return {};
 }
 
 void GroupCollectiveBindings::publish(
-    BindingEntry& entry, const void* kernel_plan,
+    CollectiveBinding& binding, const void* kernel_plan,
     std::vector<std::shared_ptr<void>> resources) {
-    const uint32_t active = std::atomic_ref<uint32_t>(*entry.active_slot_host)
-                                .load(std::memory_order_relaxed);
+    const uint32_t active =
+        std::atomic_ref<uint32_t>(*binding.active_slot_host_)
+            .load(std::memory_order_relaxed);
     const uint32_t next = (active + 1) % kCollectiveBindingSlots;
     auto* target =
-        static_cast<char*>(entry.slots_host) + next * entry.slot_bytes;
-    std::memcpy(target, kernel_plan, entry.slot_bytes);
-    entry.slot_resources[next] = std::move(resources);
-    std::atomic_ref<uint32_t>(*entry.active_slot_host)
+        static_cast<char*>(binding.slots_host_) + next * binding.slot_bytes_;
+    std::memcpy(target, kernel_plan, binding.slot_bytes_);
+    binding.slot_resources_[next] = std::move(resources);
+    std::atomic_ref<uint32_t>(*binding.active_slot_host_)
         .store(next, std::memory_order_release);
 }
 
-PGResult<CollectiveBindingId> GroupCollectiveBindings::add(
+PGResult<CollectiveBinding*> GroupCollectiveBindings::add(
     std::unique_ptr<CollectiveBindingMaterializer> materializer) {
     const auto plan_bytes = materializer->kernelPlanBytes();
     PG_ASSERT(plan_bytes != 0,
               "collective binding materializer has an empty kernel plan");
-    auto entry = std::make_unique<BindingEntry>();
-    entry->slot_bytes = plan_bytes;
-    entry->materializer = std::move(materializer);
-    PG_TRY(allocate(*entry));
+    auto binding = std::unique_ptr<CollectiveBinding>(
+        new CollectiveBinding(std::move(materializer), plan_bytes));
+    PG_TRY(allocate(*binding));
+    auto* result = binding.get();
 
     std::lock_guard<std::mutex> lock(mutex_);
-    bindings_.push_back(std::move(entry));
-    return static_cast<CollectiveBindingId>(bindings_.size() - 1);
+    bindings_.push_back(std::move(binding));
+    return result;
 }
 
 PGResult<void> GroupCollectiveBindings::apply(const GroupView& view) {
     std::lock_guard<std::mutex> lock(mutex_);
     std::optional<PGError> first_error;
     for (auto& owned : bindings_) {
-        auto& entry = *owned;
-        auto materialized = entry.materializer->materialize(view);
+        auto& binding = *owned;
+        std::lock_guard<std::mutex> binding_lock(binding.mutex_);
+        auto materialized = binding.materializer_->materialize(view);
         // Agent effects may rematerialize the same authoritative view after a
         // rank-state or link update. Only a new epoch starts a new wire-token
         // domain; resetting on a same-epoch apply could reuse an old token and
         // would happen at different times on different ranks.
-        if (entry.view_epoch != view.epoch) {
-            std::fill_n(entry.lane_sequences_host, control_lane_count_,
+        if (binding.view_epoch_ != view.epoch) {
+            std::fill_n(binding.lane_sequences_host_, control_lane_count_,
                         uint64_t{0});
         }
         if (auto* ready = std::get_if<ReadyCollectiveBinding>(&materialized)) {
-            publish(entry, ready->kernel_plan.get(),
+            publish(binding, ready->kernel_plan.get(),
                     std::move(ready->resources));
-            entry.ready = true;
+            binding.ready_ = true;
         } else {
             auto& failed = std::get<FailedCollectiveBinding>(materialized);
-            publish(entry, failed.kernel_plan.get(), {});
-            entry.ready = false;
+            publish(binding, failed.kernel_plan.get(), {});
+            binding.ready_ = false;
             if (!first_error) first_error = std::move(failed.error);
         }
-        entry.view_epoch = view.epoch;
+        binding.view_epoch_ = view.epoch;
     }
     if (first_error) return makePGError(std::move(*first_error));
     return {};
-}
-
-PGResult<void> GroupCollectiveBindings::requireReady(
-    CollectiveBindingId binding_id, uint64_t view_epoch) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    PG_ASSERT(binding_id < bindings_.size(),
-              "collective binding id is invalid");
-    const auto& entry = *bindings_[binding_id];
-    if (!entry.ready || entry.view_epoch != view_epoch) {
-        return makePGError(PGErrorCode::InvalidState,
-                           "collective binding does not match GroupView");
-    }
-    return {};
-}
-
-CollectiveBindingView GroupCollectiveBindings::deviceView(
-    CollectiveBindingId binding_id) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    PG_ASSERT(binding_id < bindings_.size(),
-              "collective binding id is invalid");
-    const auto& entry = *bindings_[binding_id];
-    return CollectiveBindingView{
-        .slots = entry.slots_device,
-        .lane_sequences = entry.lane_sequences_device,
-        .active_slot = entry.active_slot_device,
-    };
 }
 
 void GroupCollectiveBindings::retainForProcessLifetime() {
@@ -173,8 +163,9 @@ void GroupCollectiveBindings::retainForProcessLifetime() {
     if (retained_) return;
     auto& retained = retainedBindings();
     std::lock_guard<std::mutex> retained_lock(retained.mutex);
-    for (const auto& entry : bindings_) {
-        for (const auto& resources : entry->slot_resources) {
+    for (const auto& binding : bindings_) {
+        std::lock_guard<std::mutex> binding_lock(binding->mutex_);
+        for (const auto& resources : binding->slot_resources_) {
             retained.resources.insert(retained.resources.end(),
                                       resources.begin(), resources.end());
         }
@@ -182,23 +173,24 @@ void GroupCollectiveBindings::retainForProcessLifetime() {
     retained_ = true;
 }
 
-void GroupCollectiveBindings::release(BindingEntry& entry) noexcept {
+void GroupCollectiveBindings::release(CollectiveBinding& binding) noexcept {
     try {
         const GpuDeviceGuard guard(device_);
-        if (entry.lane_sequences_host) cudaFreeHost(entry.lane_sequences_host);
-        if (entry.active_slot_host) cudaFreeHost(entry.active_slot_host);
-        if (entry.slots_host) cudaFreeHost(entry.slots_host);
+        if (binding.lane_sequences_host_)
+            cudaFreeHost(binding.lane_sequences_host_);
+        if (binding.active_slot_host_) cudaFreeHost(binding.active_slot_host_);
+        if (binding.slots_host_) cudaFreeHost(binding.slots_host_);
     } catch (const std::exception& error) {
         LOG(WARNING) << "Collective binding cleanup failed: " << error.what();
     } catch (...) {
         LOG(WARNING) << "Collective binding cleanup failed";
     }
-    entry.lane_sequences_host = nullptr;
-    entry.lane_sequences_device = nullptr;
-    entry.active_slot_host = nullptr;
-    entry.active_slot_device = nullptr;
-    entry.slots_host = nullptr;
-    entry.slots_device = nullptr;
+    binding.lane_sequences_host_ = nullptr;
+    binding.lane_sequences_device_ = nullptr;
+    binding.active_slot_host_ = nullptr;
+    binding.active_slot_device_ = nullptr;
+    binding.slots_host_ = nullptr;
+    binding.slots_device_ = nullptr;
 }
 
 }  // namespace mooncake

@@ -411,7 +411,7 @@ PGResult<void> MooncakeCommunicator::initializePlannedCollectives(
     const uint32_t lane_count = control_layout.lane_count;
     collective_bindings_ =
         std::make_unique<GroupCollectiveBindings>(device_index_, lane_count);
-    PG_TRY(allreduce_binding_id_,
+    PG_TRY(allreduce_binding_,
            collective_bindings_->add(
                std::make_unique<AllReduceBindingMaterializer>(
                    &context_.device_link_manager, &context_.link_manager,
@@ -425,8 +425,8 @@ PGResult<void> MooncakeCommunicator::initializePlannedCollectives(
         GroupCollectiveRuntime::create(
             &context_.collective_buffer_pool, &context_.collective_control_pool,
             &context_.collective_host_proxy, collective_lanes_.get(),
-            device_location, context_.engine, collective_bindings_.get(),
-            device_index_, context_.collective_timeout_us,
+            device_location, context_.engine, device_index_,
+            context_.collective_timeout_us,
             std::move(failure_report_callback)));
 
     const auto& arena = collective_arena;
@@ -681,6 +681,7 @@ PGResult<void> MooncakeCommunicator::initialize(
                          << meta_->group_id << ": " << planned.error().message
                          << "; retaining the legacy collective protocol";
             collective_runtime_.reset();
+            allreduce_binding_ = nullptr;
             collective_bindings_.reset();
             collective_endpoint_.reset();
             if (collective_lanes_) {
@@ -947,16 +948,17 @@ PGResult<void> MooncakeCommunicator::allReduceGpu(
         }
         if (protocol == AllReduceProtocol::Planned) {
             PG_VALIDATE_STATE(
-                collective_runtime_ && collective_bindings_ &&
-                    allreduce_binding_id_ != kInvalidCollectiveBindingId,
+                collective_runtime_ && allreduce_binding_,
                 "Coordinator selected planned AllReduce but its local "
                 "runtime is unavailable");
-            PG_TRY(auto invocation, AllReduceInvocation::create(
-                                        allreduce_binding_id_, send_buffer,
-                                        recv_buffer, count, datatype, op));
-            return collective_runtime_->execute(invocation, view_epoch, stream,
-                                                failed_ranks_hint,
-                                                failed_ranks_hint_count);
+            PG_TRY(auto binding_view,
+                   allreduce_binding_->deviceView(view_epoch));
+            PG_TRY(auto invocation,
+                   AllReduceInvocation::create(send_buffer, recv_buffer, count,
+                                               datatype, op));
+            return collective_runtime_->execute(
+                invocation, binding_view, view_epoch, stream, failed_ranks_hint,
+                failed_ranks_hint_count);
         }
     }
 
@@ -1438,6 +1440,7 @@ PGResult<void> MooncakeCommunicator::shutdown() {
         }
     }
     collective_runtime_.reset();
+    allreduce_binding_ = nullptr;
     collective_bindings_.reset();
     collective_endpoint_.reset();
 

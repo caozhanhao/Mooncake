@@ -14,10 +14,6 @@ inline constexpr DeviceId kInvalidDeviceId = -2;
 // GlobalRank must not leak into collective executors or transports.
 using InGroupRank = int32_t;
 
-using CollectiveBindingId = uint32_t;
-inline constexpr CollectiveBindingId kInvalidCollectiveBindingId =
-    ~CollectiveBindingId{0};
-
 struct BufferSpan {
     uint64_t offset = 0;
     uint64_t bytes = 0;

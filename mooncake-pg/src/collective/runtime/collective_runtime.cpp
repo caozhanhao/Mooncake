@@ -3,7 +3,6 @@
 #include <limits>
 #include <utility>
 
-#include "collective/binding/collective_binding.h"
 #include "gpu_runtime.h"
 #include "pg_utils.h"
 
@@ -30,8 +29,7 @@ PGResult<std::unique_ptr<GroupCollectiveRuntime>>
 GroupCollectiveRuntime::create(
     CollectiveBufferPool* buffer_pool, CollectiveControlPool* control_pool,
     CollectiveHostTransferProxy* host_transfer_proxy, CollectiveLanePool* lanes,
-    std::string te_location, TransferEngine* engine,
-    GroupCollectiveBindings* bindings, DeviceId device,
+    std::string te_location, TransferEngine* engine, DeviceId device,
     size_t collective_timeout_us,
     CollectiveFailureReportCallback failure_report_callback) {
     const GpuDeviceGuard guard(device);
@@ -48,7 +46,7 @@ GroupCollectiveRuntime::create(
     auto runtime =
         std::unique_ptr<GroupCollectiveRuntime>(new GroupCollectiveRuntime(
             buffer_pool, control_pool, host_transfer_proxy, lanes,
-            std::move(te_location), engine, bindings, device, timeout_ticks));
+            std::move(te_location), engine, device, timeout_ticks));
     auto failure_handler = std::make_unique<CollectiveFailureHandler>(
         std::move(failure_report_callback));
     PG_TRY(runtime->progress_,
@@ -124,8 +122,8 @@ void GroupCollectiveRuntime::rollbackEmptyCapturedCollective(
 }
 
 CollectiveKernelContext GroupCollectiveRuntime::makeKernelContext(
-    const CollectiveResourceLease& resources, CollectiveBindingId binding_id,
-    uint64_t failure_cookie) const {
+    const CollectiveResourceLease& resources,
+    CollectiveBindingView binding_view, uint64_t failure_cookie) const {
     const auto& layout = CollectiveResourcePool::bufferLayout();
     const auto& control_layout = lanes_->layout().lanes[resources.lane.index];
     return CollectiveKernelContext{
@@ -151,15 +149,14 @@ CollectiveKernelContext GroupCollectiveRuntime::makeKernelContext(
             },
         .lane_index = resources.lane.index,
         .failure_cookie = failure_cookie,
-        .binding = bindings_->deviceView(binding_id),
+        .binding = binding_view,
     };
 }
 
-PGResult<void> GroupCollectiveRuntime::execute(CollectiveInvocation& invocation,
-                                               uint64_t view_epoch,
-                                               cudaStream_t stream,
-                                               int32_t* failed_ranks_hint,
-                                               size_t failed_ranks_hint_count) {
+PGResult<void> GroupCollectiveRuntime::execute(
+    CollectiveInvocation& invocation, CollectiveBindingView binding_view,
+    uint64_t view_epoch, cudaStream_t stream, int32_t* failed_ranks_hint,
+    size_t failed_ranks_hint_count) {
     PG_VALIDATE_STATE(accepting_.load(std::memory_order_acquire),
                       "collective runtime is stopping");
     PG_VALIDATE_ARG(failed_ranks_hint, "failed-ranks hint is null");
@@ -169,7 +166,6 @@ PGResult<void> GroupCollectiveRuntime::execute(CollectiveInvocation& invocation,
     std::lock_guard<std::mutex> admission(admission_mutex_);
     PG_VALIDATE_STATE(accepting_.load(std::memory_order_acquire),
                       "collective runtime is stopping");
-    PG_TRY(bindings_->requireReady(invocation.bindingId(), view_epoch));
     if (!lane_view_epoch_ || *lane_view_epoch_ != view_epoch) {
         lane_view_epoch_ = view_epoch;
         next_lane_ = 0;
@@ -178,8 +174,8 @@ PGResult<void> GroupCollectiveRuntime::execute(CollectiveInvocation& invocation,
     PG_TRY(auto collective, acquireTrackedCollective(capture_id, stream));
 
     const uint64_t failure_cookie = next_failure_cookie_++;
-    const auto context = makeKernelContext(
-        collective->resources, invocation.bindingId(), failure_cookie);
+    const auto context =
+        makeKernelContext(collective->resources, binding_view, failure_cookie);
     CollectiveFailureTarget failure_target{
         .failure_cookie = failure_cookie,
         .failed_ranks_hint = failed_ranks_hint,

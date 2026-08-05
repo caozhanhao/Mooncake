@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -44,19 +45,48 @@ class CollectiveBindingMaterializer {
         const GroupView& view) const = 0;
 };
 
+// One communicator-scoped binding for one collective implementation. It owns
+// the stable device publication read by every invocation of that collective.
+class CollectiveBinding {
+   public:
+    PGResult<CollectiveBindingView> deviceView(uint64_t view_epoch) const;
+
+    CollectiveBinding(const CollectiveBinding&) = delete;
+    CollectiveBinding& operator=(const CollectiveBinding&) = delete;
+
+   private:
+    friend class GroupCollectiveBindings;
+
+    CollectiveBinding(
+        std::unique_ptr<CollectiveBindingMaterializer> materializer,
+        size_t slot_bytes)
+        : materializer_(std::move(materializer)), slot_bytes_(slot_bytes) {}
+
+    std::unique_ptr<CollectiveBindingMaterializer> materializer_;
+    size_t slot_bytes_ = 0;
+    void* slots_host_ = nullptr;
+    void* slots_device_ = nullptr;
+    uint64_t* lane_sequences_host_ = nullptr;
+    uint64_t* lane_sequences_device_ = nullptr;
+    uint32_t* active_slot_host_ = nullptr;
+    uint32_t* active_slot_device_ = nullptr;
+
+    bool ready_ = false;
+    uint64_t view_epoch_ = 0;
+    std::array<std::vector<std::shared_ptr<void>>, kCollectiveBindingSlots>
+        slot_resources_;
+    mutable std::mutex mutex_;
+};
+
 class GroupCollectiveBindings {
    public:
     GroupCollectiveBindings(DeviceId device, uint32_t control_lane_count)
         : device_(device), control_lane_count_(control_lane_count) {}
     ~GroupCollectiveBindings() noexcept;
 
-    PGResult<CollectiveBindingId> add(
+    PGResult<CollectiveBinding*> add(
         std::unique_ptr<CollectiveBindingMaterializer> materializer);
     PGResult<void> apply(const GroupView& view);
-
-    PGResult<void> requireReady(CollectiveBindingId binding_id,
-                                uint64_t view_epoch) const;
-    CollectiveBindingView deviceView(CollectiveBindingId binding_id) const;
 
     void retainForProcessLifetime();
 
@@ -64,31 +94,15 @@ class GroupCollectiveBindings {
     GroupCollectiveBindings& operator=(const GroupCollectiveBindings&) = delete;
 
    private:
-    struct BindingEntry {
-        std::unique_ptr<CollectiveBindingMaterializer> materializer;
-        size_t slot_bytes = 0;
-        void* slots_host = nullptr;
-        void* slots_device = nullptr;
-        uint64_t* lane_sequences_host = nullptr;
-        uint64_t* lane_sequences_device = nullptr;
-        uint32_t* active_slot_host = nullptr;
-        uint32_t* active_slot_device = nullptr;
-
-        bool ready = false;
-        uint64_t view_epoch = 0;
-        std::array<std::vector<std::shared_ptr<void>>, kCollectiveBindingSlots>
-            slot_resources;
-    };
-
-    PGResult<void> allocate(BindingEntry& entry);
-    void publish(BindingEntry& entry, const void* kernel_plan,
+    PGResult<void> allocate(CollectiveBinding& binding);
+    void publish(CollectiveBinding& binding, const void* kernel_plan,
                  std::vector<std::shared_ptr<void>> resources);
-    void release(BindingEntry& entry) noexcept;
+    void release(CollectiveBinding& binding) noexcept;
 
     DeviceId device_ = kInvalidDeviceId;
     uint32_t control_lane_count_ = 0;
-    std::vector<std::unique_ptr<BindingEntry>> bindings_;
-    mutable std::mutex mutex_;
+    std::vector<std::unique_ptr<CollectiveBinding>> bindings_;
+    std::mutex mutex_;
     bool retained_ = false;
 };
 
