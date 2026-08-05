@@ -39,9 +39,8 @@
 namespace mooncake {
 namespace device {
 
-// Immutable mapping for one peer allocation. Unlike the EP rank table, this
-// object can be retained by one GroupView binding without later imports
-// mutating its address.
+// One imported peer allocation. Unlike the EP rank table, importing another
+// peer does not mutate this mapping. The caller owns its lifetime.
 class P2pPeerMapping {
    public:
     virtual ~P2pPeerMapping() = default;
@@ -100,7 +99,7 @@ class P2pTransport {
 
 // Kept outside P2pTransport's vtable so existing users retain their ABI and
 // EP keeps its mutable table-oriented interface unchanged.
-std::shared_ptr<P2pPeerMapping> importP2pPeerBuffer(
+std::unique_ptr<P2pPeerMapping> importP2pPeerBuffer(
     const std::vector<int32_t>& opaque_handle);
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,5 @@
 #include "collective/route/group_peer_routes.h"
 
-#include <utility>
-
 #include "control_plane/control_types.h"
 #include "control_plane/device_link_manager.h"
 #include "control_plane/link_manager.h"
@@ -30,16 +28,15 @@ GroupPeerRoutes buildGroupPeerRoutes(const GroupView& view,
         route.peer_in_group_rank = peer_in_group_rank;
 
         if (endpoint->device_p2p.has_value()) {
-            auto local = device_links.resolveP2p(device, global_peer,
-                                                 endpoint->arena_generation);
-            if (local.has_value()) {
+            auto* mapped_arena = device_links.resolveP2p(
+                device, global_peer, endpoint->arena_generation);
+            if (mapped_arena) {
                 route.kind = PeerRouteKind::DevP2p;
-                route.device_p2p.mapped_arena = local->mapped_arena_base;
+                route.device_p2p.mapped_arena = mapped_arena;
                 route.device_p2p.mapped_buffer =
-                    static_cast<char*>(local->mapped_arena_base) +
+                    static_cast<char*>(mapped_arena) +
                     endpoint->control_base_address -
                     endpoint->arena_base_address;
-                result.p2p_mappings_.push_back(std::move(local->mapping));
                 result.routes_[peer_index] = route;
                 continue;
             }
@@ -61,7 +58,6 @@ GroupPeerRoutes buildGroupPeerRoutes(const GroupView& view,
                                              endpoint->control_base_address -
                                              endpoint->arena_base_address,
                 };
-                result.rdma_transport_ = std::move(local->transport);
                 result.routes_[peer_index] = route;
                 continue;
             }

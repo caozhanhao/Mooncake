@@ -39,7 +39,7 @@ NCCL-shaped `mooncakePg*` C API; dispatch changes only inside
                           v
                +------------------------+
                | CollectivePlanPublisher|
-               | graph-stable plan slots|
+               | graph-stable plan      |
                +-----------+------------+
                            |
                            v
@@ -75,9 +75,9 @@ plans without seeing `GroupView`, `GlobalRank`, or either link manager.
 | Dispatch | C API, `MooncakeCommunicator` | Argument validation and Planned/Legacy split | Algorithm construction or transport selection |
 | Control policy | `CollectivePolicyBuilder`, `CollectivePlanSet` | Canonical algorithm and message-size buckets | Per-rank neighbors, addresses, QPs, or transport choice |
 | Active ranks | `ActiveGroupRanks` | Active `InGroupRank` order and local ordinal | Global ranks, endpoints, or routes |
-| Peer routes | `GroupPeerRoutes`, host/device link managers | Endpoint-to-route resolution and device-link lifetime | Ring/tree roles or collective algorithms |
+| Peer routes | `GroupPeerRoutes`, host/device link managers | Endpoint-to-route resolution; process link managers own link lifetime | Ring/tree roles or collective algorithms |
 | Plan construction | `CollectivePlanBuilder`, typed builders | Algorithm-specific peer roles and typed kernel plans | `GroupView`, `GlobalRank`, or link-resource ownership |
-| Plan publication | `CollectivePlanPublisher`, `CollectivePlanHandle` | Stable double-buffered publication visible to graph replay | Invocation buffers, streams, or algorithm execution |
+| Plan publication | `CollectivePlanPublisher`, `CollectivePlanHandle` | One stable mapped plan address visible to graph replay | Invocation buffers, streams, or algorithm execution |
 | Runtime/operation | `GroupCollectiveRuntime`, `CollectiveInvocation` | Admission, resource acquisition, kernel launch, and graph retention | Membership, algorithm policy, or eager retirement |
 | Host progress | `CollectiveHostProgress`, `CollectiveFailureHandler` | Failure report/sync/ack and eager completion retirement | Transport progress, graph ownership, or pool allocation policy |
 | Executor | typed executor and algorithm routines | Reduction, dependency order, participant shards, transport tiling | CPU policy calls or local algorithm fallback |
@@ -101,7 +101,7 @@ application uses two concrete projections:
              |
              `--> GroupPeerRoutes[InGroupRank]
                   - PeerRoute kernel value
-                  - typed owner of referenced device resources
+                  - no link-resource ownership
 ```
 
 `ActiveGroupRanks` is a small value shared by every collective builder.
@@ -109,12 +109,12 @@ It is the active projection of Coordinator-authoritative membership. An absent
 local ordinal represents an inactive local rank, which a captured graph must
 handle without host admission.
 
-`GroupPeerRoutes` is built once for a communicator when a view is applied. It
-translates `InGroupRank` to `GlobalRank` only while consulting endpoints and
-process link managers. Everything below this boundary stays group-local. The
-table owns imported P2P mappings and device RDMA transports referenced by its
-POD `PeerRoute` entries. A published plan slot retains the route table, so its
-raw kernel addresses cannot outlive their concrete owner.
+`GroupPeerRoutes` is a short-lived projection built when a communicator view is
+applied. It translates `InGroupRank` to `GlobalRank` only while consulting
+endpoints and process link managers. Everything below this boundary stays
+group-local. `DeviceLinkManager` owns imported P2P mappings and device RDMA
+transports; the route table and typed plans only borrow their kernel-facing
+addresses for the current link generation.
 
 This is local O(group size) work, not Coordinator-side per-rank planning and
 not a global capability matrix. Builders use only the routes required by their
@@ -141,8 +141,36 @@ duplicating rank-space or transport code.
  message-size buckets      endpoint-selected routes    peer roles
  algorithm                 device resource owners      typed executor fields
 
- same on every rank        rebuilt per GroupView       rebuilt per GroupView
+ same on every rank        projected per GroupView     rebuilt per GroupView
 ```
+
+The publisher owns one mapped plan object at a stable address. View
+application overwrites its value; captured kernels read that address on every
+replay. No per-view plan object or route-table keepalive is required because
+publication and link replacement share the quiescent-boundary contract below.
+
+## View-update boundary
+
+This first slice deliberately does not support a `GroupView` update racing a
+collective that still consumes the preceding plan or peer routes. Applying a
+view therefore assumes a collective-quiescent boundary. This is a temporary
+internal implementation contract, not a requirement placed on the user.
+
+A later control-plane quiescing phase must stop host admission, hold graph
+replay at a device-visible gate, wait until old plan/route consumers are no
+longer running, update process links and the mapped plan, and then release the
+group. That protocol is intentionally not implemented in this change. The
+single stable plan, non-owning group routes, and process-owned device links are
+the data structures it will operate on; double-buffered plans and per-view
+`shared_ptr` ownership would only duplicate that synchronization boundary.
+Because device links are shared across groups, replacing one link generation
+must quiesce every communicator that can still borrow that device/peer link;
+plan publication itself remains scoped to the affected group.
+
+The failure path is the narrow exception: after an executor publishes failure
+and parks for acknowledgement, it no longer reads the plan or peer routes.
+`syncAfterFailure` may therefore apply the authoritative replacement view
+before acknowledging that failed invocation.
 
 Invocation state remains separate:
 
@@ -182,6 +210,14 @@ The executor receives one already selected `PeerRoute`. It never switches
 transport or algorithm after launch. If a required local route is unavailable,
 the builder publishes an invalid plan and the planned path fails closed.
 
+The only new Transfer Engine P2P surface is a per-peer import that returns one
+uniquely owned mapping. The existing EP `importPeerHandles` API owns a mutable
+rank table and embeds EP rank-layout assumptions, so using it for arbitrary
+process-level group membership would couple collective routes to that table.
+`DeviceLinkManager` owns the per-peer mapping and exposes only its resolved
+address to group-local route construction. Device RDMA continues to use the
+existing Transfer Engine API unchanged.
+
 ## Eager, CUDA Graph, and failure handling
 
 Eager and CUDA Graph use the same invocation, runtime, executor, and transport
@@ -216,7 +252,7 @@ and reuse policy.
  invocation / graph replay
           |
           +--> acquire or locate retained runtime resources
-          +--> read current CollectivePlanHandle active slot
+          +--> read current plan through CollectivePlanHandle
           +--> run current Coordinator-selected plan
                     |
              +------+------+
@@ -239,7 +275,7 @@ and reuse policy.
 There is no collective-level retry. A failed invocation reports the failure
 and finishes after sync-after-failure aligns the observed view. The application
 owns any retry. A later eager invocation or graph replay reads the newly
-published active plan slot without graph recapture.
+published plan through the same stable address without graph recapture.
 
 Host admission rejects a new collective after self deactivation. Replay has no
 host participation, so the published AllReduce plan carries an explicit local
@@ -278,6 +314,8 @@ protocol.
 - Hierarchical topology/performance policy and implementation;
 - AllGather, Broadcast, and a general hybrid dependency scheduler;
 - graph-destruction callbacks and independently pinned concurrent graph lanes;
+- the control-plane quiescing phase and device-visible replay gate that enforce
+  the view-update boundary described above;
 - device-RDMA reconnect/generation semantics after uncertain in-flight work;
 - scalable device-RDMA endpoint exchange beyond the current process-rank
   table;
@@ -293,7 +331,8 @@ protocol.
    `collective/plan/logical_plan.h`, `control_plane/collective_policy.*`.
 2. Serializable endpoint descriptors and process link state:
    `collective/endpoint.h`, `control_plane/device_link_manager.*`,
-   `control_plane/link_manager.*`.
+   `control_plane/link_manager.*`, and the narrow per-peer import in
+   `mooncake-transfer-engine/.../device_transport.h`.
 3. The control-to-local boundary:
    `collective/plan/active_group_ranks.*`,
    `collective/route/group_peer_routes.*`, and

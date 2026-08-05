@@ -7,16 +7,15 @@
 
 namespace mooncake {
 
-inline constexpr uint32_t kCollectivePlanSlots = 2;
-
-// Stable kernel reference to the published collective plans. Membership,
-// algorithm and peer routes live in the typed plan slots selected through
-// active_slot on every invocation. Per-lane sequences enter the same view-local
-// token domain when a new active slot is published.
+// Stable kernel reference to the published collective plan. View application
+// overwrites the mapped plan only at the collective-quiescent boundary assumed
+// by this slice. Future control-plane quiescing will enforce that boundary, so
+// every eager invocation and graph replay can read the current plan through
+// the same captured address. Per-lane sequences provide the view-local wire
+// tokens.
 struct CollectivePlanHandle {
-    const void* slots = nullptr;
+    const void* plan = nullptr;
     uint64_t* lane_sequences = nullptr;
-    const uint32_t* active_slot = nullptr;
 };
 
 }  // namespace mooncake

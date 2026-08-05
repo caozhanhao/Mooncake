@@ -695,6 +695,10 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                     }
                 },
                 [this](const ApplyViewToCommunicator& e) {
+                    // Link replacement and plan publication form one view
+                    // transition. This slice assumes they run at a
+                    // collective-quiescent boundary; a future Agent phase will
+                    // enforce that boundary for host calls and graph replay.
                     device_link_manager_.observeGroupView(e.view,
                                                           e.rank_epochs);
                     withCommunicator(e.view.group_id, [&](auto communicator) {

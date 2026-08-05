@@ -938,25 +938,18 @@ PGResult<void> MooncakeCommunicator::allReduceGpu(
     // signatures intentionally remain on the legacy implementation on every
     // rank; this is not a local-error fallback from a selected planned path.
     if (AllReduceInvocation::supports(datatype, op)) {
-        AllReduceProtocol protocol = AllReduceProtocol::Legacy;
-        uint64_t view_epoch = 0;
-        {
-            std::lock_guard<std::mutex> lock(collective_policy_mutex_);
-            protocol = allreduce_protocol_;
-            view_epoch = collective_view_epoch_;
-        }
-        if (protocol == AllReduceProtocol::Planned) {
+        if (allreduce_protocol_ == AllReduceProtocol::Planned) {
             PG_VALIDATE_STATE(
                 collective_runtime_ && allreduce_plan_publisher_,
                 "Coordinator selected planned AllReduce but its local "
                 "runtime is unavailable");
-            PG_TRY(auto plan, allreduce_plan_publisher_->handle(view_epoch));
+            PG_TRY(auto plan, allreduce_plan_publisher_->handle());
             PG_TRY(auto invocation,
                    AllReduceInvocation::create(send_buffer, recv_buffer, count,
                                                datatype, op));
-            return collective_runtime_->execute(invocation, plan, view_epoch,
-                                                stream, failed_ranks_hint,
-                                                failed_ranks_hint_count);
+            return collective_runtime_->execute(
+                invocation, plan, collective_view_epoch_, stream,
+                failed_ranks_hint, failed_ranks_hint_count);
         }
     }
 
@@ -1436,6 +1429,7 @@ PGResult<void> MooncakeCommunicator::shutdown() {
         if (collective_plan_registry_) {
             collective_plan_registry_->retainForProcessLifetime();
         }
+        context_.device_link_manager.retainForProcessLifetime();
     }
     collective_runtime_.reset();
     allreduce_plan_publisher_ = nullptr;
@@ -1792,11 +1786,8 @@ void MooncakeCommunicator::applyViewUpdate(
                          << applied.error().message;
         }
     }
-    {
-        std::lock_guard<std::mutex> lock(collective_policy_mutex_);
-        allreduce_protocol_ = view.collective_plans.allreduce_protocol;
-        collective_view_epoch_ = view.epoch;
-    }
+    allreduce_protocol_ = view.collective_plans.allreduce_protocol;
+    collective_view_epoch_ = view.epoch;
 }
 
 void MooncakeCommunicator::onPeerLinkReset(InGroupRank peer) {

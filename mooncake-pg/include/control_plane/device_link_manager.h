@@ -19,17 +19,9 @@ class P2pPeerMapping;
 class RdmaTransport;
 }  // namespace device
 
-struct DeviceP2pLink {
-    // Owns mapped_arena_base.
-    std::shared_ptr<device::P2pPeerMapping> mapping;
-    void* mapped_arena_base = nullptr;
-};
-
 // The indices are opaque slots owned by TE's device RDMA implementation. They
 // are never used for group rank arithmetic.
 struct DeviceRdmaLink {
-    // Owns qp_contexts and remote_keys.
-    std::shared_ptr<device::RdmaTransport> transport;
     void* qp_contexts = nullptr;
     const uint32_t* remote_keys = nullptr;
     int32_t local_peer_index = -1;
@@ -41,8 +33,9 @@ struct DeviceRdmaLink {
 // Process-level owner of device mappings and QPs. Concrete observations are
 // keyed by (local device, global peer), while AgentStateMachine receives one
 // process-level Device reachability contribution aggregated across devices.
-// GroupPeerRoutes retains the resolved resources selected for one local
-// device and view.
+// Group-local route construction borrows resolved addresses from this owner.
+// This slice assumes view replacement happens at a collective-quiescent
+// boundary; future control-plane quiescing will enforce it.
 class DeviceLinkManager {
    public:
     DeviceLinkManager() = default;
@@ -54,15 +47,17 @@ class DeviceLinkManager {
     void observeGroupView(const GroupView& view,
                           const std::vector<uint64_t>& rank_epochs);
 
-    std::optional<DeviceP2pLink> resolveP2p(DeviceId source_device,
-                                            GlobalRank peer,
-                                            uint64_t arena_generation) const;
+    void* resolveP2p(DeviceId source_device, GlobalRank peer,
+                     uint64_t arena_generation) const;
     std::optional<DeviceRdmaLink> resolveRdma(DeviceId source_device,
                                               GlobalRank peer,
                                               uint64_t arena_generation) const;
 
     void disconnect(GlobalRank peer);
     void clear();
+    // Unsafe kernels may still dereference current links. From this point on,
+    // replaced and shutdown resources are left for OS process cleanup.
+    void retainForProcessLifetime();
     void shutdown() noexcept;
 
     using EventCallback = std::function<void(PeerLinkUpdate)>;
@@ -77,7 +72,7 @@ class DeviceLinkManager {
         uint64_t rdma_target_rank_epoch = 0;
         uint64_t p2p_arena_generation = 0;
         uint64_t rdma_arena_generation = 0;
-        std::shared_ptr<device::P2pPeerMapping> p2p_mapping;
+        std::unique_ptr<device::P2pPeerMapping> p2p_mapping;
         uint64_t remote_rdma_arena_address = 0;
         bool rdma_available = false;
     };
@@ -100,7 +95,8 @@ class DeviceLinkManager {
     std::unordered_map<DeviceId, std::vector<PeerObservation>> device_peers_;
     std::vector<uint64_t> target_rank_epochs_;
     mutable std::mutex peers_mutex_;
-    std::unordered_map<DeviceId, std::shared_ptr<DeviceArenaState>> arenas_;
+    std::unordered_map<DeviceId, std::unique_ptr<DeviceArenaState>> arenas_;
+    bool retained_ = false;
 
     EventCallback event_callback_;
     mutable std::mutex event_callback_mutex_;

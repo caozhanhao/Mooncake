@@ -1,11 +1,9 @@
 #ifndef MOONCAKE_PG_COLLECTIVE_PLAN_COLLECTIVE_PLAN_REGISTRY_H
 #define MOONCAKE_PG_COLLECTIVE_PLAN_COLLECTIVE_PLAN_REGISTRY_H
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -23,8 +21,8 @@ struct CollectivePlanSet;
 struct GroupView;
 
 // The concrete builder owns this short-lived typed host value until the
-// generic publisher copies it into a plan slot. Link and runtime resources are
-// not type-erased here.
+// generic publisher copies it into mapped plan storage. Link and runtime
+// resources are not type-erased here.
 struct ReadyCollectivePlan {
     std::shared_ptr<const void> kernel_plan;
 };
@@ -55,7 +53,7 @@ class CollectivePlanBuilder {
 // Owns one communicator-scoped, graph-stable publication for one collective.
 class CollectivePlanPublisher {
    public:
-    PGResult<CollectivePlanHandle> handle(uint64_t view_epoch) const;
+    PGResult<CollectivePlanHandle> handle() const;
 
     CollectivePlanPublisher(const CollectivePlanPublisher&) = delete;
     CollectivePlanPublisher& operator=(const CollectivePlanPublisher&) = delete;
@@ -64,23 +62,18 @@ class CollectivePlanPublisher {
     friend class CollectivePlanRegistry;
 
     CollectivePlanPublisher(std::unique_ptr<CollectivePlanBuilder> builder,
-                            size_t slot_bytes)
-        : builder_(std::move(builder)), slot_bytes_(slot_bytes) {}
+                            size_t plan_bytes)
+        : builder_(std::move(builder)), plan_bytes_(plan_bytes) {}
 
     std::unique_ptr<CollectivePlanBuilder> builder_;
-    size_t slot_bytes_ = 0;
-    void* slots_host_ = nullptr;
-    void* slots_device_ = nullptr;
+    size_t plan_bytes_ = 0;
+    void* plan_host_ = nullptr;
+    void* plan_device_ = nullptr;
     uint64_t* lane_sequences_host_ = nullptr;
     uint64_t* lane_sequences_device_ = nullptr;
-    uint32_t* active_slot_host_ = nullptr;
-    uint32_t* active_slot_device_ = nullptr;
 
     bool ready_ = false;
     uint64_t view_epoch_ = 0;
-    std::array<std::shared_ptr<const GroupPeerRoutes>, kCollectivePlanSlots>
-        slot_routes_;
-    mutable std::mutex mutex_;
 };
 
 class CollectivePlanRegistry {
@@ -107,8 +100,7 @@ class CollectivePlanRegistry {
 
    private:
     PGResult<void> allocate(CollectivePlanPublisher& publisher);
-    void publish(CollectivePlanPublisher& publisher, const void* kernel_plan,
-                 std::shared_ptr<const GroupPeerRoutes> peer_routes);
+    void publish(CollectivePlanPublisher& publisher, const void* kernel_plan);
     void release(CollectivePlanPublisher& publisher) noexcept;
 
     DeviceLinkManager& device_links_;
@@ -117,7 +109,6 @@ class CollectivePlanRegistry {
     InGroupRank self_in_group_rank_ = -1;
     uint32_t control_lane_count_ = 0;
     std::vector<std::unique_ptr<CollectivePlanPublisher>> publishers_;
-    std::mutex mutex_;
     bool retained_ = false;
 };
 

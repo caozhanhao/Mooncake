@@ -2,7 +2,6 @@
 #define MOONCAKE_PG_COLLECTIVE_ROUTE_GROUP_PEER_ROUTES_H
 
 #include <cstddef>
-#include <memory>
 #include <optional>
 #include <vector>
 
@@ -15,14 +14,9 @@ class DeviceLinkManager;
 class LinkManager;
 struct GroupView;
 
-namespace device {
-class P2pPeerMapping;
-class RdmaTransport;
-}  // namespace device
-
 // Immutable routes selected for one local device and one authoritative group
-// view. The table owns the process-level device resources referenced by its
-// kernel-facing PeerRoute values; collective algorithms assign peer roles.
+// view. Link managers own the resources referenced by the kernel-facing
+// PeerRoute values; collective algorithms only assign peer roles.
 class GroupPeerRoutes {
    public:
     const PeerRoute* find(InGroupRank peer_in_group_rank) const {
@@ -37,8 +31,6 @@ class GroupPeerRoutes {
         DeviceLinkManager& device_links, LinkManager& host_links);
 
     std::vector<std::optional<PeerRoute>> routes_;
-    std::vector<std::shared_ptr<device::P2pPeerMapping>> p2p_mappings_;
-    std::shared_ptr<device::RdmaTransport> rdma_transport_;
 };
 
 GroupPeerRoutes buildGroupPeerRoutes(const GroupView& view,

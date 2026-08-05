@@ -538,7 +538,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
         return result;
     }
 
-    static std::shared_ptr<P2pPeerMapping> importPeerBuffer(
+    static std::unique_ptr<P2pPeerMapping> importPeerBuffer(
         const std::vector<int32_t>& opaque_handle) {
         if (opaque_handle.empty()) return nullptr;
 
@@ -587,7 +587,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 cuMemRelease(handle);
                 return nullptr;
             }
-            return std::make_shared<FabricPeerBufferMapping>(
+            return std::make_unique<FabricPeerBufferMapping>(
                 peer_base, mapped_size, handle, device);
         }
 #endif
@@ -606,7 +606,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
             const auto error = mcIpcOpenMemHandleCross_v2(
                 &peer_base, &handle, cudaIpcMemLazyEnablePeerAccess);
             if (error != cudaSuccess) return nullptr;
-            return std::make_shared<IpcPeerMapping>(peer_base, device);
+            return std::make_unique<IpcPeerMapping>(peer_base, device);
         }
 #endif
 
@@ -629,7 +629,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
                                                 cudaIpcMemLazyEnablePeerAccess);
 #endif
         if (error != cudaSuccess) return nullptr;
-        return std::make_shared<IpcPeerMapping>(peer_base, device);
+        return std::make_unique<IpcPeerMapping>(peer_base, device);
     }
 
     void importPeerHandles(
@@ -987,7 +987,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
 #endif
 };
 
-std::shared_ptr<P2pPeerMapping> importP2pPeerBuffer(
+std::unique_ptr<P2pPeerMapping> importP2pPeerBuffer(
     const std::vector<int32_t>& opaque_handle) {
     return P2pDeviceTransportImpl::importPeerBuffer(opaque_handle);
 }

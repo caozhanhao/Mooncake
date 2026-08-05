@@ -38,6 +38,16 @@ struct DeviceRdmaTransportDeleter {
     }
 };
 
+using DeviceRdmaTransport =
+    std::unique_ptr<device::RdmaTransport, DeviceRdmaTransportDeleter>;
+
+void replaceP2pMapping(std::unique_ptr<device::P2pPeerMapping>& current,
+                       std::unique_ptr<device::P2pPeerMapping> replacement,
+                       bool retain_current) {
+    if (retain_current) (void)current.release();
+    current = std::move(replacement);
+}
+
 }  // namespace
 
 struct DeviceLinkManager::DeviceArenaState {
@@ -46,7 +56,7 @@ struct DeviceLinkManager::DeviceArenaState {
     void* base = nullptr;
     uint64_t bytes = 0;
     cudaStream_t bootstrap_stream = nullptr;
-    std::shared_ptr<device::RdmaTransport> rdma;
+    DeviceRdmaTransport rdma{nullptr, DeviceRdmaTransportDeleter{}};
     std::optional<RdmaArenaDescriptor> published_rdma;
     std::vector<bool> rdma_connected;
 
@@ -79,6 +89,14 @@ void DeviceLinkManager::shutdown() noexcept {
     }
     try {
         std::lock_guard<std::mutex> lock(peers_mutex_);
+        if (retained_) {
+            for (auto& [_, observations] : device_peers_) {
+                for (auto& observation : observations) {
+                    (void)observation.p2p_mapping.release();
+                }
+            }
+            for (auto& [_, arena] : arenas_) (void)arena.release();
+        }
         arenas_.clear();
         device_peers_.clear();
         target_rank_epochs_.clear();
@@ -106,15 +124,15 @@ void DeviceLinkManager::bindCollectiveArena(const CollectiveArenaView& view) {
     }
 
     const GpuDeviceGuard guard(view.device);
-    auto arena = std::make_shared<DeviceArenaState>();
+    auto arena = std::make_unique<DeviceArenaState>();
     arena->device = view.device;
     arena->generation = view.generation;
     arena->base = view.base;
     arena->bytes = view.bytes;
     arena->rdma_connected.assign(max_world_size_, false);
     auto rdma = device::createIbgdaDeviceTransport();
-    arena->rdma = std::shared_ptr<device::RdmaTransport>(
-        rdma.release(), DeviceRdmaTransportDeleter{view.device});
+    arena->rdma = DeviceRdmaTransport(rdma.release(),
+                                      DeviceRdmaTransportDeleter{view.device});
 
     bool rdma_ready = arena->rdma != nullptr;
     if (rdma_ready) {
@@ -163,6 +181,10 @@ void DeviceLinkManager::bindCollectiveArena(const CollectiveArenaView& view) {
                   << view.device;
     }
 
+    if (const auto found = arenas_.find(view.device);
+        retained_ && found != arenas_.end()) {
+        (void)found->second.release();
+    }
     arenas_[view.device] = std::move(arena);
 }
 
@@ -203,7 +225,7 @@ void DeviceLinkManager::observeGroupView(
             target_rank_epochs_[peer] = rank_epochs[peer];
 
             if (!endpoint.device_p2p.has_value()) {
-                observation.p2p_mapping.reset();
+                replaceP2pMapping(observation.p2p_mapping, {}, retained_);
                 observation.p2p_target_rank_epoch = 0;
                 observation.p2p_arena_generation = 0;
             } else {
@@ -220,8 +242,13 @@ void DeviceLinkManager::observeGroupView(
                         mapping &&
                         (mapping->mappedBytes() == 0 ||
                          mapping->mappedBytes() >= endpoint.arena_bytes);
-                    observation.p2p_mapping =
-                        available ? std::move(mapping) : nullptr;
+                    if (available) {
+                        replaceP2pMapping(observation.p2p_mapping,
+                                          std::move(mapping), retained_);
+                    } else {
+                        replaceP2pMapping(observation.p2p_mapping, {},
+                                          retained_);
+                    }
                     observation.p2p_arena_generation =
                         endpoint.arena_generation;
                 }
@@ -323,20 +350,19 @@ void DeviceLinkManager::connectRdmaPeers(
     }
 }
 
-std::optional<DeviceP2pLink> DeviceLinkManager::resolveP2p(
-    DeviceId source_device, GlobalRank peer, uint64_t arena_generation) const {
-    if (!rankInRange(peer)) return std::nullopt;
+void* DeviceLinkManager::resolveP2p(DeviceId source_device, GlobalRank peer,
+                                    uint64_t arena_generation) const {
+    if (!rankInRange(peer)) return nullptr;
     std::lock_guard<std::mutex> lock(peers_mutex_);
     const auto device = device_peers_.find(source_device);
-    if (device == device_peers_.end()) return std::nullopt;
+    if (device == device_peers_.end()) return nullptr;
     const auto& observation = device->second[peer];
     if (!observation.p2p_mapping ||
         observation.p2p_target_rank_epoch != target_rank_epochs_[peer] ||
         observation.p2p_arena_generation != arena_generation) {
-        return std::nullopt;
+        return nullptr;
     }
-    return DeviceP2pLink{observation.p2p_mapping,
-                         observation.p2p_mapping->mappedBase()};
+    return observation.p2p_mapping->mappedBase();
 }
 
 std::optional<DeviceRdmaLink> DeviceLinkManager::resolveRdma(
@@ -354,7 +380,6 @@ std::optional<DeviceRdmaLink> DeviceLinkManager::resolveRdma(
         return std::nullopt;
     }
     return DeviceRdmaLink{
-        .transport = arena->second->rdma,
         .qp_contexts = arena->second->rdma->qpDevCtxsPtr(),
         .remote_keys =
             static_cast<const uint32_t*>(arena->second->rdma->rkeysPtr()),
@@ -375,6 +400,7 @@ void DeviceLinkManager::disconnect(GlobalRank peer) {
             auto& observation = observations[peer];
             was_available |= observation.p2p_mapping != nullptr ||
                              observation.rdma_available;
+            replaceP2pMapping(observation.p2p_mapping, {}, retained_);
             observation = PeerObservation{};
         }
         if (was_available) update = makeLinkUpdate(peer);
@@ -384,8 +410,20 @@ void DeviceLinkManager::disconnect(GlobalRank peer) {
 
 void DeviceLinkManager::clear() {
     std::lock_guard<std::mutex> lock(peers_mutex_);
+    if (retained_) {
+        for (auto& [_, observations] : device_peers_) {
+            for (auto& observation : observations) {
+                (void)observation.p2p_mapping.release();
+            }
+        }
+    }
     device_peers_.clear();
     std::fill(target_rank_epochs_.begin(), target_rank_epochs_.end(), 0);
+}
+
+void DeviceLinkManager::retainForProcessLifetime() {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    retained_ = true;
 }
 
 void DeviceLinkManager::setEventCallback(EventCallback callback) {

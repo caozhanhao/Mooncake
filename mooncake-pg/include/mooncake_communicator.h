@@ -317,11 +317,10 @@ class MooncakeCommunicator {
     std::array<int32_t*, 2> cpu_sync_recv_region_{};
     std::shared_ptr<TransferGroupMeta> meta_;
 
-    // Only the dispatch discriminator and epoch cross from control-plane view
-    // application to the application thread. GroupView, membership and global
-    // ranks are projected into published plans and never captured by an
-    // executor.
-    mutable std::mutex collective_policy_mutex_;
+    // This slice assumes view application is serialized with collective
+    // execution. A future control-plane quiescing phase will enforce that
+    // internal contract. GroupView, membership and global ranks are projected
+    // into published plans and never captured by an executor.
     AllReduceProtocol allreduce_protocol_ = AllReduceProtocol::Legacy;
     uint64_t collective_view_epoch_ = 0;
 
