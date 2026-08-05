@@ -16,7 +16,7 @@
 #include <transfer_engine.h>
 
 #include "control_plane/control_types.h"
-#include "collective/transport/link.h"
+#include "collective/transport/peer_route.h"
 #include "error_types.h"
 
 namespace mooncake {

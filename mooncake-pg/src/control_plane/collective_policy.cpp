@@ -34,7 +34,6 @@ CollectivePlanSet CollectivePolicyBuilder::build(const GroupView& view) const {
     if (endpoints_ready) {
         plans.allreduce_plans.push_back(AllReducePlan{
             .max_message_bytes = std::numeric_limits<uint64_t>::max(),
-            .algorithm = FlatRingPlan{},
         });
     }
     return plans;

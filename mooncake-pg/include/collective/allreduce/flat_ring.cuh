@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_COLLECTIVE_EXECUTOR_ALGORITHM_FLAT_RING_CUH
-#define MOONCAKE_PG_COLLECTIVE_EXECUTOR_ALGORITHM_FLAT_RING_CUH
+#ifndef MOONCAKE_PG_COLLECTIVE_ALLREDUCE_FLAT_RING_CUH
+#define MOONCAKE_PG_COLLECTIVE_ALLREDUCE_FLAT_RING_CUH
 
 #include <cstdint>
 #include <type_traits>
@@ -7,14 +7,34 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#include "collective/executor/allreduce_device.cuh"
-#include "collective/executor/tensor_partition.cuh"
+#include "collective/allreduce/allreduce.h"
+#include "collective/allreduce/tensor_partition.cuh"
+#include "collective/runtime/device_protocol.cuh"
 #include "collective/runtime/peer_buffer_exchange.cuh"
 #include "collective/transport/transfer.cuh"
 
 namespace mooncake::flat_ring {
 
 using namespace mooncake::device;
+
+inline __device__ uint32_t allReduceElementBytes(DataType datatype) {
+    return datatype == DataType::Float32 ? 4 : 2;
+}
+
+inline __device__ void setCollectiveError(const AllReduceKernelArgs& args,
+                                          int32_t error_code,
+                                          InGroupRank failed_peer) {
+    mooncake::setCollectiveError(args.common.resources, error_code,
+                                 failed_peer);
+}
+
+inline __device__ bool waitForCollectiveToken(const uint64_t* address,
+                                              uint64_t expected,
+                                              const AllReduceKernelArgs& args,
+                                              InGroupRank failed_peer) {
+    return mooncake::waitForCollectiveToken(address, expected,
+                                            args.common.resources, failed_peer);
+}
 
 enum class Phase : uint32_t {
     BufferExchange = 0,
@@ -195,7 +215,7 @@ inline __device__ bool transferFailed(const AllReduceKernelArgs& args,
 }
 
 inline __device__ bool runReduceScatter(
-    const AllReduceKernelArgs& args, const FlatRingKernelPlan& ring,
+    const AllReduceKernelArgs& args, const FlatRingDevicePlan& ring,
     const void* input, uint64_t view_epoch, uint64_t collective_sequence,
     uint64_t transfer_offset, uint64_t transfer_elements,
     uint64_t transfer_index, void* work_stages[2], uint32_t* current_stage) {
@@ -279,7 +299,7 @@ inline __device__ bool runReduceScatter(
 }
 
 inline __device__ bool runAllGather(
-    const AllReduceKernelArgs& args, const FlatRingKernelPlan& ring,
+    const AllReduceKernelArgs& args, const FlatRingDevicePlan& ring,
     uint64_t view_epoch, uint64_t collective_sequence, uint64_t transfer_offset,
     uint64_t transfer_elements, uint64_t transfer_index, void* work_stages[2],
     uint32_t* current_stage) {
@@ -362,7 +382,7 @@ inline __device__ bool runAllGather(
 }
 
 inline __device__ bool run(const AllReduceKernelArgs& args,
-                           const FlatRingKernelPlan& ring, const void* input,
+                           const FlatRingDevicePlan& ring, const void* input,
                            uint64_t view_epoch, uint64_t collective_sequence) {
     const auto& resources = args.common.resources;
     if (args.element_count == 0) return true;
@@ -374,7 +394,7 @@ inline __device__ bool run(const AllReduceKernelArgs& args,
         return true;
     }
 
-    __shared__ FlatRingKernelPlan resolved_ring;
+    __shared__ FlatRingDevicePlan resolved_ring;
     __shared__ PeerBufferExchange buffer_exchanges[2];
     if (threadIdx.x == 0) {
         resolved_ring.participant_count = ring.participant_count;
@@ -444,4 +464,4 @@ inline __device__ bool run(const AllReduceKernelArgs& args,
 
 }  // namespace mooncake::flat_ring
 
-#endif  // MOONCAKE_PG_COLLECTIVE_EXECUTOR_ALGORITHM_FLAT_RING_CUH
+#endif  // MOONCAKE_PG_COLLECTIVE_ALLREDUCE_FLAT_RING_CUH

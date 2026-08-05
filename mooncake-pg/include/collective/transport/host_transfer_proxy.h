@@ -4,7 +4,6 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
-#include <optional>
 #include <thread>
 #include <vector>
 
@@ -34,10 +33,10 @@ class CollectiveHostTransferProxy {
 
     PGResult<void> initialize(TransferEngine* engine, LinkManager* links,
                               uint32_t command_count = 128);
-    std::optional<HostTransferCommandLease> tryAcquireCommand(
+    PGResult<HostTransferCommandLease> acquireCommand(
         CollectiveControlBlock* control);
-    bool releaseCommand(const HostTransferCommandLease& command,
-                        bool resource_idle);
+    bool releaseCommand(const HostTransferCommandLease& command);
+    void abandonCommand(const HostTransferCommandLease& command);
     void shutdown();
 
     bool initialized() const {
@@ -49,9 +48,14 @@ class CollectiveHostTransferProxy {
         delete;
 
    private:
-    struct CommandState {
-        bool in_use = false;
-        bool reusable = true;
+    enum class SlotState : uint8_t {
+        Free = 0,
+        Acquired,
+        Abandoned,
+    };
+
+    struct CommandSlot {
+        SlotState state = SlotState::Free;
         CollectiveControlBlock* control = nullptr;
     };
 
@@ -63,8 +67,6 @@ class CollectiveHostTransferProxy {
     };
 
     bool beginCommand(uint32_t command_index);
-    bool commandReusableLocked(const HostTransferCommandLease& command,
-                               bool resource_idle);
     bool submitPhase(uint32_t command_index, ActiveTransfer::Phase phase,
                      ActiveTransfer& active);
     bool advanceTransfer(ActiveTransfer& active);
@@ -78,7 +80,7 @@ class CollectiveHostTransferProxy {
     uint32_t command_count_ = 0;
 
     std::mutex command_mutex_;
-    std::vector<CommandState> commands_;
+    std::vector<CommandSlot> commands_;
     std::vector<ActiveTransfer> active_transfers_;
 
     std::thread progress_thread_;

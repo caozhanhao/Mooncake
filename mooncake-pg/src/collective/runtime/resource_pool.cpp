@@ -32,7 +32,11 @@ uint64_t collectiveBufferBytes() {
 }  // namespace
 
 CollectiveResourceLease::~CollectiveResourceLease() noexcept {
-    (void)release(!submitted_);
+    if (submitted_) {
+        abandon();
+    } else {
+        (void)release();
+    }
 }
 
 CollectiveResourceLease::CollectiveResourceLease(
@@ -43,24 +47,36 @@ CollectiveResourceLease::CollectiveResourceLease(
 CollectiveResourceLease& CollectiveResourceLease::operator=(
     CollectiveResourceLease&& other) noexcept {
     if (this != &other) {
-        (void)release(!submitted_);
+        if (submitted_) {
+            abandon();
+        } else {
+            (void)release();
+        }
         moveFrom(std::move(other));
     }
     return *this;
 }
 
-bool CollectiveResourceLease::release(bool resource_idle) noexcept {
+bool CollectiveResourceLease::release() noexcept {
     if (!pool_) return true;
     auto* pool = std::exchange(pool_, nullptr);
-    return pool->release(*this, resource_idle);
+    return pool->release(*this);
+}
+
+void CollectiveResourceLease::abandon() noexcept {
+    if (!pool_) return;
+    auto* pool = std::exchange(pool_, nullptr);
+    pool->abandon(*this);
 }
 
 bool CollectiveResourceLease::retire() noexcept {
     if (!pool_) return true;
-    const bool resource_idle =
-        std::atomic_ref<uint32_t>(control.host->resource_idle)
+    const bool resources_idle =
+        std::atomic_ref<uint32_t>(control.host->transport_idle)
             .load(std::memory_order_acquire) != 0;
-    return release(resource_idle);
+    if (resources_idle) return release();
+    abandon();
+    return false;
 }
 
 void CollectiveResourceLease::moveFrom(
@@ -80,23 +96,14 @@ PGResult<CollectiveResourceLease> CollectiveResourcePool::acquire(
     PG_TRY(resources.lane, lanes_->acquire(preferred_lane));
     resources.has_lane_ = true;
 
-    auto control = control_pool_->tryAcquire();
-    if (!control.has_value()) {
-        return makePGError(PGErrorCode::ResourceBusy,
-                           "collective control block is busy");
-    }
-    resources.control = *control;
+    PG_TRY(resources.control, control_pool_->acquire());
 
     PG_TRY(resources.buffer,
            buffer_pool_->acquire(device_, collectiveBufferBytes(),
                                  kBufferAlignment, te_location_, engine_));
 
-    auto host_command = host_proxy_->tryAcquireCommand(resources.control.host);
-    if (!host_command.has_value()) {
-        return makePGError(PGErrorCode::ResourceBusy,
-                           "collective host-transfer command is busy");
-    }
-    resources.host_command = *host_command;
+    PG_TRY(resources.host_command,
+           host_proxy_->acquireCommand(resources.control.host));
     return resources;
 }
 
@@ -104,28 +111,51 @@ const CollectiveBufferLayout& CollectiveResourcePool::bufferLayout() {
     return collectiveBufferLayout();
 }
 
-bool CollectiveResourcePool::release(CollectiveResourceLease& resources,
-                                     bool resource_idle) noexcept {
-    bool reusable = resource_idle;
+bool CollectiveResourcePool::release(
+    CollectiveResourceLease& resources) noexcept {
     if (resources.host_command.host) {
-        reusable =
-            host_proxy_->releaseCommand(resources.host_command, reusable);
+        if (!host_proxy_->releaseCommand(resources.host_command)) {
+            resources.host_command = {};
+            abandon(resources);
+            return false;
+        }
         resources.host_command = {};
     }
     if (resources.buffer) {
-        reusable = buffer_pool_->release(*resources.buffer, reusable);
+        buffer_pool_->release(*resources.buffer);
         resources.buffer.reset();
     }
     if (resources.has_lane_) {
-        reusable = lanes_->release(resources.lane, reusable);
+        lanes_->release(resources.lane);
         resources.has_lane_ = false;
     }
     if (resources.control.host) {
-        reusable = control_pool_->release(resources.control, reusable);
+        control_pool_->release(resources.control);
         resources.control = {};
     }
     resources.submitted_ = false;
-    return reusable;
+    return true;
+}
+
+void CollectiveResourcePool::abandon(
+    CollectiveResourceLease& resources) noexcept {
+    if (resources.host_command.host) {
+        host_proxy_->abandonCommand(resources.host_command);
+        resources.host_command = {};
+    }
+    if (resources.buffer) {
+        buffer_pool_->abandon(*resources.buffer);
+        resources.buffer.reset();
+    }
+    if (resources.has_lane_) {
+        lanes_->abandon(resources.lane);
+        resources.has_lane_ = false;
+    }
+    if (resources.control.host) {
+        control_pool_->abandon(resources.control);
+        resources.control = {};
+    }
+    resources.submitted_ = false;
 }
 
 }  // namespace mooncake

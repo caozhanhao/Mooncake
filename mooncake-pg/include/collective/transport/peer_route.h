@@ -2,11 +2,23 @@
 #define MOONCAKE_PG_COLLECTIVE_TRANSPORT_PEER_ROUTE_H
 
 #include <cstdint>
+#include <limits>
 
-#include "collective/transport/link.h"
 #include "collective/types.h"
 
 namespace mooncake {
+
+// Stable process-local reference to a Host Transfer Engine peer. Segment IDs
+// are resolved immediately before submission so reconnects do not invalidate
+// a captured collective command.
+struct HostLinkHandle {
+    uint32_t slot = std::numeric_limits<uint32_t>::max();
+    uint64_t target_rank_epoch = std::numeric_limits<uint64_t>::max();
+
+    bool operator==(const HostLinkHandle&) const = default;
+};
+
+inline constexpr HostLinkHandle kInvalidHostLinkHandle{};
 
 struct HostPeerRoute {
     HostLinkHandle link = kInvalidHostLinkHandle;

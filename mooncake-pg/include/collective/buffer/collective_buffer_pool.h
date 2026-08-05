@@ -70,10 +70,10 @@ class CollectiveBufferPool {
         const CollectiveBufferPoolConfig& config = {});
     CollectiveArenaView arena(DeviceId device) const;
 
-    // A range is returned only after every asynchronous user is idle. Unsafe
-    // ranges stay out of the free list and keep their arena alive until process
-    // exit.
-    bool release(CollectiveBufferLease& lease, bool resource_idle);
+    void release(CollectiveBufferLease& lease);
+    // Permanently removes an asynchronously referenced range from reuse. Its
+    // registered arena is retained for process lifetime.
+    void abandon(CollectiveBufferLease& lease);
     void shutdown();
 
     CollectiveBufferPool(const CollectiveBufferPool&) = delete;
@@ -94,7 +94,7 @@ class CollectiveBufferPool {
         void* base = nullptr;
         uint64_t bytes = 0;
         uint64_t active_allocations = 0;
-        bool has_retained_allocation = false;
+        bool has_abandoned_allocation = false;
         std::unique_ptr<device::P2pTransport> p2p_transport;
         std::vector<int32_t> p2p_handle;
         std::vector<FreeBlock> free_blocks;

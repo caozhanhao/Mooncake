@@ -52,40 +52,52 @@ PGResult<void> CollectiveControlPool::initialize(uint32_t control_count) {
     return {};
 }
 
-std::optional<CollectiveControlLease> CollectiveControlPool::tryAcquire() {
-    if (!initialized_.load(std::memory_order_acquire)) return std::nullopt;
+PGResult<CollectiveControlLease> CollectiveControlPool::acquire() {
+    PG_VALIDATE_STATE(initialized_.load(std::memory_order_acquire),
+                      "collective control pool is not initialized");
     std::lock_guard<std::mutex> lock(mutex_);
     for (uint32_t index = 0; index < controls_.size(); ++index) {
         auto& state = controls_[index];
-        if (state.in_use || !state.reusable) continue;
-        state.in_use = true;
+        if (state != SlotState::Free) continue;
+        state = SlotState::Acquired;
         host_controls_[index] = CollectiveControlBlock{};
         return CollectiveControlLease{index, host_controls_ + index,
                                       device_controls_ + index};
     }
-    return std::nullopt;
+    return makePGError(PGErrorCode::ResourceBusy,
+                       "collective control pool is exhausted");
 }
 
-bool CollectiveControlPool::release(const CollectiveControlLease& control,
-                                    bool resource_idle) {
+void CollectiveControlPool::release(const CollectiveControlLease& control) {
     std::lock_guard<std::mutex> lock(mutex_);
     PG_ASSERT(control.index < controls_.size(),
               "collective control index is invalid");
     auto& state = controls_[control.index];
-    PG_ASSERT(state.in_use && control.host == host_controls_ + control.index &&
+    PG_ASSERT(state == SlotState::Acquired &&
+                  control.host == host_controls_ + control.index &&
                   control.device == device_controls_ + control.index,
               "collective control lease is invalid");
-    state.in_use = false;
-    state.reusable = resource_idle;
-    return resource_idle;
+    state = SlotState::Free;
+}
+
+void CollectiveControlPool::abandon(const CollectiveControlLease& control) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    PG_ASSERT(control.index < controls_.size(),
+              "collective control index is invalid");
+    auto& state = controls_[control.index];
+    PG_ASSERT(state == SlotState::Acquired &&
+                  control.host == host_controls_ + control.index &&
+                  control.device == device_controls_ + control.index,
+              "collective control lease is invalid");
+    state = SlotState::Abandoned;
 }
 
 void CollectiveControlPool::shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_.exchange(false, std::memory_order_acq_rel)) return;
-    const bool safe_to_free = std::all_of(
-        controls_.begin(), controls_.end(),
-        [](const auto& state) { return !state.in_use && state.reusable; });
+    const bool safe_to_free =
+        std::all_of(controls_.begin(), controls_.end(),
+                    [](const auto state) { return state == SlotState::Free; });
     if (safe_to_free) {
         (void)cudaFreeHost(host_controls_);
     } else {

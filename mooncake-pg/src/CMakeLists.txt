@@ -1,6 +1,6 @@
 set(_pg_device_sources
     "${CMAKE_CURRENT_SOURCE_DIR}/mooncake_worker.cu"
-    "${CMAKE_CURRENT_SOURCE_DIR}/collective/executor/allreduce.cu")
+    "${CMAKE_CURRENT_SOURCE_DIR}/collective/allreduce/allreduce.cu")
 if(USE_CUDA)
   # Preserve the existing sm_80/sm_90 coverage unless the caller selects
   # architectures through CMake's standard variable or CUDAARCHS environment.
@@ -131,15 +131,12 @@ set_target_properties(
              BUILD_RPATH_USE_ORIGIN YES)
 
 add_library(mooncake_pg SHARED
-    collective/plan/allreduce_plan_builder.cpp
-    collective/plan/active_group_ranks.cpp
-    collective/plan/collective_plan_registry.cpp
-    collective/route/group_peer_routes.cpp
+    collective/group_collective_engine.cpp
+    collective/allreduce/allreduce.cpp
+    collective/resolved_collective_view.cpp
     collective/buffer/collective_buffer_pool.cpp
-    collective/operation/allreduce.cpp
-    collective/runtime/collective_failure.cpp
     collective/runtime/collective_lane_pool.cpp
-    collective/runtime/collective_runtime.cpp
+    collective/runtime/runtime.cpp
     collective/runtime/control_pool.cpp
     collective/runtime/host_progress.cpp
     collective/runtime/resource_pool.cpp

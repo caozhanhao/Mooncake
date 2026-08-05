@@ -42,7 +42,7 @@ struct CollectiveFailureReport {
 struct alignas(64) CollectiveControlBlock {
     int32_t first_error_code = 0;
     InGroupRank failed_peer = -1;
-    uint32_t resource_idle = 1;
+    uint32_t transport_idle = 1;
     CollectiveFailureReport failure;
 };
 

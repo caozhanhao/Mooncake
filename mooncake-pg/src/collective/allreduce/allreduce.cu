@@ -1,10 +1,8 @@
-#include "collective/executor/allreduce.cuh"
+#include "collective/allreduce/allreduce.h"
 
 #include <cstdint>
 
-#include "collective/executor/algorithm/flat_ring.cuh"
-#include "collective/executor/algorithm/hierarchical.cuh"
-#include "collective/executor/allreduce_device.cuh"
+#include "collective/allreduce/flat_ring.cuh"
 
 namespace mooncake {
 namespace {
@@ -12,7 +10,7 @@ namespace {
 using namespace mooncake::device;
 
 __global__ void allReduceExecutorKernel(AllReduceKernelArgs args) {
-    __shared__ AllReduceBucketKernelPlan kernel_plan;
+    __shared__ AllReduceBucketDevicePlan device_plan;
     __shared__ uint64_t view_epoch;
     __shared__ uint64_t collective_sequence;
     __shared__ int32_t self_participating;
@@ -20,7 +18,8 @@ __global__ void allReduceExecutorKernel(AllReduceKernelArgs args) {
     __shared__ InGroupRank plan_failed_peer;
 
     const auto& common = args.common;
-    const uint32_t bytes_per_element = allReduceElementBytes(args.datatype);
+    const uint32_t bytes_per_element =
+        flat_ring::allReduceElementBytes(args.datatype);
 
     if (!prepareCollectiveInvocation(common)) {
         reportCollectiveFailureAndWait(common);
@@ -32,14 +31,12 @@ __global__ void allReduceExecutorKernel(AllReduceKernelArgs args) {
     // CUDA Graph replay is a new application invocation and can observe the
     // plan published by sync-after-failure without graph recapture.
     if (threadIdx.x == 0) {
-        const auto& published =
-            *static_cast<const AllReduceKernelPlan*>(common.plan.plan);
+        const auto& published = *args.plan.value;
         view_epoch = published.view_epoch;
         // Sequence identifies this invocation on its physical lane. The
-        // mapped counter is reset before a new-epoch plan is published.
-        collective_sequence = atomicAdd_system(
-            reinterpret_cast<unsigned long long*>(common.plan.lane_sequences +
-                                                  common.lane_index),
+        // counter is shared by every collective operation using that lane.
+        collective_sequence = atomicAdd(
+            reinterpret_cast<unsigned long long*>(common.invocation_sequence),
             1ULL);
         self_participating = static_cast<int32_t>(published.self_participating);
         plan_error = published.error_code;
@@ -53,7 +50,7 @@ __global__ void allReduceExecutorKernel(AllReduceKernelArgs args) {
                        published.buckets[bucket_index].max_message_bytes) {
                 ++bucket_index;
             }
-            kernel_plan = published.buckets[bucket_index];
+            device_plan = published.buckets[bucket_index];
         } else if (plan_error == 0) {
             plan_error =
                 static_cast<int32_t>(CollectiveProtocolError::Unsupported);
@@ -70,20 +67,10 @@ __global__ void allReduceExecutorKernel(AllReduceKernelArgs args) {
     } else {
         success = plan_error == 0;
         if (!success) {
-            setCollectiveError(args, plan_error, plan_failed_peer);
+            flat_ring::setCollectiveError(args, plan_error, plan_failed_peer);
         } else {
-            switch (kernel_plan.algorithm) {
-                case AllReduceAlgorithm::FlatRing:
-                    success =
-                        flat_ring::run(args, kernel_plan.flat_ring, args.input,
-                                       view_epoch, collective_sequence);
-                    break;
-                case AllReduceAlgorithm::Hierarchical:
-                    success = hierarchical_allreduce::run(
-                        args, kernel_plan.hierarchical, args.input, view_epoch,
-                        collective_sequence);
-                    break;
-            }
+            success = flat_ring::run(args, device_plan.flat_ring, args.input,
+                                     view_epoch, collective_sequence);
         }
     }
     __syncthreads();

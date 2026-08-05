@@ -3,7 +3,7 @@
 
 #include <cstdint>
 
-#include "collective/transport/kernel_resources.cuh"
+#include "collective/device_context.cuh"
 #include "collective/transport/peer_route.h"
 #include "transport/device/device_ops.cuh"
 #include "transport/device/ibgda_device.cuh"
@@ -165,7 +165,7 @@ inline __device__ bool putAndSignalRdma(
     Overlap overlap) {
     __shared__ int success;
     if (threadIdx.x == 0) {
-        mc_st_release_u32(&resources.control->resource_idle, 0);
+        mc_st_release_u32(&resources.control->transport_idle, 0);
         auto* signal_source = reinterpret_cast<uint64_t*>(
             static_cast<char*>(resources.buffer.base) +
             resources.buffer.protocol_offset + kTransferSignalSourceOffset);
@@ -182,7 +182,7 @@ inline __device__ bool putAndSignalRdma(
                 ? 1
                 : 0;
         if (success) {
-            mc_st_release_u32(&resources.control->resource_idle, 1);
+            mc_st_release_u32(&resources.control->transport_idle, 1);
         }
     } else {
         overlap(threadIdx.x - 1, blockDim.x - 1);
@@ -210,7 +210,7 @@ inline __device__ bool signalRdma(const CollectiveKernelResources& resources,
                                   uint64_t command_id) {
     __shared__ int success;
     if (threadIdx.x == 0) {
-        mc_st_release_u32(&resources.control->resource_idle, 0);
+        mc_st_release_u32(&resources.control->transport_idle, 0);
         auto* signal_source = reinterpret_cast<uint64_t*>(
             static_cast<char*>(resources.buffer.base) +
             resources.buffer.protocol_offset + kTransferSignalSourceOffset);
@@ -223,7 +223,7 @@ inline __device__ bool signalRdma(const CollectiveKernelResources& resources,
                 ? 1
                 : 0;
         if (success) {
-            mc_st_release_u32(&resources.control->resource_idle, 1);
+            mc_st_release_u32(&resources.control->transport_idle, 1);
         }
     }
     __syncthreads();

@@ -64,8 +64,8 @@ inline __device__ bool exchangePeerBufferOffsets(
     }
     __syncthreads();
 
-    auto* control_signals = static_cast<char*>(resources.peer_control.buffer) +
-                            resources.peer_control.signals_offset;
+    auto* control_signals = static_cast<char*>(resources.peer_signals.base) +
+                            resources.peer_signals.offset;
     auto* outgoing =
         reinterpret_cast<uint64_t*>(control_signals + kOutgoingBufferOffset);
     if (threadIdx.x == 0) {
@@ -75,13 +75,11 @@ inline __device__ bool exchangePeerBufferOffsets(
 
     for (size_t index = 0; index < PeerCount; ++index) {
         const auto& exchange = exchanges[index];
-        if (!putAndSignal(resources, exchange.route, outgoing, sizeof(uint64_t),
-                          resources.peer_control.signals_offset +
-                              exchange.remote_offset_target,
-                          resources.peer_control.signals_offset +
-                              exchange.remote_ready_target,
-                          token, first_command_id + index,
-                          NoBufferExchangeOverlap{})) {
+        if (!putAndSignal(
+                resources, exchange.route, outgoing, sizeof(uint64_t),
+                resources.peer_signals.offset + exchange.remote_offset_target,
+                resources.peer_signals.offset + exchange.remote_ready_target,
+                token, first_command_id + index, NoBufferExchangeOverlap{})) {
             return false;
         }
     }

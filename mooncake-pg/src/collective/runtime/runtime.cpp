@@ -1,4 +1,4 @@
-#include "collective/runtime/collective_runtime.h"
+#include "collective/runtime/runtime.h"
 
 #include <atomic>
 #include <limits>
@@ -19,8 +19,7 @@ PGResult<void> cudaFailure(cudaError_t error, const char* operation) {
 
 }  // namespace
 
-PGResult<std::unique_ptr<GroupCollectiveRuntime>>
-GroupCollectiveRuntime::create(
+PGResult<std::unique_ptr<CollectiveRuntime>> CollectiveRuntime::create(
     CollectiveBufferPool* buffer_pool, CollectiveControlPool* control_pool,
     CollectiveHostTransferProxy* host_transfer_proxy, CollectiveLanePool* lanes,
     std::string te_location, TransferEngine* engine, DeviceId device,
@@ -37,18 +36,16 @@ GroupCollectiveRuntime::create(
             ? std::numeric_limits<uint64_t>::max()
             : collective_timeout_us * clock_rate / 1000ULL;
 
-    auto runtime =
-        std::unique_ptr<GroupCollectiveRuntime>(new GroupCollectiveRuntime(
-            buffer_pool, control_pool, host_transfer_proxy, lanes,
-            std::move(te_location), engine, device, timeout_ticks));
-    auto failure_handler = std::make_unique<CollectiveFailureHandler>(
-        std::move(failure_report_callback));
+    auto runtime = std::unique_ptr<CollectiveRuntime>(new CollectiveRuntime(
+        buffer_pool, control_pool, host_transfer_proxy, lanes,
+        std::move(te_location), engine, device, timeout_ticks));
     PG_TRY(runtime->host_progress_,
-           CollectiveHostProgress::create(device, std::move(failure_handler)));
+           CollectiveHostProgress::create(device,
+                                          std::move(failure_report_callback)));
     return runtime;
 }
 
-GroupCollectiveRuntime::~GroupCollectiveRuntime() noexcept {
+CollectiveRuntime::~CollectiveRuntime() noexcept {
     stopAccepting();
     if (host_progress_) {
         (void)host_progress_->drain(std::chrono::milliseconds(100));
@@ -60,8 +57,8 @@ GroupCollectiveRuntime::~GroupCollectiveRuntime() noexcept {
     }
 }
 
-CollectiveKernelArgs GroupCollectiveRuntime::makeKernelArgs(
-    const CollectiveResourceLease& resources, CollectivePlanHandle plan,
+CollectiveKernelArgs CollectiveRuntime::makeKernelArgs(
+    const CollectiveResourceLease& resources,
     uint64_t failure_target_id) const {
     const auto& layout = CollectiveResourcePool::bufferLayout();
     const auto& control_layout = lanes_->layout().lanes[resources.lane.index];
@@ -77,27 +74,24 @@ CollectiveKernelArgs GroupCollectiveRuntime::makeKernelArgs(
                         .protocol_offset = layout.protocol.offset,
                         .protocol_bytes = layout.protocol.bytes,
                     },
-                .peer_control =
-                    CollectivePeerControl{
-                        .buffer = lanes_->controlBase(),
-                        .signals_offset = control_layout.signals.offset,
+                .peer_signals =
+                    CollectivePeerSignals{
+                        .base = lanes_->controlBase(),
+                        .offset = control_layout.signals.offset,
                     },
                 .control = resources.control.device,
                 .host_command = resources.host_command.device,
                 .timeout_device_ticks = timeout_device_ticks_,
             },
-        .lane_index = resources.lane.index,
+        .invocation_sequence = lanes_->invocationSequence(resources.lane),
         .failure_target_id = failure_target_id,
-        .plan = plan,
     };
 }
 
-PGResult<void> GroupCollectiveRuntime::execute(CollectiveInvocation& invocation,
-                                               CollectivePlanHandle plan,
-                                               uint64_t view_epoch,
-                                               cudaStream_t stream,
-                                               int32_t* failed_ranks_hint,
-                                               size_t failed_ranks_hint_count) {
+PGResult<void> CollectiveRuntime::submit(
+    uint64_t view_epoch, cudaStream_t stream, int32_t* failed_ranks_hint,
+    size_t failed_ranks_hint_count,
+    const std::function<void(const CollectiveKernelArgs&)>& launch) {
     PG_VALIDATE_STATE(accepting_.load(std::memory_order_acquire),
                       "collective runtime is stopping");
     PG_VALIDATE_ARG(failed_ranks_hint, "failed-ranks hint is null");
@@ -152,9 +146,9 @@ PGResult<void> GroupCollectiveRuntime::execute(CollectiveInvocation& invocation,
                        .failed_ranks_hint_count = failed_ranks_hint_count,
                    });
 
-    const auto common = makeKernelArgs(*resources, plan, failure_target_id);
+    const auto common = makeKernelArgs(*resources, failure_target_id);
     (void)cudaGetLastError();
-    invocation.launch(common, stream);
+    launch(common);
     const auto launch_error = cudaGetLastError();
     if (launch_error != cudaSuccess) {
         host_progress_->unregisterFailureTarget(resources, failure_target_id);
@@ -178,11 +172,11 @@ PGResult<void> GroupCollectiveRuntime::execute(CollectiveInvocation& invocation,
     return {};
 }
 
-void GroupCollectiveRuntime::stopAccepting() {
+void CollectiveRuntime::stopAccepting() {
     accepting_.store(false, std::memory_order_release);
 }
 
-bool GroupCollectiveRuntime::drain(std::chrono::milliseconds timeout) {
+bool CollectiveRuntime::drain(std::chrono::milliseconds timeout) {
     stopAccepting();
     std::lock_guard<std::mutex> admission(admission_mutex_);
     return !host_progress_ || host_progress_->drain(timeout);

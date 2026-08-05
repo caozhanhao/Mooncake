@@ -3,7 +3,7 @@
 
 #include <cstdint>
 
-#include "collective/transport/link.h"
+#include "collective/transport/peer_route.h"
 #include "collective/types.h"
 
 namespace mooncake {

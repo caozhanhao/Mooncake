@@ -3,7 +3,6 @@
 
 #include <cstdint>
 #include <limits>
-#include <variant>
 #include <vector>
 
 namespace mooncake {
@@ -11,23 +10,10 @@ namespace mooncake {
 // Coordinator-owned logical policy. Plans contain only choices that must be
 // identical on every rank. Membership roles, routes, and local resources are
 // resolved by each Agent from the authoritative GroupView.
-struct FlatRingPlan {
-    bool operator==(const FlatRingPlan&) const = default;
-};
-
-// The first vertical slice does not select this algorithm. Keeping the plan
-// alternative exposes the boundary for future topology-aware policy and plan
-// changes across application invocations without adding an incomplete
-// implementation.
-struct HierarchicalPlan {
-    bool operator==(const HierarchicalPlan&) const = default;
-};
-
-using AllReduceAlgorithmPlan = std::variant<FlatRingPlan, HierarchicalPlan>;
-
+// The first planned protocol implements Flat Ring for every size bucket. Add
+// an algorithm choice here only when a second executable algorithm exists.
 struct AllReducePlan {
     uint64_t max_message_bytes = std::numeric_limits<uint64_t>::max();
-    AllReduceAlgorithmPlan algorithm;
 
     bool operator==(const AllReducePlan&) const = default;
 };

@@ -3,7 +3,7 @@
 
 #include <cstdint>
 
-#include "collective/transport/kernel_resources.cuh"
+#include "collective/device_context.cuh"
 #include "collective/transport/peer_route.h"
 #include "transport/device/device_ops.cuh"
 

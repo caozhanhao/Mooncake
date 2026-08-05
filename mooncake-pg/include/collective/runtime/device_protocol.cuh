@@ -1,7 +1,7 @@
 #ifndef MOONCAKE_PG_COLLECTIVE_RUNTIME_DEVICE_PROTOCOL_CUH
 #define MOONCAKE_PG_COLLECTIVE_RUNTIME_DEVICE_PROTOCOL_CUH
 
-#include "collective/runtime/kernel_args.cuh"
+#include "collective/device_context.cuh"
 #include "transport/device/device_ops.cuh"
 
 namespace mooncake {
@@ -79,18 +79,16 @@ inline __device__ bool prepareCollectiveInvocation(
                 &failure.state,
                 static_cast<uint32_t>(CollectiveFailureState::Idle));
         }
-        const bool asynchronous_resource_idle =
-            mc_ld_acquire(
-                reinterpret_cast<const int*>(&control.resource_idle)) != 0;
+        const bool transport_idle = mc_ld_acquire(reinterpret_cast<const int*>(
+                                        &control.transport_idle)) != 0;
         const auto host_command_state =
             static_cast<HostTransferCommandState>(mc_ld_acquire(
                 reinterpret_cast<const int*>(&resources.host_command->state)));
-        const bool host_command_reusable =
+        const bool host_command_settled =
             host_command_state == HostTransferCommandState::Idle ||
             host_command_state == HostTransferCommandState::Completed ||
             host_command_state == HostTransferCommandState::Failed;
-        resource_available =
-            asynchronous_resource_idle && host_command_reusable ? 1 : 0;
+        resource_available = transport_idle && host_command_settled ? 1 : 0;
         if (resource_available) {
             control.first_error_code = 0;
             control.failed_peer = -1;

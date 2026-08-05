@@ -29,10 +29,11 @@ struct CollectiveBufferLayout {
 //   |- CollectiveControlPool        shared failure/resource controls
 //   `- CollectiveHostTransferProxy optional host-transfer commands
 //
-// GroupCollectiveRuntime (communicator lifetime)
+// GroupCollectiveEngine (communicator lifetime)
 //   |- CollectiveLanePool         stable wire-control addresses + lane owners
-//   |- eager invocation           temporary CollectiveResourceLease
-//   `- graph_resources[id]        same lease, retained until destruction
+//   `- CollectiveRuntime
+//       |- eager invocation       temporary CollectiveResourceLease
+//       `- graph_resources[id]    same lease, retained until destruction
 //
 // The lease owns the composed resources. Before submission, destruction is a
 // normal acquisition rollback. After markSubmitted(), destruction
@@ -49,9 +50,8 @@ class CollectiveResourceLease {
         CollectiveResourceLease&& other) noexcept;
 
     void markSubmitted() noexcept { submitted_ = true; }
-    // Retires a completed submission. Resources return to their pools only
-    // when the shared control block proves that asynchronous transport is no
-    // longer using them; otherwise the pools quarantine them.
+    // Retires a completed submission. An idle bundle returns to its pools;
+    // otherwise every component is explicitly abandoned.
     bool retire() noexcept;
 
     CollectiveLaneLease lane;
@@ -64,7 +64,8 @@ class CollectiveResourceLease {
 
     explicit CollectiveResourceLease(CollectiveResourcePool* pool)
         : pool_(pool) {}
-    bool release(bool resource_idle) noexcept;
+    bool release() noexcept;
+    void abandon() noexcept;
     void moveFrom(CollectiveResourceLease&& other) noexcept;
 
     CollectiveResourcePool* pool_ = nullptr;
@@ -98,8 +99,8 @@ class CollectiveResourcePool {
    private:
     friend class CollectiveResourceLease;
 
-    bool release(CollectiveResourceLease& resources,
-                 bool resource_idle) noexcept;
+    bool release(CollectiveResourceLease& resources) noexcept;
+    void abandon(CollectiveResourceLease& resources) noexcept;
 
     CollectiveBufferPool* buffer_pool_ = nullptr;
     CollectiveControlPool* control_pool_ = nullptr;

@@ -1,4 +1,4 @@
-#include "collective/route/group_peer_routes.h"
+#include "collective/resolved_collective_view.h"
 
 #include "control_plane/control_types.h"
 #include "control_plane/device_link_manager.h"
@@ -6,26 +6,36 @@
 
 namespace mooncake {
 
-GroupPeerRoutes buildGroupPeerRoutes(const GroupView& view,
-                                     const ActiveGroupRanks& active_ranks,
-                                     InGroupRank self_in_group_rank,
-                                     DeviceId device,
-                                     DeviceLinkManager& device_links,
-                                     LinkManager& host_links) {
-    GroupPeerRoutes result;
-    result.routes_.resize(view.rank_order.size());
-    if (!active_ranks.self_ordinal.has_value()) return result;
+ResolvedCollectiveView resolveCollectiveView(const GroupView& view,
+                                             InGroupRank self, DeviceId device,
+                                             DeviceLinkManager& device_links,
+                                             LinkManager& host_links) {
+    ResolvedCollectiveView result;
+    result.epoch = view.epoch;
+    result.active_order.reserve(view.rank_order.size());
+    result.peer_routes.resize(view.rank_order.size());
 
-    for (const auto peer_in_group_rank : active_ranks.ordered) {
-        if (peer_in_group_rank == self_in_group_rank) continue;
+    for (size_t index = 0; index < view.rank_order.size(); ++index) {
+        const auto global_rank = view.rank_order[index];
+        if (!view.members[global_rank].isActive()) continue;
+        if (static_cast<InGroupRank>(index) == self) {
+            result.self_ordinal =
+                static_cast<uint32_t>(result.active_order.size());
+        }
+        result.active_order.push_back(static_cast<InGroupRank>(index));
+    }
+    if (!result.self_ordinal.has_value()) return result;
 
-        const auto peer_index = static_cast<size_t>(peer_in_group_rank);
+    for (const auto peer : result.active_order) {
+        if (peer == self) continue;
+
+        const auto peer_index = static_cast<size_t>(peer);
         const auto global_peer = view.rank_order[peer_index];
         const auto& endpoint = view.members[global_peer].endpoint_v2;
         if (!endpoint.has_value()) continue;
 
         PeerRoute route;
-        route.peer_in_group_rank = peer_in_group_rank;
+        route.peer_in_group_rank = peer;
 
         if (endpoint->device_p2p.has_value()) {
             auto* mapped_arena = device_links.resolveP2p(
@@ -37,7 +47,7 @@ GroupPeerRoutes buildGroupPeerRoutes(const GroupView& view,
                     static_cast<char*>(mapped_arena) +
                     endpoint->control_base_address -
                     endpoint->arena_base_address;
-                result.routes_[peer_index] = route;
+                result.peer_routes[peer_index] = route;
                 continue;
             }
         }
@@ -58,7 +68,7 @@ GroupPeerRoutes buildGroupPeerRoutes(const GroupView& view,
                                              endpoint->control_base_address -
                                              endpoint->arena_base_address,
                 };
-                result.routes_[peer_index] = route;
+                result.peer_routes[peer_index] = route;
                 continue;
             }
         }
@@ -71,7 +81,7 @@ GroupPeerRoutes buildGroupPeerRoutes(const GroupView& view,
             .remote_arena_address = endpoint->arena_base_address,
             .remote_buffer_address = endpoint->control_base_address,
         };
-        result.routes_[peer_index] = route;
+        result.peer_routes[peer_index] = route;
     }
 
     return result;

@@ -5,18 +5,29 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include <cuda_alike.h>
 
-#include "collective/runtime/collective_failure.h"
+#include "collective/runtime/resource_pool.h"
 #include "error_types.h"
 
 namespace mooncake {
+
+using CollectiveFailureReportCallback =
+    std::function<PGResult<void>(InGroupRank failed_peer)>;
+
+struct CollectiveFailureTarget {
+    uint64_t failure_target_id = 0;
+    int32_t* failed_ranks_hint = nullptr;
+    size_t failed_ranks_hint_count = 0;
+};
 
 // One launched eager invocation. Host progress owns this value until its
 // completion event proves that the resource lease can be retired.
@@ -38,8 +49,7 @@ struct EagerSubmission {
 class CollectiveHostProgress {
    public:
     static PGResult<std::unique_ptr<CollectiveHostProgress>> create(
-        DeviceId device,
-        std::unique_ptr<CollectiveFailureHandler> failure_handler);
+        DeviceId device, CollectiveFailureReportCallback report_failure);
     ~CollectiveHostProgress() noexcept;
 
     void registerFailureTarget(
@@ -65,19 +75,27 @@ class CollectiveHostProgress {
         std::vector<CollectiveFailureTarget> targets;
     };
 
-    CollectiveHostProgress(
-        DeviceId device,
-        std::unique_ptr<CollectiveFailureHandler> failure_handler)
-        : device_(device), failure_handler_(std::move(failure_handler)) {}
+    struct FailureClaim {
+        std::shared_ptr<CollectiveResourceLease> resources;
+        CollectiveFailureTarget target;
+        InGroupRank failed_peer = -1;
+    };
+
+    CollectiveHostProgress(DeviceId device,
+                           CollectiveFailureReportCallback report_failure)
+        : device_(device), report_failure_(std::move(report_failure)) {}
 
     bool retireCompletedSubmission();
+    static std::optional<FailureClaim> claimFailure(
+        const FailureSource& source);
+    void handleFailure(const FailureClaim& failure);
     bool handleOneFailure();
     void progressLoop() noexcept;
     void removeFailureSourceLocked(
         const std::shared_ptr<CollectiveResourceLease>& resources);
 
     DeviceId device_ = kInvalidDeviceId;
-    std::unique_ptr<CollectiveFailureHandler> failure_handler_;
+    CollectiveFailureReportCallback report_failure_;
 
     mutable std::mutex mutex_;
     std::vector<FailureSource> failure_sources_;

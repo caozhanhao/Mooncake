@@ -18,8 +18,9 @@ struct CollectiveLaneLease {
     uint32_t index = 0;
 };
 
-// Communicator-scoped collective lanes. Each lane reserves one stable control
-// span used for peer wire tokens; invocation buffers remain process-pooled.
+// Communicator-scoped collective lanes. Each lane owns one local invocation
+// sequence and one stable span for peer wire tokens; invocation buffers remain
+// process-pooled.
 class CollectiveLanePool {
    public:
     static PGResult<std::unique_ptr<CollectiveLanePool>> create(
@@ -30,18 +31,21 @@ class CollectiveLanePool {
 
     const CollectiveControlLayout& layout() const { return layout_; }
     void* controlBase() const { return control_->base(); }
+    uint64_t* invocationSequence(const CollectiveLaneLease& lane) const;
 
     PGResult<CollectiveLaneLease> acquire(uint32_t preferred_lane);
-    bool release(const CollectiveLaneLease& lane, bool resource_idle);
-    bool close(bool resource_idle);
+    void release(const CollectiveLaneLease& lane);
+    void abandon(const CollectiveLaneLease& lane);
+    bool close(bool resources_safe);
 
     CollectiveLanePool(const CollectiveLanePool&) = delete;
     CollectiveLanePool& operator=(const CollectiveLanePool&) = delete;
 
    private:
-    struct LaneState {
-        bool in_use = false;
-        bool reusable = true;
+    enum class LaneState : uint8_t {
+        Free = 0,
+        Acquired,
+        Abandoned,
     };
 
     CollectiveLanePool(CollectiveBufferPool* buffers,
@@ -58,7 +62,6 @@ class CollectiveLanePool {
 
     std::mutex mutex_;
     std::vector<LaneState> lanes_;
-    bool may_be_in_use_ = false;
     bool closed_ = false;
 };
 

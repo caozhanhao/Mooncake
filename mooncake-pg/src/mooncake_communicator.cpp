@@ -12,12 +12,11 @@
 #include <glog/logging.h>
 
 #include "common.h"
+#include "collective/group_collective_engine.h"
+#include "collective/allreduce/allreduce.h"
 #include "error_types.h"
 #include "gpu_runtime.h"
 #include "memory_location.h"
-#include "collective/plan/allreduce_plan_builder.h"
-#include "collective/operation/allreduce.h"
-#include "collective/runtime/collective_runtime.h"
 
 namespace mooncake {
 namespace {
@@ -396,55 +395,17 @@ MooncakeCommunicator::MooncakeCommunicator(
 
 PGResult<void> MooncakeCommunicator::initializePlannedCollectives(
     const std::string& device_location) {
-    PG_TRY(context_.collective_control_pool.initialize());
-    PG_TRY(context_.collective_host_proxy.initialize(context_.engine,
-                                                     &context_.link_manager));
-    PG_TRY(collective_lanes_,
-           CollectiveLanePool::create(&context_.collective_buffer_pool,
-                                      device_index_, device_location,
-                                      context_.engine));
-    const auto collective_arena =
-        context_.collective_buffer_pool.arena(device_index_);
-    context_.device_link_manager.bindCollectiveArena(collective_arena);
-
-    const auto& control_layout = collective_lanes_->layout();
-    const uint32_t lane_count = control_layout.lane_count;
-    collective_plan_registry_ = std::make_unique<CollectivePlanRegistry>(
-        context_.device_link_manager, context_.link_manager, device_index_,
-        rank_, lane_count);
-    PG_TRY(allreduce_plan_publisher_,
-           collective_plan_registry_->addBuilder(
-               std::make_unique<AllReducePlanBuilder>()));
-    CollectiveFailureReportCallback failure_report_callback =
+    std::function<PGResult<void>(InGroupRank)> report_failure =
         [this](InGroupRank failed_peer) {
             return reportCollectiveFailure(failed_peer);
         };
-    PG_TRY(
-        collective_runtime_,
-        GroupCollectiveRuntime::create(
-            &context_.collective_buffer_pool, &context_.collective_control_pool,
-            &context_.collective_host_proxy, collective_lanes_.get(),
-            device_location, context_.engine, device_index_,
-            context_.collective_timeout_us,
-            std::move(failure_report_callback)));
-
-    const auto& arena = collective_arena;
-    collective_endpoint_ = GroupEndpointV2{
-        .device = arena.device,
-        .arena_generation = arena.generation,
-        .arena_base_address =
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(arena.base)),
-        .arena_bytes = arena.bytes,
-        .control_base_address = static_cast<uint64_t>(
-            reinterpret_cast<uintptr_t>(collective_lanes_->controlBase())),
-        .control_layout = collective_lanes_->layout(),
-    };
-    if (!arena.p2p_handle.empty()) {
-        collective_endpoint_->device_p2p = P2pArenaDescriptor{
-            .opaque_handle = arena.p2p_handle,
-        };
-    }
-    context_.device_link_manager.populateEndpoint(*collective_endpoint_);
+    PG_TRY(planned_collectives_,
+           GroupCollectiveEngine::create(
+               context_.collective_buffer_pool,
+               context_.collective_control_pool, context_.collective_host_proxy,
+               context_.device_link_manager, context_.link_manager,
+               context_.engine, device_index_, rank_, device_location,
+               context_.collective_timeout_us, std::move(report_failure)));
     return {};
 }
 
@@ -679,14 +640,7 @@ PGResult<void> MooncakeCommunicator::initialize(
             LOG(WARNING) << "Planned collectives are unavailable for group "
                          << meta_->group_id << ": " << planned.error().message
                          << "; retaining the legacy collective protocol";
-            collective_runtime_.reset();
-            allreduce_plan_publisher_ = nullptr;
-            collective_plan_registry_.reset();
-            collective_endpoint_.reset();
-            if (collective_lanes_) {
-                (void)collective_lanes_->close(true);
-                collective_lanes_.reset();
-            }
+            planned_collectives_.reset();
         }
     }
 
@@ -937,20 +891,12 @@ PGResult<void> MooncakeCommunicator::allReduceGpu(
     // Signature is part of the incremental protocol discriminator. Unsupported
     // signatures intentionally remain on the legacy implementation on every
     // rank; this is not a local-error fallback from a selected planned path.
-    if (AllReduceInvocation::supports(datatype, op)) {
-        if (allreduce_protocol_ == AllReduceProtocol::Planned) {
-            PG_VALIDATE_STATE(
-                collective_runtime_ && allreduce_plan_publisher_,
-                "Coordinator selected planned AllReduce but its local "
-                "runtime is unavailable");
-            PG_TRY(auto plan, allreduce_plan_publisher_->handle());
-            PG_TRY(auto invocation,
-                   AllReduceInvocation::create(send_buffer, recv_buffer, count,
-                                               datatype, op));
-            return collective_runtime_->execute(
-                invocation, plan, collective_view_epoch_, stream,
-                failed_ranks_hint, failed_ranks_hint_count);
-        }
+    if (planned_collectives_ &&
+        planned_collectives_->shouldUsePlannedAllReduce(datatype, op)) {
+        PG_TRY(auto request, makeAllReduceRequest(send_buffer, recv_buffer,
+                                                  count, datatype, op));
+        return planned_collectives_->allReduce(
+            request, stream, failed_ranks_hint, failed_ranks_hint_count);
     }
 
     PG_TRY(checkReduction(datatype, op, false));
@@ -1395,10 +1341,9 @@ PGResult<void> MooncakeCommunicator::shutdown() {
     if (is_shutdown_) return {};
     std::unique_ptr<GpuDeviceGuard> device_guard;
     const bool has_device_state =
-        !is_cpu_ &&
-        (active_ranks_mirror_stream_.has_value() || send_buffer_[0] ||
-         recv_buffer_[0] || worker_ || p2p_proxy_ || meta_ ||
-         collective_runtime_ || collective_lanes_);
+        !is_cpu_ && (active_ranks_mirror_stream_.has_value() ||
+                     send_buffer_[0] || recv_buffer_[0] || worker_ ||
+                     p2p_proxy_ || meta_ || planned_collectives_);
     if (has_device_state) {
         device_guard = std::make_unique<GpuDeviceGuard>(device_index_);
     }
@@ -1413,28 +1358,16 @@ PGResult<void> MooncakeCommunicator::shutdown() {
     // A parked executor must keep receiving authoritative view updates until
     // its failure sync completes. Drain the new runtime before removing this
     // communicator from AgentHost's callback lookup.
-    if (collective_runtime_) {
-        collective_runtime_->stopAccepting();
+    if (planned_collectives_) {
         const auto recovery_window = std::chrono::microseconds(
             std::max<int64_t>(0, context_.fault_reconciliation_window_us));
         const auto drain_timeout = std::chrono::ceil<std::chrono::milliseconds>(
             std::chrono::microseconds(context_.collective_timeout_us) +
             2 * recovery_window);
-        has_unsafe_collective = !collective_runtime_->drain(drain_timeout);
+        has_unsafe_collective = !planned_collectives_->stop(drain_timeout);
     }
 
     if (isValidGroup()) agent_.detachCommunicator(meta_->group_id);
-
-    if (has_unsafe_collective) {
-        if (collective_plan_registry_) {
-            collective_plan_registry_->retainForProcessLifetime();
-        }
-        context_.device_link_manager.retainForProcessLifetime();
-    }
-    collective_runtime_.reset();
-    allreduce_plan_publisher_ = nullptr;
-    collective_plan_registry_.reset();
-    collective_endpoint_.reset();
 
     // Phase 1: Drain P2P tasks.
     if (p2p_device_worker_ && p2p_proxy_) {
@@ -1495,13 +1428,13 @@ PGResult<void> MooncakeCommunicator::shutdown() {
             unregister_error = std::move(result).error();
         }
     }
-    if (collective_lanes_) {
-        if (!collective_lanes_->close(!unregister_error &&
-                                      !has_unsafe_collective)) {
+    if (planned_collectives_) {
+        if (!planned_collectives_->close(!unregister_error &&
+                                         !has_unsafe_collective)) {
             LOG(WARNING) << "Failed to release collective control region for "
                          << meta_->group_id;
         }
-        collective_lanes_.reset();
+        planned_collectives_.reset();
     }
     if (unregister_error) return makePGError(std::move(*unregister_error));
     return {};
@@ -1775,8 +1708,8 @@ void MooncakeCommunicator::applyViewUpdate(
         meta_->extensionMode.store(next_mode, std::memory_order_release);
     }
 
-    if (collective_plan_registry_) {
-        auto applied = collective_plan_registry_->apply(view);
+    if (planned_collectives_) {
+        auto applied = planned_collectives_->applyView(view);
         if (!applied.has_value()) {
             // The plan builder publishes an explicit invalid state before
             // returning this error. Planned execution therefore fails closed;
@@ -1786,8 +1719,6 @@ void MooncakeCommunicator::applyViewUpdate(
                          << applied.error().message;
         }
     }
-    allreduce_protocol_ = view.collective_plans.allreduce_protocol;
-    collective_view_epoch_ = view.epoch;
 }
 
 void MooncakeCommunicator::onPeerLinkReset(InGroupRank peer) {
@@ -1810,7 +1741,9 @@ GroupEndpointPublication MooncakeCommunicator::buildEndpointMetadata() const {
     GroupEndpointPublication publication{
         .group_id = meta_->group_id,
         .endpoint = meta_->segmentInfos[meta_->rank]};
-    publication.endpoint_v2 = collective_endpoint_;
+    if (planned_collectives_) {
+        publication.endpoint_v2 = planned_collectives_->endpoint();
+    }
     return publication;
 }
 

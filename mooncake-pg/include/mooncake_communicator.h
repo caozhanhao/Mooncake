@@ -28,10 +28,7 @@
 
 namespace mooncake {
 
-class CollectivePlanPublisher;
-class CollectivePlanRegistry;
-class GroupCollectiveRuntime;
-class CollectiveLanePool;
+class GroupCollectiveEngine;
 
 static constexpr size_t kDefaultCollectiveTimeoutUs = 10000000;  // 10 s
 static constexpr int64_t kDefaultP2PTimeoutUs = 10000000;        // 10 s
@@ -317,18 +314,7 @@ class MooncakeCommunicator {
     std::array<int32_t*, 2> cpu_sync_recv_region_{};
     std::shared_ptr<TransferGroupMeta> meta_;
 
-    // This slice assumes view application is serialized with collective
-    // execution. A future control-plane quiescing phase will enforce that
-    // internal contract. GroupView, membership and global ranks are projected
-    // into published plans and never captured by an executor.
-    AllReduceProtocol allreduce_protocol_ = AllReduceProtocol::Legacy;
-    uint64_t collective_view_epoch_ = 0;
-
-    std::unique_ptr<CollectiveLanePool> collective_lanes_;
-    std::unique_ptr<CollectivePlanRegistry> collective_plan_registry_;
-    CollectivePlanPublisher* allreduce_plan_publisher_ = nullptr;
-    std::unique_ptr<GroupCollectiveRuntime> collective_runtime_;
-    std::optional<GroupEndpointV2> collective_endpoint_;
+    std::unique_ptr<GroupCollectiveEngine> planned_collectives_;
 
     // P2P async infrastructure. p2p_proxy_ is created by this communicator but
     // can live longer because P2PDeviceWorker retains it until all transfers

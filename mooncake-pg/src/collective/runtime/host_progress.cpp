@@ -16,11 +16,10 @@ EagerSubmission::~EagerSubmission() noexcept {
 }
 
 PGResult<std::unique_ptr<CollectiveHostProgress>>
-CollectiveHostProgress::create(
-    DeviceId device,
-    std::unique_ptr<CollectiveFailureHandler> failure_handler) {
+CollectiveHostProgress::create(DeviceId device,
+                               CollectiveFailureReportCallback report_failure) {
     auto progress = std::unique_ptr<CollectiveHostProgress>(
-        new CollectiveHostProgress(device, std::move(failure_handler)));
+        new CollectiveHostProgress(device, std::move(report_failure)));
     try {
         progress->thread_ =
             std::thread(&CollectiveHostProgress::progressLoop, progress.get());
@@ -135,17 +134,63 @@ bool CollectiveHostProgress::retireCompletedSubmission() {
     return true;
 }
 
+std::optional<CollectiveHostProgress::FailureClaim>
+CollectiveHostProgress::claimFailure(const FailureSource& source) {
+    auto& failure = source.resources->control.host->failure;
+    auto state = std::atomic_ref<uint32_t>(failure.state);
+    uint32_t expected = static_cast<uint32_t>(CollectiveFailureState::Pending);
+    if (!state.compare_exchange_strong(
+            expected, static_cast<uint32_t>(CollectiveFailureState::Handling),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+
+    const auto target = std::find_if(
+        source.targets.begin(), source.targets.end(), [&](const auto& value) {
+            return value.failure_target_id == failure.failure_target_id;
+        });
+    PG_ASSERT(target != source.targets.end(),
+              "collective failure report has no tracked target");
+    return FailureClaim{
+        .resources = source.resources,
+        .target = *target,
+        .failed_peer = failure.failed_peer,
+    };
+}
+
+void CollectiveHostProgress::handleFailure(const FailureClaim& failure) {
+    if (failure.target.failed_ranks_hint && failure.failed_peer >= 0 &&
+        static_cast<size_t>(failure.failed_peer) <
+            failure.target.failed_ranks_hint_count) {
+        failure.target.failed_ranks_hint[failure.failed_peer] = 1;
+    }
+
+    if (report_failure_ && failure.failed_peer >= 0) {
+        auto result = report_failure_(failure.failed_peer);
+        if (!result.has_value()) {
+            LOG(WARNING) << "Collective failure report failed for peer "
+                         << failure.failed_peer << ": "
+                         << result.error().message;
+        }
+    }
+
+    auto& report = failure.resources->control.host->failure;
+    std::atomic_ref<uint32_t>(report.state)
+        .store(static_cast<uint32_t>(CollectiveFailureState::Acknowledged),
+               std::memory_order_release);
+}
+
 bool CollectiveHostProgress::handleOneFailure() {
-    std::optional<CollectiveFailureHandler::Claim> failure;
+    std::optional<FailureClaim> failure;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& source : failure_sources_) {
-            failure = failure_handler_->claim(source.resources, source.targets);
+            failure = claimFailure(source);
             if (failure.has_value()) break;
         }
     }
     if (!failure.has_value()) return false;
-    failure_handler_->handle(*failure);
+    handleFailure(*failure);
     return true;
 }
 

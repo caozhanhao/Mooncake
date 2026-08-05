@@ -172,18 +172,22 @@ PGResult<std::unique_ptr<CollectiveBufferLease>> CollectiveBufferPool::acquire(
     return lease;
 }
 
-bool CollectiveBufferPool::release(CollectiveBufferLease& lease,
-                                   bool resource_idle) {
+void CollectiveBufferPool::release(CollectiveBufferLease& lease) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto arena = arenas_.find(lease.device_);
-    if (arena == arenas_.end()) return false;
+    PG_ASSERT(arena != arenas_.end(),
+              "collective buffer arena is unavailable during release");
     --arena->second->active_allocations;
-    if (!resource_idle) {
-        arena->second->has_retained_allocation = true;
-        return false;
-    }
     releaseBlock(*arena->second, lease.offset_, lease.bytes_);
-    return true;
+}
+
+void CollectiveBufferPool::abandon(CollectiveBufferLease& lease) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto arena = arenas_.find(lease.device_);
+    PG_ASSERT(arena != arenas_.end(),
+              "collective buffer arena is unavailable during abandon");
+    --arena->second->active_allocations;
+    arena->second->has_abandoned_allocation = true;
 }
 
 CollectiveArenaView CollectiveBufferPool::arena(DeviceId device) const {
@@ -201,7 +205,7 @@ void CollectiveBufferPool::shutdown() {
     if (shutdown_) return;
     shutdown_ = true;
     for (auto& [device, arena] : arenas_) {
-        if (arena->active_allocations != 0 || arena->has_retained_allocation) {
+        if (arena->active_allocations != 0 || arena->has_abandoned_allocation) {
             LOG(WARNING) << "Retaining collective buffer pool for OS cleanup, "
                             "device="
                          << device;

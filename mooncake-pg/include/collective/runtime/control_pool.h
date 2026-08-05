@@ -4,7 +4,6 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
-#include <optional>
 #include <vector>
 
 #include "collective/runtime/control_block.cuh"
@@ -27,22 +26,24 @@ class CollectiveControlPool {
     ~CollectiveControlPool() noexcept;
 
     PGResult<void> initialize(uint32_t control_count = 128);
-    std::optional<CollectiveControlLease> tryAcquire();
-    bool release(const CollectiveControlLease& control, bool resource_idle);
+    PGResult<CollectiveControlLease> acquire();
+    void release(const CollectiveControlLease& control);
+    void abandon(const CollectiveControlLease& control);
     void shutdown();
 
     CollectiveControlPool(const CollectiveControlPool&) = delete;
     CollectiveControlPool& operator=(const CollectiveControlPool&) = delete;
 
    private:
-    struct ControlState {
-        bool in_use = false;
-        bool reusable = true;
+    enum class SlotState : uint8_t {
+        Free = 0,
+        Acquired,
+        Abandoned,
     };
 
     CollectiveControlBlock* host_controls_ = nullptr;
     CollectiveControlBlock* device_controls_ = nullptr;
-    std::vector<ControlState> controls_;
+    std::vector<SlotState> controls_;
     std::mutex mutex_;
     std::atomic<bool> initialized_{false};
 };

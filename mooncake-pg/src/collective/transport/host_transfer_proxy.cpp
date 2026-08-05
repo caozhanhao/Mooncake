@@ -89,49 +89,60 @@ PGResult<void> CollectiveHostTransferProxy::initialize(TransferEngine* engine,
     return {};
 }
 
-std::optional<HostTransferCommandLease>
-CollectiveHostTransferProxy::tryAcquireCommand(
+PGResult<HostTransferCommandLease> CollectiveHostTransferProxy::acquireCommand(
     CollectiveControlBlock* control) {
     if (!initialized() || stopping_.load(std::memory_order_acquire)) {
-        return std::nullopt;
+        return makePGError(PGErrorCode::InvalidState,
+                           "collective host transfer proxy is not running");
     }
     std::lock_guard<std::mutex> lock(command_mutex_);
     for (uint32_t index = 0; index < command_count_; ++index) {
-        auto& state = commands_[index];
-        if (state.in_use || !state.reusable) continue;
-        state.in_use = true;
-        state.control = control;
+        auto& slot = commands_[index];
+        if (slot.state != SlotState::Free) continue;
+        slot.state = SlotState::Acquired;
+        slot.control = control;
         host_commands_[index] = HostTransferCommand{};
         return HostTransferCommandLease{index, host_commands_ + index,
                                         device_commands_ + index};
     }
-    return std::nullopt;
-}
-
-bool CollectiveHostTransferProxy::commandReusableLocked(
-    const HostTransferCommandLease& lease, bool resource_idle) {
-    auto state = static_cast<HostTransferCommandState>(loadState(*lease.host));
-    if (resource_idle && (state == HostTransferCommandState::Completed ||
-                          state == HostTransferCommandState::Failed)) {
-        storeState(*lease.host, HostTransferCommandState::Idle);
-        state = HostTransferCommandState::Idle;
-    }
-    return resource_idle && state == HostTransferCommandState::Idle;
+    return makePGError(PGErrorCode::ResourceBusy,
+                       "collective host commands are exhausted");
 }
 
 bool CollectiveHostTransferProxy::releaseCommand(
-    const HostTransferCommandLease& command, bool resource_idle) {
+    const HostTransferCommandLease& command) {
     std::lock_guard<std::mutex> lock(command_mutex_);
     PG_ASSERT(command.index < commands_.size() &&
-                  commands_[command.index].in_use &&
+                  commands_[command.index].state == SlotState::Acquired &&
                   command.host == host_commands_ + command.index &&
                   command.device == device_commands_ + command.index,
               "collective host command lease is invalid");
-    auto& state = commands_[command.index];
-    state.reusable = commandReusableLocked(command, resource_idle);
-    state.in_use = false;
-    if (state.reusable) state.control = nullptr;
-    return state.reusable;
+    auto& slot = commands_[command.index];
+    auto command_state =
+        static_cast<HostTransferCommandState>(loadState(*command.host));
+    if (command_state == HostTransferCommandState::Completed ||
+        command_state == HostTransferCommandState::Failed) {
+        storeState(*command.host, HostTransferCommandState::Idle);
+        command_state = HostTransferCommandState::Idle;
+    }
+    if (command_state != HostTransferCommandState::Idle) {
+        slot.state = SlotState::Abandoned;
+        return false;
+    }
+    slot.state = SlotState::Free;
+    slot.control = nullptr;
+    return true;
+}
+
+void CollectiveHostTransferProxy::abandonCommand(
+    const HostTransferCommandLease& command) {
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    PG_ASSERT(command.index < commands_.size() &&
+                  commands_[command.index].state == SlotState::Acquired &&
+                  command.host == host_commands_ + command.index &&
+                  command.device == device_commands_ + command.index,
+              "collective host command lease is invalid");
+    commands_[command.index].state = SlotState::Abandoned;
 }
 
 bool CollectiveHostTransferProxy::submitPhase(uint32_t command_index,
@@ -167,7 +178,7 @@ bool CollectiveHostTransferProxy::submitPhase(uint32_t command_index,
         failCommand(command_index, CollectiveProtocolError::Transport);
         return false;
     }
-    std::atomic_ref<uint32_t>(control.resource_idle)
+    std::atomic_ref<uint32_t>(control.transport_idle)
         .store(0, std::memory_order_release);
     const auto submit = engine_->submitTransfer(
         batch, {TransferRequest{.opcode = TransferRequest::WRITE,
@@ -178,7 +189,7 @@ bool CollectiveHostTransferProxy::submitPhase(uint32_t command_index,
     if (!submit.ok()) {
         const auto released = engine_->freeBatchID(batch);
         if (released.ok()) {
-            std::atomic_ref<uint32_t>(control.resource_idle)
+            std::atomic_ref<uint32_t>(control.transport_idle)
                 .store(1, std::memory_order_release);
         }
         failCommand(command_index, CollectiveProtocolError::Transport);
@@ -245,7 +256,7 @@ bool CollectiveHostTransferProxy::advanceTransfer(ActiveTransfer& active) {
         failCommand(active.command_index, CollectiveProtocolError::Transport);
         return true;
     }
-    std::atomic_ref<uint32_t>(control.resource_idle)
+    std::atomic_ref<uint32_t>(control.transport_idle)
         .store(1, std::memory_order_release);
 
     if (active.phase == ActiveTransfer::Phase::Data) {
@@ -306,7 +317,7 @@ void CollectiveHostTransferProxy::shutdown() {
     {
         std::lock_guard<std::mutex> lock(command_mutex_);
         for (const auto& command : commands_) {
-            safe_to_free &= !command.in_use && command.reusable;
+            safe_to_free &= command.state == SlotState::Free;
         }
     }
     if (safe_to_free && host_commands_) {
