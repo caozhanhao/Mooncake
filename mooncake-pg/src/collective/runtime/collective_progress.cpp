@@ -13,11 +13,10 @@ namespace mooncake {
 
 PGResult<std::unique_ptr<CollectiveProgressEngine>>
 CollectiveProgressEngine::create(
-    CollectiveResourcePool* resource_pool, DeviceId device,
+    DeviceId device,
     std::unique_ptr<CollectiveFailureHandler> failure_handler) {
-    auto progress =
-        std::unique_ptr<CollectiveProgressEngine>(new CollectiveProgressEngine(
-            resource_pool, device, std::move(failure_handler)));
+    auto progress = std::unique_ptr<CollectiveProgressEngine>(
+        new CollectiveProgressEngine(device, std::move(failure_handler)));
     try {
         progress->thread_ = std::thread(&CollectiveProgressEngine::progressLoop,
                                         progress.get());
@@ -60,18 +59,11 @@ bool CollectiveProgressEngine::retireCompletedCollective() {
             std::atomic_ref<uint32_t>(
                 collective->resources.control.host->resource_idle)
                     .load(std::memory_order_acquire) != 0;
-        if (!resource_pool_->release(collective->resources, resource_idle)) {
+        if (!collective->resources.release(resource_idle)) {
             LOG(WARNING) << "Retained collective resources after "
                             "completion";
         }
-        if (query == cudaSuccess) {
-            const auto destroy = cudaEventDestroy(collective->completion);
-            if (destroy != cudaSuccess) {
-                LOG(WARNING) << "Failed to destroy collective completion "
-                                "event: "
-                             << cudaGetErrorString(destroy);
-            }
-        } else {
+        if (query != cudaSuccess) {
             LOG(WARNING) << "Collective completion query failed: "
                          << cudaGetErrorString(query);
         }

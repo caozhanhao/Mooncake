@@ -26,6 +26,7 @@ class CollectiveLanePool {
         CollectiveBufferPool* buffers, DeviceId device,
         const std::string& te_location, TransferEngine* engine,
         uint32_t lane_count = 3);
+    ~CollectiveLanePool() noexcept;
 
     const CollectiveControlLayout& layout() const { return layout_; }
     void* controlBase() const { return control_->base(); }
@@ -57,6 +58,7 @@ class CollectiveLanePool {
 
     std::mutex mutex_;
     std::vector<LaneState> lanes_;
+    bool may_be_in_use_ = false;
     bool closed_ = false;
 };
 

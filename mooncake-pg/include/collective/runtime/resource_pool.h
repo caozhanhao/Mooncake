@@ -14,6 +14,8 @@
 
 namespace mooncake {
 
+class CollectiveResourcePool;
+
 // Every collective receives the same opaque staging region. Algorithms own
 // its internal layout and tile larger tensors through it. The protocol tail is
 // reserved for transport-visible tokens and dynamic peer-buffer exchange.
@@ -32,13 +34,38 @@ struct CollectiveBufferLayout {
 //   |- eager invocation           temporary CollectiveResourceLease
 //   `- captured_collectives[id]   same lease, retained until destruction
 //
-// The pool only composes these resources. It does not know whether the
-// caller will return the lease after one invocation or retain it for a graph.
-struct CollectiveResourceLease {
+// The lease owns the composed resources. Before submission, destruction is a
+// normal acquisition rollback. After markSubmitted(), destruction
+// conservatively retains the resources unless progress explicitly releases them
+// with observed idle state.
+class CollectiveResourceLease {
+   public:
+    ~CollectiveResourceLease() noexcept;
+
+    CollectiveResourceLease(const CollectiveResourceLease&) = delete;
+    CollectiveResourceLease& operator=(const CollectiveResourceLease&) = delete;
+    CollectiveResourceLease(CollectiveResourceLease&& other) noexcept;
+    CollectiveResourceLease& operator=(
+        CollectiveResourceLease&& other) noexcept;
+
+    void markSubmitted() noexcept { submitted_ = true; }
+    bool release(bool resource_idle) noexcept;
+
     CollectiveLaneLease lane;
     std::unique_ptr<CollectiveBufferLease> buffer;
     CollectiveControlLease control;
     HostTransferCommandLease host_command;
+
+   private:
+    friend class CollectiveResourcePool;
+
+    explicit CollectiveResourceLease(CollectiveResourcePool* pool)
+        : pool_(pool) {}
+    void moveFrom(CollectiveResourceLease&& other) noexcept;
+
+    CollectiveResourcePool* pool_ = nullptr;
+    bool submitted_ = false;
+    bool has_lane_ = false;
 };
 
 // Eager calls lease and graphs pin the same data-plane resource. Every lease
@@ -63,9 +90,13 @@ class CollectiveResourcePool {
 
     PGResult<CollectiveResourceLease> acquire(uint32_t preferred_lane);
     static const CollectiveBufferLayout& bufferLayout();
-    bool release(const CollectiveResourceLease& resources, bool resource_idle);
 
    private:
+    friend class CollectiveResourceLease;
+
+    bool release(CollectiveResourceLease& resources,
+                 bool resource_idle) noexcept;
+
     CollectiveBufferPool* buffer_pool_ = nullptr;
     CollectiveControlPool* control_pool_ = nullptr;
     CollectiveLanePool* lanes_ = nullptr;

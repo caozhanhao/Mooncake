@@ -27,6 +27,9 @@ struct CollectiveFailureTarget {
 struct TrackedCollective {
     explicit TrackedCollective(CollectiveResourceLease value)
         : resources(std::move(value)) {}
+    ~TrackedCollective() noexcept {
+        if (completion) (void)cudaEventDestroy(completion);
+    }
 
     CollectiveResourceLease resources;
     cudaEvent_t completion = nullptr;

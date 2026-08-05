@@ -6,7 +6,6 @@
 #include <cuda_alike.h>
 
 #include "gpu_runtime.h"
-#include "pg_utils.h"
 
 namespace mooncake {
 namespace {
@@ -46,13 +45,16 @@ PGResult<std::unique_ptr<CollectiveLanePool>> CollectiveLanePool::create(
     PG_TRY(auto control,
            buffers->acquire(device, layout.total_bytes, layout.alignment,
                             te_location, engine));
-    auto control_rollback = makeScopeExit(
-        [&]() noexcept { (void)buffers->release(*control, true); });
-    const GpuDeviceGuard guard(device);
-    PG_TRY_CUDA(cudaMemset(control->base(), 0, control->bytes()));
-    control_rollback.dismiss();
-    return std::unique_ptr<CollectiveLanePool>(
+    auto pool = std::unique_ptr<CollectiveLanePool>(
         new CollectiveLanePool(buffers, std::move(control), std::move(layout)));
+    const GpuDeviceGuard guard(device);
+    PG_TRY_CUDA(cudaMemset(pool->control_->base(), 0, pool->control_->bytes()));
+    pool->may_be_in_use_ = true;
+    return pool;
+}
+
+CollectiveLanePool::~CollectiveLanePool() noexcept {
+    (void)close(!may_be_in_use_);
 }
 
 PGResult<CollectiveLaneLease> CollectiveLanePool::acquire(

@@ -7,46 +7,12 @@
 #include <chrono>
 #include <cstdint>
 #include <thread>
-#include <type_traits>
 #include <utility>
 
 // For PAUSE macro
 #include <transfer_engine.h>
 
 namespace mooncake {
-
-template <typename Callback>
-class ScopeExit {
-   public:
-    explicit ScopeExit(Callback callback) noexcept(
-        std::is_nothrow_move_constructible_v<Callback>)
-        : callback_(std::move(callback)) {}
-
-    ScopeExit(const ScopeExit&) = delete;
-    ScopeExit& operator=(const ScopeExit&) = delete;
-    ScopeExit& operator=(ScopeExit&&) = delete;
-
-    ScopeExit(ScopeExit&& other) noexcept(
-        std::is_nothrow_move_constructible_v<Callback>)
-        : callback_(std::move(other.callback_)),
-          active_(std::exchange(other.active_, false)) {}
-
-    ~ScopeExit() noexcept {
-        if (active_) callback_();
-    }
-
-    void dismiss() noexcept { active_ = false; }
-
-   private:
-    Callback callback_;
-    bool active_ = true;
-};
-
-template <typename Callback>
-[[nodiscard]] auto makeScopeExit(Callback&& callback) {
-    using CallbackType = std::decay_t<Callback>;
-    return ScopeExit<CallbackType>(std::forward<Callback>(callback));
-}
 
 /**
  * @brief Configuration parameters for the BackoffWaiter.

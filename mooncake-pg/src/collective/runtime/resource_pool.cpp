@@ -1,7 +1,5 @@
 #include "collective/runtime/resource_pool.h"
 
-#include "pg_utils.h"
-
 namespace mooncake {
 namespace {
 
@@ -31,47 +29,93 @@ uint64_t collectiveBufferBytes() {
 
 }  // namespace
 
+CollectiveResourceLease::~CollectiveResourceLease() noexcept {
+    (void)release(!submitted_);
+}
+
+CollectiveResourceLease::CollectiveResourceLease(
+    CollectiveResourceLease&& other) noexcept {
+    moveFrom(std::move(other));
+}
+
+CollectiveResourceLease& CollectiveResourceLease::operator=(
+    CollectiveResourceLease&& other) noexcept {
+    if (this != &other) {
+        (void)release(!submitted_);
+        moveFrom(std::move(other));
+    }
+    return *this;
+}
+
+bool CollectiveResourceLease::release(bool resource_idle) noexcept {
+    if (!pool_) return true;
+    auto* pool = std::exchange(pool_, nullptr);
+    return pool->release(*this, resource_idle);
+}
+
+void CollectiveResourceLease::moveFrom(
+    CollectiveResourceLease&& other) noexcept {
+    lane = other.lane;
+    buffer = std::move(other.buffer);
+    control = other.control;
+    host_command = other.host_command;
+    pool_ = std::exchange(other.pool_, nullptr);
+    submitted_ = std::exchange(other.submitted_, false);
+    has_lane_ = std::exchange(other.has_lane_, false);
+}
+
 PGResult<CollectiveResourceLease> CollectiveResourcePool::acquire(
     uint32_t preferred_lane) {
-    PG_TRY(auto lane, lanes_->acquire(preferred_lane));
-    auto lane_rollback =
-        makeScopeExit([&]() noexcept { (void)lanes_->release(lane, true); });
+    CollectiveResourceLease resources(this);
+    PG_TRY(resources.lane, lanes_->acquire(preferred_lane));
+    resources.has_lane_ = true;
+
     auto control = control_pool_->tryAcquire();
     if (!control.has_value()) {
         return makePGError(PGErrorCode::ResourceBusy,
                            "collective control block is busy");
     }
-    auto control_rollback = makeScopeExit(
-        [&]() noexcept { (void)control_pool_->release(*control, true); });
-    PG_TRY(auto buffer,
+    resources.control = *control;
+
+    PG_TRY(resources.buffer,
            buffer_pool_->acquire(device_, collectiveBufferBytes(),
                                  kBufferAlignment, te_location_, engine_));
-    auto buffer_rollback = makeScopeExit(
-        [&]() noexcept { (void)buffer_pool_->release(*buffer, true); });
 
-    auto host_command = host_proxy_->tryAcquireCommand(control->host);
+    auto host_command = host_proxy_->tryAcquireCommand(resources.control.host);
     if (!host_command.has_value()) {
         return makePGError(PGErrorCode::ResourceBusy,
                            "collective host-transfer command is busy");
     }
-    lane_rollback.dismiss();
-    control_rollback.dismiss();
-    buffer_rollback.dismiss();
-    return CollectiveResourceLease{std::move(lane), std::move(buffer), *control,
-                                   *host_command};
+    resources.host_command = *host_command;
+    return resources;
 }
 
 const CollectiveBufferLayout& CollectiveResourcePool::bufferLayout() {
     return collectiveBufferLayout();
 }
 
-bool CollectiveResourcePool::release(const CollectiveResourceLease& resources,
-                                     bool resource_idle) {
-    bool reusable =
-        host_proxy_->releaseCommand(resources.host_command, resource_idle);
-    reusable = buffer_pool_->release(*resources.buffer, reusable);
-    reusable = lanes_->release(resources.lane, reusable);
-    return control_pool_->release(resources.control, reusable);
+bool CollectiveResourcePool::release(CollectiveResourceLease& resources,
+                                     bool resource_idle) noexcept {
+    bool reusable = resource_idle;
+    if (resources.host_command.host) {
+        reusable =
+            host_proxy_->releaseCommand(resources.host_command, reusable);
+        resources.host_command = {};
+    }
+    if (resources.buffer) {
+        reusable = buffer_pool_->release(*resources.buffer, reusable);
+        resources.buffer.reset();
+    }
+    if (resources.has_lane_) {
+        reusable = lanes_->release(resources.lane, reusable);
+        resources.has_lane_ = false;
+    }
+    if (resources.control.host) {
+        reusable = control_pool_->release(resources.control, reusable);
+        resources.control = {};
+    }
+    resources.submitted_ = false;
+    return reusable;
 }
 
 }  // namespace mooncake

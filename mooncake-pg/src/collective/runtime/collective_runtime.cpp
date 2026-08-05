@@ -4,7 +4,6 @@
 #include <utility>
 
 #include "gpu_runtime.h"
-#include "pg_utils.h"
 
 namespace mooncake {
 namespace {
@@ -49,9 +48,8 @@ GroupCollectiveRuntime::create(
             std::move(te_location), engine, device, timeout_ticks));
     auto failure_handler = std::make_unique<CollectiveFailureHandler>(
         std::move(failure_report_callback));
-    PG_TRY(runtime->progress_,
-           CollectiveProgressEngine::create(&runtime->resource_pool_, device,
-                                            std::move(failure_handler)));
+    PG_TRY(runtime->progress_, CollectiveProgressEngine::create(
+                                   device, std::move(failure_handler)));
     return runtime;
 }
 
@@ -67,8 +65,7 @@ GroupCollectiveRuntime::~GroupCollectiveRuntime() noexcept {
             std::atomic_ref<uint32_t>(
                 captured.collective->resources.control.host->resource_idle)
                 .load(std::memory_order_acquire) != 0;
-        (void)resource_pool_.release(captured.collective->resources,
-                                     resource_idle);
+        (void)captured.collective->resources.release(resource_idle);
     }
 }
 
@@ -86,39 +83,19 @@ GroupCollectiveRuntime::acquireTrackedCollective(
 
     PG_TRY(auto resources, resource_pool_.acquire(next_lane_));
     next_lane_ = (resources.lane.index + 1) % lanes_->layout().lane_count;
-    auto collective = std::make_shared<TrackedCollective>(std::move(resources));
-    if (capture_id) {
-        captured_collectives_.emplace(
-            *capture_id, CapturedCollective{.capture_stream = capture_stream,
-                                            .collective = collective});
-    }
-    return collective;
+    return std::make_shared<TrackedCollective>(std::move(resources));
 }
 
 void GroupCollectiveRuntime::trackCollective(
     const std::shared_ptr<TrackedCollective>& collective,
-    CollectiveFailureTarget target, cudaEvent_t completion) {
+    CollectiveFailureTarget target) {
     bool first_target = false;
     {
         std::lock_guard<std::mutex> lock(collective->mutex);
         first_target = collective->failure_targets.empty();
-        if (completion) collective->completion = completion;
         collective->failure_targets.push_back(target);
     }
     if (first_target) progress_->track(collective);
-}
-
-void GroupCollectiveRuntime::rollbackEmptyCapturedCollective(
-    uint64_t capture_id) noexcept {
-    const auto captured = captured_collectives_.find(capture_id);
-    if (captured == captured_collectives_.end()) return;
-    const auto& collective = captured->second.collective;
-    {
-        std::lock_guard<std::mutex> lock(collective->mutex);
-        if (!collective->failure_targets.empty()) return;
-    }
-    (void)resource_pool_.release(collective->resources, true);
-    captured_collectives_.erase(captured);
 }
 
 CollectiveKernelContext GroupCollectiveRuntime::makeKernelContext(
@@ -184,34 +161,24 @@ PGResult<void> GroupCollectiveRuntime::execute(CollectiveInvocation& invocation,
         .failed_ranks_hint_count = failed_ranks_hint_count,
     };
 
-    bool resource_idle = true;
-    cudaEvent_t completion = nullptr;
-    auto collective_rollback = makeScopeExit([&]() noexcept {
-        if (completion) {
-            (void)cudaEventDestroy(completion);
-        }
-        if (capture_id) {
-            rollbackEmptyCapturedCollective(*capture_id);
-        } else {
-            (void)resource_pool_.release(collective->resources, resource_idle);
-        }
-    });
     if (!capture_id) {
-        PG_TRY_CUDA(
-            cudaEventCreateWithFlags(&completion, cudaEventDisableTiming));
+        PG_TRY_CUDA(cudaEventCreateWithFlags(&collective->completion,
+                                             cudaEventDisableTiming));
     }
 
     (void)cudaGetLastError();
     invocation.launch(context, stream);
     PG_TRY_CUDA(cudaGetLastError());
-    resource_idle = false;
+    collective->resources.markSubmitted();
 
     if (!capture_id) {
-        PG_TRY_CUDA(cudaEventRecord(completion, stream));
+        PG_TRY_CUDA(cudaEventRecord(collective->completion, stream));
+    } else {
+        captured_collectives_.try_emplace(
+            *capture_id, CapturedCollective{.capture_stream = stream,
+                                            .collective = collective});
     }
-    trackCollective(collective, failure_target, completion);
-    completion = nullptr;
-    collective_rollback.dismiss();
+    trackCollective(collective, failure_target);
     return {};
 }
 

@@ -84,9 +84,7 @@ class GroupCollectiveRuntime {
     PGResult<std::shared_ptr<TrackedCollective>> acquireTrackedCollective(
         std::optional<uint64_t> capture_id, cudaStream_t capture_stream);
     void trackCollective(const std::shared_ptr<TrackedCollective>& collective,
-                         CollectiveFailureTarget target,
-                         cudaEvent_t completion);
-    void rollbackEmptyCapturedCollective(uint64_t capture_id) noexcept;
+                         CollectiveFailureTarget target);
 
     struct CapturedCollective {
         cudaStream_t capture_stream = nullptr;

@@ -11,7 +11,6 @@
 #include <transport/device/device_transport.h>
 
 #include "gpu_runtime.h"
-#include "pg_utils.h"
 
 namespace mooncake {
 namespace {
@@ -26,6 +25,10 @@ void* byteOffset(void* base, uint64_t offset) {
 }
 
 }  // namespace
+
+CollectiveBufferPool::RegisteredArena::~RegisteredArena() noexcept {
+    CollectiveBufferPool::releaseArena(*this);
+}
 
 CollectiveBufferPool::~CollectiveBufferPool() noexcept {
     try {
@@ -53,7 +56,6 @@ CollectiveBufferPool::getOrCreateArena(
     auto arena = std::make_unique<RegisteredArena>();
     arena->generation = next_arena_generation_++;
     arena->device = device;
-    arena->engine = engine;
     arena->bytes = config.arena_bytes;
     arena->p2p_transport = device::createP2pDeviceTransport(1);
     if (arena->p2p_transport) {
@@ -63,17 +65,6 @@ CollectiveBufferPool::getOrCreateArena(
         arena->p2p_transport.reset();
         PG_TRY_CUDA(cudaMalloc(&arena->base, arena->bytes));
     }
-    bool registered = false;
-    auto allocation_rollback = makeScopeExit([&]() noexcept {
-        if (registered) {
-            (void)engine->unregisterLocalMemory(arena->base);
-        }
-        if (arena->p2p_transport) {
-            arena->p2p_transport->freeBuffer(arena->base);
-        } else {
-            (void)cudaFree(arena->base);
-        }
-    });
     PG_TRY_CUDA(cudaMemset(arena->base, 0, arena->bytes));
     if (arena->p2p_transport) {
         arena->p2p_handle = arena->p2p_transport->exportIpcHandle(arena->base);
@@ -83,10 +74,9 @@ CollectiveBufferPool::getOrCreateArena(
         return makePGError(PGErrorCode::TransferEngineError,
                            "failed to register collective buffer pool");
     }
-    registered = true;
+    arena->engine = engine;
     arena->free_blocks.push_back({0, arena->bytes});
     const auto position = arenas_.emplace(device, std::move(arena)).first;
-    allocation_rollback.dismiss();
     return position->second.get();
 }
 
@@ -148,6 +138,7 @@ void CollectiveBufferPool::releaseArena(RegisteredArena& arena) noexcept {
             (void)arena.p2p_transport.release();
             return;
         }
+        arena.engine = nullptr;
         if (arena.p2p_transport) {
             arena.p2p_transport->freeBuffer(arena.base);
         } else {
@@ -215,8 +206,6 @@ void CollectiveBufferPool::shutdown() {
                             "device="
                          << device;
             (void)arena.release();
-        } else {
-            releaseArena(*arena);
         }
     }
     arenas_.clear();

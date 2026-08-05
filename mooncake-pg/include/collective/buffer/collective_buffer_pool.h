@@ -86,6 +86,8 @@ class CollectiveBufferPool {
     };
 
     struct RegisteredArena {
+        ~RegisteredArena() noexcept;
+
         uint64_t generation = 0;
         DeviceId device = kInvalidDeviceId;
         TransferEngine* engine = nullptr;

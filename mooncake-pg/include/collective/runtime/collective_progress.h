@@ -25,7 +25,7 @@ namespace mooncake {
 class CollectiveProgressEngine {
    public:
     static PGResult<std::unique_ptr<CollectiveProgressEngine>> create(
-        CollectiveResourcePool* resource_pool, DeviceId device,
+        DeviceId device,
         std::unique_ptr<CollectiveFailureHandler> failure_handler);
     ~CollectiveProgressEngine() noexcept;
 
@@ -41,17 +41,14 @@ class CollectiveProgressEngine {
 
    private:
     CollectiveProgressEngine(
-        CollectiveResourcePool* resource_pool, DeviceId device,
+        DeviceId device,
         std::unique_ptr<CollectiveFailureHandler> failure_handler)
-        : resource_pool_(resource_pool),
-          device_(device),
-          failure_handler_(std::move(failure_handler)) {}
+        : device_(device), failure_handler_(std::move(failure_handler)) {}
 
     bool retireCompletedCollective();
     bool handleOneFailure();
     void progressLoop() noexcept;
 
-    CollectiveResourcePool* resource_pool_ = nullptr;
     DeviceId device_ = kInvalidDeviceId;
     std::unique_ptr<CollectiveFailureHandler> failure_handler_;
 
