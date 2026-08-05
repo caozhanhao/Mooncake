@@ -45,7 +45,7 @@ NCCL-shaped `mooncakePg*` C API; dispatch changes only inside
                            v
                +------------------------+
                | GroupCollectiveRuntime |
-               | resources + progress   |
+               | admission + launch     |
                +-----------+------------+
                            |
                            v
@@ -78,7 +78,8 @@ plans without seeing `GroupView`, `GlobalRank`, or either link manager.
 | Peer routes | `GroupPeerRoutes`, host/device link managers | Endpoint-to-route resolution and device-link lifetime | Ring/tree roles or collective algorithms |
 | Plan construction | `CollectivePlanBuilder`, typed builders | Algorithm-specific peer roles and typed kernel plans | `GroupView`, `GlobalRank`, or link-resource ownership |
 | Plan publication | `CollectivePlanPublisher`, `CollectivePlanHandle` | Stable double-buffered publication visible to graph replay | Invocation buffers, streams, or algorithm execution |
-| Runtime/operation | `GroupCollectiveRuntime`, `CollectiveInvocation`, progress | Admission, shared resource acquisition, graph retention, failure reporting | Membership or algorithm policy |
+| Runtime/operation | `GroupCollectiveRuntime`, `CollectiveInvocation` | Admission, resource acquisition, kernel launch, and graph retention | Membership, algorithm policy, or eager retirement |
+| Host progress | `CollectiveHostProgress`, `CollectiveFailureHandler` | Failure report/sync/ack and eager completion retirement | Transport progress, graph ownership, or pool allocation policy |
 | Executor | typed executor and algorithm routines | Reduction, dependency order, participant shards, transport tiling | CPU policy calls or local algorithm fallback |
 | Transport | `PeerRoute`, device transfer, host proxy | One-sided put-and-signal through the selected route | Collective algorithm selection |
 
@@ -149,10 +150,13 @@ Invocation state remains separate:
  input/output + count/type/op + stream
                     |
                     v
-       GroupCollectiveRuntime resources
+       GroupCollectiveRuntime admission
                     |
                     v
-        typed invocation launches kernel
+       CollectiveKernelArgs + typed arguments
+                    |
+                    v
+                   kernel
 ```
 
 Tensor pointers and invocation buffer offsets never enter the published
@@ -186,6 +190,29 @@ pool after completion, while a captured invocation retains its resources until
 communicator teardown.
 
 ```text
+                         observes failures
+                                ^
+                                |
+                    CollectiveHostProgress
+                       /                 \
+            completion owner         failure observer
+                    /                       \
+           EagerSubmission             GraphResources
+           resource + event       capture id + pinned resource
+                    |                       |
+             event completes        communicator teardown
+                    |                       |
+                    `----------> pool <-----'
+```
+
+`CollectiveHostProgress` does not move collective data. Device kernels and the
+host-transfer proxy own transport progress. The host loop observes mapped
+failure controls for both lifetimes, while only eager submissions enter its
+completion queue. Resource retirement is performed after removing a completed
+submission from the progress lock; the resource pools own the actual return
+and reuse policy.
+
+```text
  invocation / graph replay
           |
           +--> acquire or locate retained runtime resources
@@ -198,7 +225,7 @@ communicator teardown.
              |             |
           complete      publish failed peer and wait
                            |
-                    CPU progress thread
+                  CollectiveHostProgress
                            |
                     report + syncAfterFailure
                            |

@@ -17,6 +17,19 @@ void warnCleanupFailure(const char* operation, const char* error) noexcept {
 
 }  // namespace
 
+PGResult<GraphCaptureState> queryGraphCapture(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    unsigned long long capture_id = 0;
+    PG_TRY_CUDA(cudaStreamGetCaptureInfo(stream, &status, &capture_id));
+    if (status == cudaStreamCaptureStatusNone) return GraphCaptureState{};
+    PG_VALIDATE_STATE(status == cudaStreamCaptureStatusActive,
+                      "collective CUDA Graph capture is invalidated");
+    return GraphCaptureState{
+        .active = true,
+        .id = static_cast<uint64_t>(capture_id),
+    };
+}
+
 GpuDeviceGuard::GpuDeviceGuard(int device) {
     PG_ASSERT(device >= 0, "invalid CUDA device index");
 

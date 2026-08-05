@@ -1,5 +1,7 @@
 #include "collective/runtime/resource_pool.h"
 
+#include <atomic>
+
 namespace mooncake {
 namespace {
 
@@ -51,6 +53,14 @@ bool CollectiveResourceLease::release(bool resource_idle) noexcept {
     if (!pool_) return true;
     auto* pool = std::exchange(pool_, nullptr);
     return pool->release(*this, resource_idle);
+}
+
+bool CollectiveResourceLease::retire() noexcept {
+    if (!pool_) return true;
+    const bool resource_idle =
+        std::atomic_ref<uint32_t>(control.host->resource_idle)
+            .load(std::memory_order_acquire) != 0;
+    return release(resource_idle);
 }
 
 void CollectiveResourceLease::moveFrom(

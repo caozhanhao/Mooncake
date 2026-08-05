@@ -32,12 +32,12 @@ struct CollectiveBufferLayout {
 // GroupCollectiveRuntime (communicator lifetime)
 //   |- CollectiveLanePool         stable wire-control addresses + lane owners
 //   |- eager invocation           temporary CollectiveResourceLease
-//   `- captured_collectives[id]   same lease, retained until destruction
+//   `- graph_resources[id]        same lease, retained until destruction
 //
 // The lease owns the composed resources. Before submission, destruction is a
 // normal acquisition rollback. After markSubmitted(), destruction
-// conservatively retains the resources unless progress explicitly releases them
-// with observed idle state.
+// conservatively retains the resources unless its lifetime owner calls
+// retire(); the lease then checks the shared idle state before pool reuse.
 class CollectiveResourceLease {
    public:
     ~CollectiveResourceLease() noexcept;
@@ -49,7 +49,10 @@ class CollectiveResourceLease {
         CollectiveResourceLease&& other) noexcept;
 
     void markSubmitted() noexcept { submitted_ = true; }
-    bool release(bool resource_idle) noexcept;
+    // Retires a completed submission. Resources return to their pools only
+    // when the shared control block proves that asynchronous transport is no
+    // longer using them; otherwise the pools quarantine them.
+    bool retire() noexcept;
 
     CollectiveLaneLease lane;
     std::unique_ptr<CollectiveBufferLease> buffer;
@@ -61,6 +64,7 @@ class CollectiveResourceLease {
 
     explicit CollectiveResourceLease(CollectiveResourcePool* pool)
         : pool_(pool) {}
+    bool release(bool resource_idle) noexcept;
     void moveFrom(CollectiveResourceLease&& other) noexcept;
 
     CollectiveResourcePool* pool_ = nullptr;

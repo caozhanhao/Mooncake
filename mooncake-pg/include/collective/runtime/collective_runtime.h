@@ -16,7 +16,7 @@
 
 #include "collective/runtime/collective_invocation.h"
 #include "collective/runtime/collective_lane_pool.h"
-#include "collective/runtime/collective_progress.h"
+#include "collective/runtime/host_progress.h"
 #include "collective/runtime/resource_pool.h"
 #include "error_types.h"
 
@@ -29,16 +29,17 @@ namespace mooncake {
 //   API -> collective dispatch ------+-> PlanHandle
 //              |                           |
 //              `-> Invocation -------------+-> GroupCollectiveRuntime
-//                                                         |             |
-//                                                         v             v
-//                                                   ResourcePool ProgressEngine
-//                                                                      `->
-//                                                                      FailureHandler
+//                                                   |              |
+//                                                   v              v
+//                                             ResourcePool   HostProgress
+//                                                                  |
+//                                                                  v
+//                                                           FailureHandler
 //
-//   context -> operation executor -> algorithm -> transport route
+//   common kernel args -> operation kernel -> algorithm -> transport route
 //
 // Plan builders see only ordered active ranks and group-local peer routes.
-// Everything below CollectiveKernelContext sees only published kernel plans,
+// Everything below CollectiveKernelArgs sees only published kernel plans,
 // raw kernel resources and InGroupRank peer routes.
 
 // One runtime per communicator and shared by all collective plugins. The first
@@ -78,24 +79,22 @@ class GroupCollectiveRuntime {
           device_(device),
           timeout_device_ticks_(timeout_device_ticks) {}
 
-    CollectiveKernelContext makeKernelContext(
+    CollectiveKernelArgs makeKernelArgs(
         const CollectiveResourceLease& resources, CollectivePlanHandle plan,
         uint64_t failure_target_id) const;
-    PGResult<std::shared_ptr<TrackedCollective>> acquireTrackedCollective(
-        std::optional<uint64_t> capture_id, cudaStream_t capture_stream);
-    void trackCollective(const std::shared_ptr<TrackedCollective>& collective,
-                         CollectiveFailureTarget target);
 
-    struct CapturedCollective {
-        cudaStream_t capture_stream = nullptr;
-        std::shared_ptr<TrackedCollective> collective;
+    struct GraphResources {
+        // Reusing one resource set is safe only while captured nodes remain
+        // ordered by the same stream. Multi-stream graph capture is deferred.
+        cudaStream_t bound_stream = nullptr;
+        std::shared_ptr<CollectiveResourceLease> resources;
     };
 
     // MooncakeCommunicator owns this group-scoped collaborator and destroys
     // the runtime before it.
     CollectiveLanePool* lanes_ = nullptr;
     CollectiveResourcePool resource_pool_;
-    std::unique_ptr<CollectiveProgressEngine> progress_;
+    std::unique_ptr<CollectiveHostProgress> host_progress_;
     DeviceId device_ = kInvalidDeviceId;
     uint64_t timeout_device_ticks_ = 0;
 
@@ -103,7 +102,7 @@ class GroupCollectiveRuntime {
     uint32_t next_lane_ = 0;
     std::optional<uint64_t> lane_view_epoch_;
     uint64_t next_failure_target_id_ = 1;
-    std::unordered_map<uint64_t, CapturedCollective> captured_collectives_;
+    std::unordered_map<uint64_t, GraphResources> graph_resources_;
     std::atomic<bool> accepting_{true};
 };
 

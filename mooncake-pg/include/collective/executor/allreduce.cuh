@@ -6,21 +6,21 @@
 #include <cuda_alike.h>
 
 #include "collective/executor/allreduce_kernel_plan.cuh"
-#include "collective/runtime/kernel_context.cuh"
+#include "collective/runtime/kernel_args.cuh"
 #include "comm_types.h"
 
 namespace mooncake {
 
-struct AllReduceExecutorArgs {
+struct AllReduceKernelArgs {
     const void* input = nullptr;
     void* output = nullptr;
-    CollectiveKernelContext context;
+    CollectiveKernelArgs common;
 
     uint64_t element_count = 0;
     DataType datatype = DataType::Float16;
 };
 
-void launchAllReduceExecutor(const AllReduceExecutorArgs& args,
+void launchAllReduceExecutor(const AllReduceKernelArgs& args,
                              cudaStream_t stream);
 
 }  // namespace mooncake

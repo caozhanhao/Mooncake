@@ -3,7 +3,7 @@
 
 #include <cuda_alike.h>
 
-#include "collective/runtime/kernel_context.cuh"
+#include "collective/runtime/kernel_args.cuh"
 
 namespace mooncake {
 
@@ -14,7 +14,7 @@ class CollectiveInvocation {
    public:
     virtual ~CollectiveInvocation() = default;
 
-    virtual void launch(const CollectiveKernelContext& context,
+    virtual void launch(const CollectiveKernelArgs& common,
                         cudaStream_t stream) const = 0;
 };
 

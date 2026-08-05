@@ -1,9 +1,20 @@
 #ifndef MOONCAKE_PG_GPU_RUNTIME_H
 #define MOONCAKE_PG_GPU_RUNTIME_H
 
+#include <cstdint>
+
 #include <cuda_alike.h>
 
+#include "error_types.h"
+
 namespace mooncake {
+
+struct GraphCaptureState {
+    bool active = false;
+    uint64_t id = 0;
+};
+
+PGResult<GraphCaptureState> queryGraphCapture(cudaStream_t stream);
 
 class GpuDeviceGuard {
    public:

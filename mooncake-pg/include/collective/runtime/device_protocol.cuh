@@ -1,7 +1,7 @@
 #ifndef MOONCAKE_PG_COLLECTIVE_RUNTIME_DEVICE_PROTOCOL_CUH
 #define MOONCAKE_PG_COLLECTIVE_RUNTIME_DEVICE_PROTOCOL_CUH
 
-#include "collective/runtime/kernel_context.cuh"
+#include "collective/runtime/kernel_args.cuh"
 #include "transport/device/device_ops.cuh"
 
 namespace mooncake {
@@ -66,10 +66,10 @@ inline __device__ void copyCollectiveBytes(void* destination,
 // the pooled data-plane resources. Resource availability is a lifetime rule,
 // not an authorization to retry the failed invocation.
 inline __device__ bool prepareCollectiveInvocation(
-    const CollectiveKernelContext& context) {
+    const CollectiveKernelArgs& common) {
     __shared__ int resource_available;
     if (threadIdx.x == 0) {
-        const auto& resources = context.resources;
+        const auto& resources = common.resources;
         auto& control = *resources.control;
         auto& failure = control.failure;
         if (static_cast<CollectiveFailureState>(
@@ -104,14 +104,14 @@ inline __device__ bool prepareCollectiveInvocation(
 }
 
 inline __device__ void reportCollectiveFailureAndWait(
-    const CollectiveKernelContext& context) {
+    const CollectiveKernelArgs& common) {
     if (threadIdx.x == 0) {
-        const auto& resources = context.resources;
+        const auto& resources = common.resources;
         auto& control = *resources.control;
         auto& failure = control.failure;
         failure.error_code = control.first_error_code;
         failure.failed_peer = control.failed_peer;
-        failure.failure_target_id = context.failure_target_id;
+        failure.failure_target_id = common.failure_target_id;
         mc_st_release_u32(&failure.state, static_cast<uint32_t>(
                                               CollectiveFailureState::Pending));
         while (static_cast<CollectiveFailureState>(mc_ld_acquire(

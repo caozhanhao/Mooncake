@@ -10,17 +10,17 @@ inline __device__ uint32_t allReduceElementBytes(DataType datatype) {
     return datatype == DataType::Float32 ? 4 : 2;
 }
 
-inline __device__ void setCollectiveError(const AllReduceExecutorArgs& args,
+inline __device__ void setCollectiveError(const AllReduceKernelArgs& args,
                                           int32_t error_code,
                                           InGroupRank failed_peer) {
-    setCollectiveError(args.context.resources, error_code, failed_peer);
+    setCollectiveError(args.common.resources, error_code, failed_peer);
 }
 
 inline __device__ bool waitForCollectiveToken(const uint64_t* address,
                                               uint64_t expected,
-                                              const AllReduceExecutorArgs& args,
+                                              const AllReduceKernelArgs& args,
                                               InGroupRank failed_peer) {
-    return waitForCollectiveToken(address, expected, args.context.resources,
+    return waitForCollectiveToken(address, expected, args.common.resources,
                                   failed_peer);
 }
 

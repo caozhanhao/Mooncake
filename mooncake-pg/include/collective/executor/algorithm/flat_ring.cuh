@@ -183,9 +183,9 @@ struct CopyOverlap {
     }
 };
 
-inline __device__ bool transferFailed(const AllReduceExecutorArgs& args,
+inline __device__ bool transferFailed(const AllReduceKernelArgs& args,
                                       const PeerRoute& edge) {
-    int32_t error_code = args.context.resources.control->first_error_code;
+    int32_t error_code = args.common.resources.control->first_error_code;
     if (error_code == 0) {
         error_code = static_cast<int32_t>(CollectiveProtocolError::Transport);
     }
@@ -195,11 +195,11 @@ inline __device__ bool transferFailed(const AllReduceExecutorArgs& args,
 }
 
 inline __device__ bool runReduceScatter(
-    const AllReduceExecutorArgs& args, const FlatRingKernelPlan& ring,
+    const AllReduceKernelArgs& args, const FlatRingKernelPlan& ring,
     const void* input, uint64_t view_epoch, uint64_t collective_sequence,
     uint64_t transfer_offset, uint64_t transfer_elements,
     uint64_t transfer_index, void* work_stages[2], uint32_t* current_stage) {
-    const auto& resources = args.context.resources;
+    const auto& resources = args.common.resources;
     const uint32_t count = ring.participant_count;
     const uint32_t self = ring.self_ordinal;
     const uint32_t bytes_per_element = allReduceElementBytes(args.datatype);
@@ -279,11 +279,11 @@ inline __device__ bool runReduceScatter(
 }
 
 inline __device__ bool runAllGather(
-    const AllReduceExecutorArgs& args, const FlatRingKernelPlan& ring,
+    const AllReduceKernelArgs& args, const FlatRingKernelPlan& ring,
     uint64_t view_epoch, uint64_t collective_sequence, uint64_t transfer_offset,
     uint64_t transfer_elements, uint64_t transfer_index, void* work_stages[2],
     uint32_t* current_stage) {
-    const auto& resources = args.context.resources;
+    const auto& resources = args.common.resources;
     const uint32_t count = ring.participant_count;
     const uint32_t self = ring.self_ordinal;
     const uint32_t bytes_per_element = allReduceElementBytes(args.datatype);
@@ -361,10 +361,10 @@ inline __device__ bool runAllGather(
     return true;
 }
 
-inline __device__ bool run(const AllReduceExecutorArgs& args,
+inline __device__ bool run(const AllReduceKernelArgs& args,
                            const FlatRingKernelPlan& ring, const void* input,
                            uint64_t view_epoch, uint64_t collective_sequence) {
-    const auto& resources = args.context.resources;
+    const auto& resources = args.common.resources;
     if (args.element_count == 0) return true;
     if (ring.participant_count <= 1) {
         copyCollectiveBytes(

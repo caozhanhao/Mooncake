@@ -18,7 +18,7 @@ class AllReduceInvocation final : public CollectiveInvocation {
                                                 size_t element_count,
                                                 DataType datatype, ReduceOp op);
 
-    void launch(const CollectiveKernelContext& context,
+    void launch(const CollectiveKernelArgs& common,
                 cudaStream_t stream) const override;
 
    private:

@@ -11,7 +11,7 @@ namespace {
 
 using namespace mooncake::device;
 
-__global__ void allReduceExecutorKernel(AllReduceExecutorArgs args) {
+__global__ void allReduceExecutorKernel(AllReduceKernelArgs args) {
     __shared__ AllReduceBucketKernelPlan kernel_plan;
     __shared__ uint64_t view_epoch;
     __shared__ uint64_t collective_sequence;
@@ -19,11 +19,11 @@ __global__ void allReduceExecutorKernel(AllReduceExecutorArgs args) {
     __shared__ int32_t plan_error;
     __shared__ InGroupRank plan_failed_peer;
 
-    const auto& context = args.context;
+    const auto& common = args.common;
     const uint32_t bytes_per_element = allReduceElementBytes(args.datatype);
 
-    if (!prepareCollectiveInvocation(context)) {
-        reportCollectiveFailureAndWait(context);
+    if (!prepareCollectiveInvocation(common)) {
+        reportCollectiveFailureAndWait(common);
         return;
     }
 
@@ -33,17 +33,17 @@ __global__ void allReduceExecutorKernel(AllReduceExecutorArgs args) {
     // plan published by sync-after-failure without graph recapture.
     if (threadIdx.x == 0) {
         const uint32_t slot_index = static_cast<uint32_t>(mc_ld_acquire(
-            reinterpret_cast<const int*>(context.plan.active_slot)));
+            reinterpret_cast<const int*>(common.plan.active_slot)));
         const auto* plans =
-            static_cast<const AllReduceKernelPlan*>(context.plan.slots);
+            static_cast<const AllReduceKernelPlan*>(common.plan.slots);
         const auto& published = plans[slot_index];
         view_epoch = published.view_epoch;
         // Sequence identifies this invocation on its physical lane. The
         // mapped counter is reset before a new plan is published, so the
         // active-slot acquire above establishes its view-local domain.
         collective_sequence = atomicAdd_system(
-            reinterpret_cast<unsigned long long*>(context.plan.lane_sequences +
-                                                  context.lane_index),
+            reinterpret_cast<unsigned long long*>(common.plan.lane_sequences +
+                                                  common.lane_index),
             1ULL);
         self_participating = static_cast<int32_t>(published.self_participating);
         plan_error = published.error_code;
@@ -94,12 +94,12 @@ __global__ void allReduceExecutorKernel(AllReduceExecutorArgs args) {
 
     // Failure may leave output partially written. PG reports it and finishes
     // this invocation; the application owns any later retry.
-    if (!success) reportCollectiveFailureAndWait(context);
+    if (!success) reportCollectiveFailureAndWait(common);
 }
 
 }  // namespace
 
-void launchAllReduceExecutor(const AllReduceExecutorArgs& args,
+void launchAllReduceExecutor(const AllReduceKernelArgs& args,
                              cudaStream_t stream) {
     allReduceExecutorKernel<<<1, 256, 0, stream>>>(args);
 }
