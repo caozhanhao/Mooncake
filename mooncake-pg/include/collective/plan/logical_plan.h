@@ -7,15 +7,15 @@
 
 namespace mooncake {
 
-// Coordinator-owned logical policy. Plans contain only choices that must be
+// Coordinator-owned logical policy. Policies contain only choices that must be
 // identical on every rank. Membership roles, routes, and local resources are
 // resolved by each Agent from the authoritative GroupView.
 // The first planned protocol implements Flat Ring for every size bucket. Add
 // an algorithm choice here only when a second executable algorithm exists.
-struct AllReducePlan {
+struct AllReducePolicy {
     uint64_t max_message_bytes = std::numeric_limits<uint64_t>::max();
 
-    bool operator==(const AllReducePlan&) const = default;
+    bool operator==(const AllReducePolicy&) const = default;
 };
 
 // Legacy and Planned are different wire protocols. Once a group selects the
@@ -28,7 +28,7 @@ enum class AllReduceProtocol : uint8_t {
 
 struct CollectivePlanSet {
     AllReduceProtocol allreduce_protocol = AllReduceProtocol::Legacy;
-    std::vector<AllReducePlan> allreduce_plans;
+    std::vector<AllReducePolicy> allreduce_policies;
 
     bool operator==(const CollectivePlanSet&) const = default;
 };

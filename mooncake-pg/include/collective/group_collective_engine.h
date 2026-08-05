@@ -26,7 +26,7 @@ class LinkManager;
 class TransferEngine;
 struct GroupView;
 template <typename Plan>
-class MappedPlan;
+class DevicePlan;
 
 // Complete group-scoped owner for the planned collective path. Process-level
 // pools, the Host transfer executor and link managers are borrowed services.
@@ -76,7 +76,7 @@ class GroupCollectiveEngine {
     InGroupRank self_in_group_rank_ = -1;
 
     std::unique_ptr<CollectiveLanePool> lanes_;
-    std::unique_ptr<MappedPlan<AllReduceDevicePlan>> allreduce_plan_;
+    std::unique_ptr<DevicePlan<AllReducePlan>> allreduce_plan_;
     std::unique_ptr<CollectiveRuntime> runtime_;
     GroupEndpointV2 endpoint_;
     AllReduceProtocol allreduce_protocol_ = AllReduceProtocol::Legacy;

@@ -7,9 +7,8 @@
 namespace mooncake {
 namespace {
 
-PGResult<FlatRingDevicePlan> buildFlatRingPlan(
-    const ResolvedCollectiveView& view) {
-    FlatRingDevicePlan ring;
+PGResult<FlatRingPlan> buildFlatRingPlan(const ResolvedCollectiveView& view) {
+    FlatRingPlan ring;
     const auto participant_count =
         static_cast<uint32_t>(view.active_order.size());
     const auto self_ordinal = *view.self_ordinal;
@@ -67,41 +66,39 @@ PGResult<AllReduceRequest> makeAllReduceRequest(const void* input, void* output,
     };
 }
 
-PGResult<AllReduceDevicePlan> buildAllReduceDevicePlan(
-    const CollectivePlanSet& plans, const ResolvedCollectiveView& view) {
-    AllReduceDevicePlan device_plan;
-    device_plan.view_epoch = view.epoch;
-    device_plan.self_participating = view.self_ordinal.has_value() ? 1 : 0;
+PGResult<AllReducePlan> buildAllReducePlan(const CollectivePlanSet& plans,
+                                           const ResolvedCollectiveView& view) {
+    AllReducePlan plan;
+    plan.view_epoch = view.epoch;
+    plan.self_participating = view.self_ordinal.has_value() ? 1 : 0;
 
     // Host admission rejects an inactive rank, while graph replay has no host
     // participation. The published local identity keeps replay independent of
     // the membership used when the graph was captured.
-    if (!device_plan.self_participating) return device_plan;
+    if (!plan.self_participating) return plan;
 
     if (plans.allreduce_protocol == AllReduceProtocol::Legacy) {
-        device_plan.error_code =
+        plan.error_code =
             static_cast<int32_t>(CollectiveProtocolError::Unsupported);
-        return device_plan;
+        return plan;
     }
-    if (plans.allreduce_plans.empty()) {
+    if (plans.allreduce_policies.empty()) {
         return makePGError(PGErrorCode::InvalidState,
                            "planned AllReduce has no executable policy");
     }
 
-    device_plan.bucket_count =
-        static_cast<uint32_t>(plans.allreduce_plans.size());
+    plan.bucket_count = static_cast<uint32_t>(plans.allreduce_policies.size());
     PG_TRY(auto ring, buildFlatRingPlan(view));
-    for (uint32_t index = 0; index < device_plan.bucket_count; ++index) {
-        const auto& logical = plans.allreduce_plans[index];
-        auto& bucket = device_plan.buckets[index];
-        bucket.max_message_bytes = logical.max_message_bytes;
+    for (uint32_t index = 0; index < plan.bucket_count; ++index) {
+        const auto& policy = plans.allreduce_policies[index];
+        auto& bucket = plan.buckets[index];
+        bucket.max_message_bytes = policy.max_message_bytes;
         bucket.flat_ring = ring;
     }
-    return device_plan;
+    return plan;
 }
 
-void launchAllReduce(const AllReduceRequest& request,
-                     MappedPlanHandle<AllReduceDevicePlan> plan,
+void launchAllReduce(const AllReduceRequest& request, const AllReducePlan* plan,
                      const CollectiveKernelArgs& common, cudaStream_t stream) {
     launchAllReduceExecutor(
         AllReduceKernelArgs{

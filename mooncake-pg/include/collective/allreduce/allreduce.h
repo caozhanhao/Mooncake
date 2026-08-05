@@ -15,30 +15,30 @@
 
 namespace mooncake {
 
-struct FlatRingDevicePlan {
+struct FlatRingPlan {
     uint32_t participant_count = 0;
     uint32_t self_ordinal = 0;
     PeerRoute predecessor;
     PeerRoute successor;
 };
 
-struct AllReduceBucketDevicePlan {
+struct AllReducePlanBucket {
     uint64_t max_message_bytes = ~uint64_t{0};
-    FlatRingDevicePlan flat_ring;
+    FlatRingPlan flat_ring;
 };
 
 inline constexpr uint32_t kMaxAllReduceSizeBuckets = 8;
 
-// Captured kernels retain the address of this mapped value, not a membership
-// snapshot. A later quiescent view application can therefore replace roles
-// and routes without graph recapture.
-struct alignas(64) AllReduceDevicePlan {
+// Captured kernels retain a stable pointer to this value, not a membership
+// snapshot. A later quiescent view application can therefore replace roles and
+// routes without graph recapture.
+struct alignas(64) AllReducePlan {
     uint64_t view_epoch = 0;
     uint32_t self_participating = 0;
     uint32_t bucket_count = 0;
     int32_t error_code = 0;
     InGroupRank failed_peer = -1;
-    AllReduceBucketDevicePlan buckets[kMaxAllReduceSizeBuckets];
+    AllReducePlanBucket buckets[kMaxAllReduceSizeBuckets];
 };
 
 struct AllReduceRequest {
@@ -54,20 +54,19 @@ PGResult<AllReduceRequest> makeAllReduceRequest(const void* input, void* output,
                                                 size_t element_count,
                                                 DataType datatype, ReduceOp op);
 
-PGResult<AllReduceDevicePlan> buildAllReduceDevicePlan(
-    const CollectivePlanSet& plans, const ResolvedCollectiveView& view);
+PGResult<AllReducePlan> buildAllReducePlan(const CollectivePlanSet& plans,
+                                           const ResolvedCollectiveView& view);
 
 struct AllReduceKernelArgs {
     const void* input = nullptr;
     void* output = nullptr;
     CollectiveKernelArgs common;
-    MappedPlanHandle<AllReduceDevicePlan> plan;
+    const AllReducePlan* plan = nullptr;
     uint64_t element_count = 0;
     DataType datatype = DataType::Float16;
 };
 
-void launchAllReduce(const AllReduceRequest& request,
-                     MappedPlanHandle<AllReduceDevicePlan> plan,
+void launchAllReduce(const AllReduceRequest& request, const AllReducePlan* plan,
                      const CollectiveKernelArgs& common, cudaStream_t stream);
 void launchAllReduceExecutor(const AllReduceKernelArgs& args,
                              cudaStream_t stream);

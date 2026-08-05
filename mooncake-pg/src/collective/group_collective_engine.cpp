@@ -4,7 +4,7 @@
 
 #include "collective/buffer/collective_buffer_pool.h"
 #include "collective/allreduce/allreduce.h"
-#include "collective/plan/mapped_plan.h"
+#include "collective/plan/device_plan.h"
 #include "collective/resolved_collective_view.h"
 #include "collective/runtime/collective_lane_pool.h"
 #include "collective/runtime/runtime.h"
@@ -37,8 +37,7 @@ PGResult<std::unique_ptr<GroupCollectiveEngine>> GroupCollectiveEngine::create(
 
     const auto arena = buffer_pool.arena(device);
     device_links.bindCollectiveArena(arena);
-    PG_TRY(result->allreduce_plan_,
-           MappedPlan<AllReduceDevicePlan>::create(device));
+    PG_TRY(result->allreduce_plan_, DevicePlan<AllReducePlan>::create(device));
     PG_TRY(result->runtime_,
            CollectiveRuntime::create(
                &buffer_pool, &control_pool, &host_transfer_executor,
@@ -77,12 +76,12 @@ bool GroupCollectiveEngine::shouldUsePlannedAllReduce(DataType datatype,
 PGResult<void> GroupCollectiveEngine::applyView(const GroupView& view) {
     const auto resolved = resolveCollectiveView(
         view, self_in_group_rank_, device_, device_links_, host_links_);
-    auto built = buildAllReduceDevicePlan(view.collective_plans, resolved);
+    auto built = buildAllReducePlan(view.collective_plans, resolved);
 
     allreduce_protocol_ = view.collective_plans.allreduce_protocol;
     view_epoch_ = view.epoch;
     if (!built.has_value()) {
-        AllReduceDevicePlan invalid;
+        AllReducePlan invalid;
         invalid.view_epoch = view.epoch;
         invalid.self_participating = resolved.self_ordinal.has_value() ? 1 : 0;
         invalid.error_code =
@@ -99,7 +98,7 @@ PGResult<void> GroupCollectiveEngine::allReduce(
     int32_t* failed_ranks_hint, size_t failed_ranks_hint_count) {
     PG_VALIDATE_STATE(allreduce_protocol_ == AllReduceProtocol::Planned,
                       "planned AllReduce is not enabled for this group");
-    PG_TRY(auto plan, allreduce_plan_->handle());
+    PG_TRY(auto plan, allreduce_plan_->devicePlan());
     return runtime_->submit(view_epoch_, stream, failed_ranks_hint,
                             failed_ranks_hint_count,
                             [&](const CollectiveKernelArgs& common) {

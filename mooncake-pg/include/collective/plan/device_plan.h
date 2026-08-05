@@ -1,13 +1,11 @@
-#ifndef MOONCAKE_PG_COLLECTIVE_PLAN_MAPPED_PLAN_H
-#define MOONCAKE_PG_COLLECTIVE_PLAN_MAPPED_PLAN_H
+#ifndef MOONCAKE_PG_COLLECTIVE_PLAN_DEVICE_PLAN_H
+#define MOONCAKE_PG_COLLECTIVE_PLAN_DEVICE_PLAN_H
 
 #include <memory>
 #include <type_traits>
-#include <utility>
 
 #include <cuda_alike.h>
 
-#include "collective/device_context.cuh"
 #include "error_types.h"
 #include "gpu_runtime.h"
 
@@ -17,11 +15,11 @@ namespace mooncake {
 // overwrite the host-mapped value only at the collective-quiescent boundary;
 // captured kernels therefore observe the current plan without recapture.
 template <typename Plan>
-class MappedPlan {
+class DevicePlan {
     static_assert(std::is_trivially_copyable_v<Plan>);
 
    public:
-    static PGResult<std::unique_ptr<MappedPlan>> create(DeviceId device) {
+    static PGResult<std::unique_ptr<DevicePlan>> create(DeviceId device) {
         const GpuDeviceGuard guard(device);
 
         void* plan_host = nullptr;
@@ -32,23 +30,21 @@ class MappedPlan {
         PG_TRY_CUDA(
             cudaHostGetDevicePointer(&plan_device, plan_memory.get(), 0));
 
-        auto result = std::unique_ptr<MappedPlan>(
-            new MappedPlan(static_cast<Plan*>(plan_memory.release()),
+        auto result = std::unique_ptr<DevicePlan>(
+            new DevicePlan(static_cast<Plan*>(plan_memory.release()),
                            static_cast<Plan*>(plan_device)));
         *result->host_plan_ = Plan{};
         return result;
     }
 
-    ~MappedPlan() noexcept {
+    ~DevicePlan() noexcept {
         if (retained_) return;
         if (host_plan_) (void)cudaFreeHost(host_plan_);
     }
 
-    PGResult<MappedPlanHandle<Plan>> handle() const {
+    PGResult<const Plan*> devicePlan() const {
         PG_VALIDATE_STATE(ready_, "collective plan is not ready");
-        return MappedPlanHandle<Plan>{
-            .value = device_plan_,
-        };
+        return device_plan_;
     }
 
     void publish(const Plan& plan) {
@@ -66,8 +62,8 @@ class MappedPlan {
 
     void retainForProcessLifetime() { retained_ = true; }
 
-    MappedPlan(const MappedPlan&) = delete;
-    MappedPlan& operator=(const MappedPlan&) = delete;
+    DevicePlan(const DevicePlan&) = delete;
+    DevicePlan& operator=(const DevicePlan&) = delete;
 
    private:
     struct HostAllocationDeleter {
@@ -77,7 +73,7 @@ class MappedPlan {
     };
     using HostAllocation = std::unique_ptr<void, HostAllocationDeleter>;
 
-    MappedPlan(Plan* host_plan, Plan* device_plan)
+    DevicePlan(Plan* host_plan, Plan* device_plan)
         : host_plan_(host_plan), device_plan_(device_plan) {}
 
     Plan* host_plan_ = nullptr;
@@ -88,4 +84,4 @@ class MappedPlan {
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_COLLECTIVE_PLAN_MAPPED_PLAN_H
+#endif  // MOONCAKE_PG_COLLECTIVE_PLAN_DEVICE_PLAN_H

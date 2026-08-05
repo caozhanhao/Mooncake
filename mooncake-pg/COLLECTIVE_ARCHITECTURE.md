@@ -25,10 +25,10 @@ The Torch adapter remains unchanged. Dispatch changes only inside
           GroupView + LinkManagers              resources + launch
                        |                                |
                        v                                v
-          buildAllReduceDevicePlan             AllReduce executor
+             buildAllReducePlan                AllReduce executor
                        |                                |
                        v                                v
-              MappedPlan::publish                    Flat Ring
+              DevicePlan::publish                  Flat Ring
                                                         |
                                                         v
                                               PeerRoute transport
@@ -55,7 +55,7 @@ Process-level services remain shared across groups:
  GroupCollectiveEngine
  ├── GroupEndpointV2
  ├── CollectiveLanePool            shared invocation order + peer signals
- ├── MappedPlan<AllReduceDevicePlan>
+ ├── DevicePlan<AllReducePlan>
  └── CollectiveRuntime
 ```
 
@@ -73,7 +73,7 @@ The Coordinator publishes only decisions that must agree across ranks:
 
 It does not generate per-rank neighbors, addresses, QPs, or physical transport
 choices. The first slice has only Flat Ring, so no unsupported algorithm value
-is part of the logical or device plan. Hierarchical policy and device dispatch
+is part of the policy or executable plan. Hierarchical policy and dispatch
 will be added together with an executable implementation.
 
 Each Agent resolves one authoritative `GroupView` into:
@@ -96,14 +96,14 @@ parallel feature module and explicit typed state to the existing group owner:
 
 ```text
  collective/allgather/
- ├── allgather.h                  request + device plan + launch API
+ ├── allgather.h                  request + executable plan + launch API
  ├── allgather.cpp                validation + plan construction
  ├── allgather.cu                 executor
  └── ring/tree algorithm routine
 
  GroupCollectiveEngine
- ├── MappedPlan<AllReduceDevicePlan> allreduce_plan
- ├── MappedPlan<AllGatherDevicePlan> allgather_plan
+ ├── DevicePlan<AllReducePlan> allreduce_plan
+ ├── DevicePlan<AllGatherPlan> allgather_plan
  ├── allReduce(AllReduceRequest)
  └── allGather(AllGatherRequest)
 ```
@@ -121,8 +121,9 @@ launch.
 
 ## Typed plan publication and CUDA Graph
 
-`buildAllReduceDevicePlan()` returns a typed `AllReduceDevicePlan`.
-`MappedPlan<T>` owns only its stable mapped value; it has no GroupView,
+The Coordinator publishes `AllReducePolicy`; `buildAllReducePlan()` combines it
+with the resolved local view and returns the executable `AllReducePlan`.
+`DevicePlan<T>` owns only its stable device-visible value; it has no GroupView,
 invocation state, or operation-building responsibilities. Physical lanes own
 the invocation sequence shared by every collective operation on that lane, so
 adding an operation cannot create an overlapping wire-token domain.
@@ -134,10 +135,10 @@ adding an operation cannot create an overlapping wire-token domain.
  ResolvedCollectiveView
           |
           v
- buildAllReduceDevicePlan
+ buildAllReducePlan
           |
           v
- MappedPlan<AllReduceDevicePlan>::publish
+ DevicePlan<AllReducePlan>::publish
           |
           `------ stable device address ------> captured executor
 ```
@@ -145,7 +146,7 @@ adding an operation cannot create an overlapping wire-token domain.
 View application overwrites the value at that address. Every later eager
 invocation or graph replay reads the current plan, so membership roles and
 routes are not frozen into captured kernel arguments. If local materialization
-fails, an explicit invalid device plan is published before new host submission
+fails, an explicit invalid executable plan is published before host submission
 is rejected; captured replay therefore cannot continue using the preceding
 view.
 
@@ -167,7 +168,7 @@ shared by AllReduce, AllGather, Broadcast, and future operations:
 - record eager completion;
 - observe and acknowledge device failure reports.
 
-Operation code supplies only a typed request, plan handle, and launch callback.
+Operation code supplies only a typed request, plan pointer, and launch callback.
 There is no virtual `CollectiveInvocation` hierarchy.
 
 ```text
@@ -248,7 +249,7 @@ Deferred:
    `collective/resolved_collective_view.*`, then
    `collective/transport/peer_route.h`.
 3. Typed AllReduce request and plan:
-   `collective/allreduce/allreduce.*` and `collective/plan/mapped_plan.h`.
+   `collective/allreduce/allreduce.*` and `collective/plan/device_plan.h`.
 4. Common submission resources and monitoring:
    `collective/runtime/runtime.*`, `resource_pool.*`, and
    `collective_monitor.*`.

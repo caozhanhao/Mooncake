@@ -10,7 +10,7 @@ namespace {
 using namespace mooncake::device;
 
 __global__ void allReduceExecutorKernel(AllReduceKernelArgs args) {
-    __shared__ AllReduceBucketDevicePlan device_plan;
+    __shared__ AllReducePlanBucket plan_bucket;
     __shared__ uint64_t view_epoch;
     __shared__ uint64_t collective_sequence;
     __shared__ int32_t self_participating;
@@ -26,12 +26,12 @@ __global__ void allReduceExecutorKernel(AllReduceKernelArgs args) {
         return;
     }
 
-    // Every launch reads the current Coordinator plan through a stable handle.
+    // Every launch reads the current executable plan through a stable pointer.
     // A failed launch never changes plan or runs again. A later eager call or
     // CUDA Graph replay is a new application invocation and can observe the
     // plan published by sync-after-failure without graph recapture.
     if (threadIdx.x == 0) {
-        const auto& published = *args.plan.value;
+        const auto& published = *args.plan;
         view_epoch = published.view_epoch;
         // Sequence identifies this invocation on its physical lane. The
         // counter is shared by every collective operation using that lane.
@@ -50,7 +50,7 @@ __global__ void allReduceExecutorKernel(AllReduceKernelArgs args) {
                        published.buckets[bucket_index].max_message_bytes) {
                 ++bucket_index;
             }
-            device_plan = published.buckets[bucket_index];
+            plan_bucket = published.buckets[bucket_index];
         } else if (plan_error == 0) {
             plan_error =
                 static_cast<int32_t>(CollectiveProtocolError::Unsupported);
@@ -69,7 +69,7 @@ __global__ void allReduceExecutorKernel(AllReduceKernelArgs args) {
         if (!success) {
             flat_ring::setCollectiveError(args, plan_error, plan_failed_peer);
         } else {
-            success = flat_ring::run(args, device_plan.flat_ring, args.input,
+            success = flat_ring::run(args, plan_bucket.flat_ring, args.input,
                                      view_epoch, collective_sequence);
         }
     }

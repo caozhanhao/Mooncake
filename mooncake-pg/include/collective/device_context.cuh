@@ -8,12 +8,6 @@
 
 namespace mooncake {
 
-// Typed stable reference to one operation's current mapped plan.
-template <typename Plan>
-struct MappedPlanHandle {
-    const Plan* value = nullptr;
-};
-
 struct CollectiveKernelBuffer {
     void* base = nullptr;
     uint64_t arena_offset = 0;

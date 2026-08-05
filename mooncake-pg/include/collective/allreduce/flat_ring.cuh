@@ -215,7 +215,7 @@ inline __device__ bool transferFailed(const AllReduceKernelArgs& args,
 }
 
 inline __device__ bool runReduceScatter(
-    const AllReduceKernelArgs& args, const FlatRingDevicePlan& ring,
+    const AllReduceKernelArgs& args, const FlatRingPlan& ring,
     const void* input, uint64_t view_epoch, uint64_t collective_sequence,
     uint64_t transfer_offset, uint64_t transfer_elements,
     uint64_t transfer_index, void* work_stages[2], uint32_t* current_stage) {
@@ -299,7 +299,7 @@ inline __device__ bool runReduceScatter(
 }
 
 inline __device__ bool runAllGather(
-    const AllReduceKernelArgs& args, const FlatRingDevicePlan& ring,
+    const AllReduceKernelArgs& args, const FlatRingPlan& ring,
     uint64_t view_epoch, uint64_t collective_sequence, uint64_t transfer_offset,
     uint64_t transfer_elements, uint64_t transfer_index, void* work_stages[2],
     uint32_t* current_stage) {
@@ -382,7 +382,7 @@ inline __device__ bool runAllGather(
 }
 
 inline __device__ bool run(const AllReduceKernelArgs& args,
-                           const FlatRingDevicePlan& ring, const void* input,
+                           const FlatRingPlan& ring, const void* input,
                            uint64_t view_epoch, uint64_t collective_sequence) {
     const auto& resources = args.common.resources;
     if (args.element_count == 0) return true;
@@ -394,7 +394,7 @@ inline __device__ bool run(const AllReduceKernelArgs& args,
         return true;
     }
 
-    __shared__ FlatRingDevicePlan resolved_ring;
+    __shared__ FlatRingPlan resolved_ring;
     __shared__ PeerBufferExchange buffer_exchanges[2];
     if (threadIdx.x == 0) {
         resolved_ring.participant_count = ring.participant_count;

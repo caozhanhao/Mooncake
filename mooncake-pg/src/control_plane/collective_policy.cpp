@@ -32,7 +32,7 @@ CollectivePlanSet CollectivePolicyBuilder::build(const GroupView& view) const {
     plans.allreduce_protocol =
         planned ? AllReduceProtocol::Planned : AllReduceProtocol::Legacy;
     if (endpoints_ready) {
-        plans.allreduce_plans.push_back(AllReducePlan{
+        plans.allreduce_policies.push_back(AllReducePolicy{
             .max_message_bytes = std::numeric_limits<uint64_t>::max(),
         });
     }
