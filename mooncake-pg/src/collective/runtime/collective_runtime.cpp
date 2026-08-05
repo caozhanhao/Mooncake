@@ -99,7 +99,7 @@ void GroupCollectiveRuntime::trackCollective(
 }
 
 CollectiveKernelContext GroupCollectiveRuntime::makeKernelContext(
-    const CollectiveResourceLease& resources, CollectiveBinding binding,
+    const CollectiveResourceLease& resources, CollectivePlanHandle plan,
     uint64_t failure_target_id) const {
     const auto& layout = CollectiveResourcePool::bufferLayout();
     const auto& control_layout = lanes_->layout().lanes[resources.lane.index];
@@ -126,12 +126,12 @@ CollectiveKernelContext GroupCollectiveRuntime::makeKernelContext(
             },
         .lane_index = resources.lane.index,
         .failure_target_id = failure_target_id,
-        .binding = binding,
+        .plan = plan,
     };
 }
 
 PGResult<void> GroupCollectiveRuntime::execute(CollectiveInvocation& invocation,
-                                               CollectiveBinding binding,
+                                               CollectivePlanHandle plan,
                                                uint64_t view_epoch,
                                                cudaStream_t stream,
                                                int32_t* failed_ranks_hint,
@@ -154,7 +154,7 @@ PGResult<void> GroupCollectiveRuntime::execute(CollectiveInvocation& invocation,
 
     const uint64_t failure_target_id = next_failure_target_id_++;
     const auto context =
-        makeKernelContext(collective->resources, binding, failure_target_id);
+        makeKernelContext(collective->resources, plan, failure_target_id);
     CollectiveFailureTarget failure_target{
         .failure_target_id = failure_target_id,
         .failed_ranks_hint = failed_ranks_hint,

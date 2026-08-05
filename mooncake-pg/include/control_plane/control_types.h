@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "collective/endpoint.h"
-#include "collective/plan.h"
+#include "collective/plan/logical_plan.h"
 #include "collective/types.h"
 
 namespace mooncake {

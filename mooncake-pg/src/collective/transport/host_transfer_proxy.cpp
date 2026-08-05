@@ -141,7 +141,7 @@ bool CollectiveHostTransferProxy::submitPhase(uint32_t command_index,
     auto& control = *commands_[command_index].control;
     const auto segment = links_->resolvePeer(command.peer_host_link);
     if (!segment.has_value()) {
-        failCommand(command_index, CollectiveProtocolError::InvalidBinding);
+        failCommand(command_index, CollectiveProtocolError::InvalidRoute);
         return false;
     }
 
@@ -158,7 +158,7 @@ bool CollectiveHostTransferProxy::submitPhase(uint32_t command_index,
         bytes = sizeof(uint64_t);
     }
     if (!source || target == 0 || bytes == 0) {
-        failCommand(command_index, CollectiveProtocolError::InvalidBinding);
+        failCommand(command_index, CollectiveProtocolError::InvalidRoute);
         return false;
     }
 
@@ -215,7 +215,7 @@ bool CollectiveHostTransferProxy::beginCommand(uint32_t command_index) {
             active_transfers_.push_back(active);
         }
     } else {
-        failCommand(command_index, CollectiveProtocolError::InvalidBinding);
+        failCommand(command_index, CollectiveProtocolError::InvalidRoute);
     }
     return true;
 }

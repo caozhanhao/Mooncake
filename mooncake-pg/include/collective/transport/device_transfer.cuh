@@ -4,7 +4,7 @@
 #include <cstdint>
 
 #include "collective/transport/kernel_resources.cuh"
-#include "collective/transport/peer_binding.h"
+#include "collective/transport/peer_route.h"
 #include "transport/device/device_ops.cuh"
 #include "transport/device/ibgda_device.cuh"
 
@@ -16,7 +16,7 @@ inline __device__ bool timedOut(uint64_t start, uint64_t timeout_ticks) {
     return timeout_ticks != 0 && clock64() - start >= timeout_ticks;
 }
 
-inline __device__ IbgdaContext rdmaContext(const CollectivePeerBinding& edge) {
+inline __device__ IbgdaContext rdmaContext(const PeerRoute& edge) {
     IbgdaContext context{};
 #ifdef MOONCAKE_EP_USE_MACA
     context.qp_devctxs = edge.device_rdma.qp_contexts;
@@ -37,9 +37,11 @@ struct RdmaCompletion {
 #endif
 };
 
-inline __device__ RdmaCompletion
-postRdmaWrite(const CollectivePeerBinding& edge, const void* source,
-              uint64_t remote_offset, uint64_t bytes, uint64_t channel) {
+inline __device__ RdmaCompletion postRdmaWrite(const PeerRoute& edge,
+                                               const void* source,
+                                               uint64_t remote_offset,
+                                               uint64_t bytes,
+                                               uint64_t channel) {
     const auto context = rdmaContext(edge);
 #ifdef MOONCAKE_EP_USE_MACA
     mc_ibgda_put(context, static_cast<int>(channel),
@@ -128,7 +130,7 @@ inline __device__ void storePeerPayload(void* destination, const void* source,
 }
 
 template <typename Overlap>
-inline __device__ bool putAndSignalP2p(const CollectivePeerBinding& edge,
+inline __device__ bool putAndSignalP2p(const PeerRoute& edge,
                                        const void* source, uint64_t bytes,
                                        uint64_t remote_inbox_offset,
                                        uint64_t remote_signal_offset,
@@ -157,10 +159,10 @@ inline __device__ bool putAndSignalP2p(const CollectivePeerBinding& edge,
 
 template <typename Overlap>
 inline __device__ bool putAndSignalRdma(
-    const CollectiveKernelResources& resources,
-    const CollectivePeerBinding& edge, const void* source, uint64_t bytes,
-    uint64_t remote_inbox_offset, uint64_t remote_signal_offset, uint64_t token,
-    uint64_t command_id, Overlap overlap) {
+    const CollectiveKernelResources& resources, const PeerRoute& edge,
+    const void* source, uint64_t bytes, uint64_t remote_inbox_offset,
+    uint64_t remote_signal_offset, uint64_t token, uint64_t command_id,
+    Overlap overlap) {
     __shared__ int success;
     if (threadIdx.x == 0) {
         mc_st_release_u32(&resources.control->resource_idle, 0);
@@ -189,7 +191,7 @@ inline __device__ bool putAndSignalRdma(
     return success != 0;
 }
 
-inline __device__ bool signalP2p(const CollectivePeerBinding& edge,
+inline __device__ bool signalP2p(const PeerRoute& edge,
                                  uint64_t remote_signal_offset,
                                  uint64_t token) {
     if (threadIdx.x == 0) {
@@ -203,7 +205,7 @@ inline __device__ bool signalP2p(const CollectivePeerBinding& edge,
 }
 
 inline __device__ bool signalRdma(const CollectiveKernelResources& resources,
-                                  const CollectivePeerBinding& edge,
+                                  const PeerRoute& edge,
                                   uint64_t remote_signal_offset, uint64_t token,
                                   uint64_t command_id) {
     __shared__ int success;

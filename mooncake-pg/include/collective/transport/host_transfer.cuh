@@ -4,7 +4,7 @@
 #include <cstdint>
 
 #include "collective/transport/kernel_resources.cuh"
-#include "collective/transport/peer_binding.h"
+#include "collective/transport/peer_route.h"
 #include "transport/device/device_ops.cuh"
 
 namespace mooncake::host_transfer {
@@ -17,10 +17,9 @@ inline __device__ bool timedOut(uint64_t start, uint64_t timeout_ticks) {
 
 inline __device__ bool issue(const CollectiveKernelResources& resources,
                              HostTransferCommandKind kind,
-                             const CollectivePeerBinding& edge,
-                             const void* source, uint64_t target,
-                             uint64_t bytes, uint64_t signal_target,
-                             uint64_t token) {
+                             const PeerRoute& edge, const void* source,
+                             uint64_t target, uint64_t bytes,
+                             uint64_t signal_target, uint64_t token) {
     auto* command = resources.host_command;
     auto* control = resources.control;
     auto* signal_source = reinterpret_cast<uint64_t*>(
@@ -64,8 +63,8 @@ inline __device__ bool issue(const CollectiveKernelResources& resources,
 
 template <typename Overlap>
 inline __device__ bool putAndSignal(const CollectiveKernelResources& resources,
-                                    const CollectivePeerBinding& edge,
-                                    const void* source, uint64_t bytes,
+                                    const PeerRoute& edge, const void* source,
+                                    uint64_t bytes,
                                     uint64_t remote_inbox_offset,
                                     uint64_t remote_signal_offset,
                                     uint64_t token, Overlap overlap) {
@@ -88,7 +87,7 @@ inline __device__ bool putAndSignal(const CollectiveKernelResources& resources,
 }
 
 inline __device__ bool signal(const CollectiveKernelResources& resources,
-                              const CollectivePeerBinding& edge,
+                              const PeerRoute& edge,
                               uint64_t remote_signal_offset, uint64_t token) {
     __shared__ int success;
     if (threadIdx.x == 0) {

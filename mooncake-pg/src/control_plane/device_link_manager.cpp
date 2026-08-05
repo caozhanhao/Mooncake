@@ -21,6 +21,23 @@ void appendChanged(std::vector<GlobalRank>& changed, GlobalRank peer) {
     }
 }
 
+struct DeviceRdmaTransportDeleter {
+    DeviceId device_id = kInvalidDeviceId;
+
+    void operator()(device::RdmaTransport* transport) const noexcept {
+        if (!transport) return;
+        try {
+            const GpuDeviceGuard guard(device_id);
+            delete transport;
+        } catch (const std::exception& error) {
+            LOG(WARNING) << "Device RDMA transport cleanup failed: "
+                         << error.what();
+        } catch (...) {
+            LOG(WARNING) << "Device RDMA transport cleanup failed";
+        }
+    }
+};
+
 }  // namespace
 
 struct DeviceLinkManager::DeviceArenaState {
@@ -29,8 +46,8 @@ struct DeviceLinkManager::DeviceArenaState {
     void* base = nullptr;
     uint64_t bytes = 0;
     cudaStream_t bootstrap_stream = nullptr;
-    std::unique_ptr<device::RdmaTransport> rdma;
-    std::optional<RdmaArenaBinding> published_rdma;
+    std::shared_ptr<device::RdmaTransport> rdma;
+    std::optional<RdmaArenaDescriptor> published_rdma;
     std::vector<bool> rdma_connected;
 
     ~DeviceArenaState() noexcept {
@@ -95,7 +112,9 @@ void DeviceLinkManager::bindCollectiveArena(const CollectiveArenaView& view) {
     arena->base = view.base;
     arena->bytes = view.bytes;
     arena->rdma_connected.assign(max_world_size_, false);
-    arena->rdma = device::createIbgdaDeviceTransport();
+    auto rdma = device::createIbgdaDeviceTransport();
+    arena->rdma = std::shared_ptr<device::RdmaTransport>(
+        rdma.release(), DeviceRdmaTransportDeleter{view.device});
 
     bool rdma_ready = arena->rdma != nullptr;
     if (rdma_ready) {
@@ -122,7 +141,7 @@ void DeviceLinkManager::bindCollectiveArena(const CollectiveArenaView& view) {
             metadata.qpns.size() >= static_cast<size_t>(max_world_size_) &&
             metadata.lids.size() >= static_cast<size_t>(max_world_size_);
         if (rdma_ready) {
-            arena->published_rdma = RdmaArenaBinding{
+            arena->published_rdma = RdmaArenaDescriptor{
                 .remote_access_address = static_cast<uint64_t>(metadata.raddr),
                 .remote_key = static_cast<uint32_t>(metadata.rkey),
                 .subnet_prefix = static_cast<uint64_t>(metadata.subnet_prefix),
@@ -188,7 +207,7 @@ void DeviceLinkManager::observeGroupView(
                 observation.p2p_target_rank_epoch = 0;
                 observation.p2p_arena_generation = 0;
             } else {
-                const auto& binding = *endpoint.device_p2p;
+                const auto& descriptor = *endpoint.device_p2p;
                 const bool needs_import =
                     observation.p2p_target_rank_epoch != rank_epochs[peer] ||
                     observation.p2p_arena_generation !=
@@ -196,7 +215,7 @@ void DeviceLinkManager::observeGroupView(
                     !observation.p2p_mapping;
                 if (needs_import) {
                     auto mapping =
-                        device::importP2pPeerBuffer(binding.opaque_handle);
+                        device::importP2pPeerBuffer(descriptor.opaque_handle);
                     const bool available =
                         mapping &&
                         (mapping->mappedBytes() == 0 ||
@@ -304,7 +323,7 @@ void DeviceLinkManager::connectRdmaPeers(
     }
 }
 
-std::optional<DeviceP2pHandle> DeviceLinkManager::resolveP2p(
+std::optional<DeviceP2pLink> DeviceLinkManager::resolveP2p(
     DeviceId source_device, GlobalRank peer, uint64_t arena_generation) const {
     if (!rankInRange(peer)) return std::nullopt;
     std::lock_guard<std::mutex> lock(peers_mutex_);
@@ -316,11 +335,11 @@ std::optional<DeviceP2pHandle> DeviceLinkManager::resolveP2p(
         observation.p2p_arena_generation != arena_generation) {
         return std::nullopt;
     }
-    return DeviceP2pHandle{observation.p2p_mapping,
-                           observation.p2p_mapping->mappedBase()};
+    return DeviceP2pLink{observation.p2p_mapping,
+                         observation.p2p_mapping->mappedBase()};
 }
 
-std::optional<DeviceRdmaHandle> DeviceLinkManager::resolveRdma(
+std::optional<DeviceRdmaLink> DeviceLinkManager::resolveRdma(
     DeviceId source_device, GlobalRank peer, uint64_t arena_generation) const {
     if (!rankInRange(peer)) return std::nullopt;
     std::lock_guard<std::mutex> lock(peers_mutex_);
@@ -334,8 +353,8 @@ std::optional<DeviceRdmaHandle> DeviceLinkManager::resolveRdma(
         arena == arenas_.end() || !arena->second->rdma) {
         return std::nullopt;
     }
-    return DeviceRdmaHandle{
-        .keepalive = arena->second,
+    return DeviceRdmaLink{
+        .transport = arena->second->rdma,
         .qp_contexts = arena->second->rdma->qpDevCtxsPtr(),
         .remote_keys =
             static_cast<const uint32_t*>(arena->second->rdma->rkeysPtr()),

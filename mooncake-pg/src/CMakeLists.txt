@@ -131,9 +131,10 @@ set_target_properties(
              BUILD_RPATH_USE_ORIGIN YES)
 
 add_library(mooncake_pg SHARED
-    collective/binding/allreduce_binding.cpp
-    collective/binding/collective_binding.cpp
-    collective/binding/group_binding.cpp
+    collective/plan/allreduce_plan_builder.cpp
+    collective/plan/active_group_ranks.cpp
+    collective/plan/collective_plan_registry.cpp
+    collective/route/group_peer_routes.cpp
     collective/buffer/collective_buffer_pool.cpp
     collective/operation/allreduce.cpp
     collective/runtime/collective_failure.cpp

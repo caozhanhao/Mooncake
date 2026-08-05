@@ -27,23 +27,23 @@ __global__ void allReduceExecutorKernel(AllReduceExecutorArgs args) {
         return;
     }
 
-    // Every launch reads the active Coordinator plan through a stable binding.
+    // Every launch reads the active Coordinator plan through a stable handle.
     // A failed launch never changes plan or runs again. A later eager call or
     // CUDA Graph replay is a new application invocation and can observe the
     // plan published by sync-after-failure without graph recapture.
     if (threadIdx.x == 0) {
         const uint32_t slot_index = static_cast<uint32_t>(mc_ld_acquire(
-            reinterpret_cast<const int*>(context.binding.active_slot)));
+            reinterpret_cast<const int*>(context.plan.active_slot)));
         const auto* plans =
-            static_cast<const AllReduceKernelPlan*>(context.binding.slots);
+            static_cast<const AllReduceKernelPlan*>(context.plan.slots);
         const auto& published = plans[slot_index];
         view_epoch = published.view_epoch;
         // Sequence identifies this invocation on its physical lane. The
         // mapped counter is reset before a new plan is published, so the
         // active-slot acquire above establishes its view-local domain.
         collective_sequence = atomicAdd_system(
-            reinterpret_cast<unsigned long long*>(
-                context.binding.lane_sequences + context.lane_index),
+            reinterpret_cast<unsigned long long*>(context.plan.lane_sequences +
+                                                  context.lane_index),
             1ULL);
         self_participating = static_cast<int32_t>(published.self_participating);
         plan_error = published.error_code;

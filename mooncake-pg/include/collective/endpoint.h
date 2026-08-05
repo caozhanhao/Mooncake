@@ -25,16 +25,16 @@ struct CollectiveControlLayout {
     bool operator==(const CollectiveControlLayout&) const = default;
 };
 
-// Device API bindings describe the process-level registered arena. A group
+// Device API descriptors describe the process-level registered arena. A group
 // endpoint publishes only its small stable control subspan. Collective buffer
 // offsets are exchanged by the data plane for each invocation.
-struct P2pArenaBinding {
+struct P2pArenaDescriptor {
     std::vector<int32_t> opaque_handle;
 
-    bool operator==(const P2pArenaBinding&) const = default;
+    bool operator==(const P2pArenaDescriptor&) const = default;
 };
 
-struct RdmaArenaBinding {
+struct RdmaArenaDescriptor {
     uint64_t remote_access_address = 0;
     uint32_t remote_key = 0;
     uint64_t subnet_prefix = 0;
@@ -43,7 +43,7 @@ struct RdmaArenaBinding {
     std::vector<int32_t> lids;
     bool is_roce = false;
 
-    bool operator==(const RdmaArenaBinding&) const = default;
+    bool operator==(const RdmaArenaDescriptor&) const = default;
 };
 
 // V2 is intentional during the incremental migration: this is the semantic
@@ -57,8 +57,8 @@ struct GroupEndpointV2 {
     uint64_t arena_bytes = 0;
     uint64_t control_base_address = 0;
     CollectiveControlLayout control_layout;
-    std::optional<P2pArenaBinding> device_p2p;
-    std::optional<RdmaArenaBinding> device_rdma;
+    std::optional<P2pArenaDescriptor> device_p2p;
+    std::optional<RdmaArenaDescriptor> device_rdma;
 
     bool operator==(const GroupEndpointV2&) const = default;
 };

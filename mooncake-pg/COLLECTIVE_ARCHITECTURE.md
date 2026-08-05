@@ -1,213 +1,239 @@
 # Collective architecture and review guide
 
 This document describes the first vertical slice of the collective refactor.
-It is intentionally narrower than the final design: supported GPU AllReduce
-uses the new path, while every other collective and unsupported AllReduce
-signature continues to use the legacy worker.
+Supported GPU AllReduce uses the new path. Other collectives, CPU AllReduce,
+and unsupported AllReduce signatures continue to use the legacy worker until
+later incremental PRs migrate them.
 
-The Torch adapter is not part of this refactor. It keeps calling the
-NCCL-shaped `mooncakePg*` C API; dispatch happens inside `MooncakeCommunicator`.
+The Torch adapter is outside this refactor. It continues to call the
+NCCL-shaped `mooncakePg*` C API; dispatch changes only inside
+`MooncakeCommunicator`.
 
 ## Overall architecture
-
-There is one call boundary followed by five internal layers. Each layer owns a
-different kind of decision; the separation is meant to prevent either the
-Coordinator or a captured kernel from becoming a per-rank God object.
 
 ```text
  Existing call surface
  +---------------+     +--------------------+     +-------------------------+
  | Torch adapter | --> | mooncake_pg C API  | --> | MooncakeCommunicator    |
- | (unchanged)   |     | raw NCCL-like args |     | incremental dispatch    |
+ | unchanged     |     | NCCL-shaped args   |     | incremental dispatch    |
  +---------------+     +--------------------+     +------------+------------+
                                                                |
                          supported GPU SUM + Planned protocol   |
                                                                v
- Control-plane policy                              Group-local data plane
- +-------------------------+     GroupView     +-----------------------------+
- | 1. Policy / Coordinator | ----------------> | 2. Binding                  |
- | per-group/per-size      |                   | GroupView -> stable local   |
- | algorithm choice only   |                   | execution state            |
- +------------^------------+                   +--------------+--------------+
-              | endpoint/capability                           |
- +------------+------------+                                  v
- | Agent state machine     |                   +-----------------------------+
- | merges process link     |                   | 3. Runtime / operation      |
- | capability and events  |                   | admission, lane, snapshot,  |
- +------------^------------+                   | invocation ABI, recovery    |
-              |                                +--------------+--------------+
- +------------+------------+                                  |
- | Process resources       |                                  v
- | LinkManager (host)      |                   +-----------------------------+
- | DeviceLinkManager       |                   | 4. Executor / algorithm     |
- | BufferManager / proxy   |                   | AllReduce + Flat Ring       |
- +-------------------------+                   | Hierarchical is a shell     |
-                                                +--------------+--------------+
-                                                               |
-                                                               v
-                                                +-----------------------------+
-                                                | 5. Transport                |
-                                                | DevP2p / DevRdma / Host     |
-                                                | common put-and-signal       |
-                                                +-----------------------------+
+
+ Coordinator            Per-group Agent preparation       Process link state
+ +------------------+   +-------------------------------+  +------------------+
+ | CollectivePolicy |-->| deriveActiveGroupRanks        |<-| Host LinkManager |
+ | algo + buckets   |   | buildGroupPeerRoutes          |  | DeviceLinkManager|
+ +------------------+   +---------------+---------------+  +------------------+
+                                       |
+                              active ranks + peer routes
+                                       |
+                                       v
+                            +-----------------------+
+                            | CollectivePlanBuilder |
+                            | AllReduce today       |
+                            | more plugins later    |
+                            +-----------+-----------+
+                          |
+                          v
+               +------------------------+
+               | CollectivePlanPublisher|
+               | graph-stable plan slots|
+               +-----------+------------+
+                           |
+                           v
+               +------------------------+
+               | GroupCollectiveRuntime |
+               | resources + progress   |
+               +-----------+------------+
+                           |
+                           v
+               +------------------------+
+               | Executor / algorithm   |
+               | Flat Ring AllReduce    |
+               +-----------+------------+
+                           |
+                           v
+               +------------------------+
+               | PeerRoute transport    |
+               | DevP2p/DevRdma/Host    |
+               +------------------------+
 
  Unsupported signature or Legacy protocol -----------------> legacy worker
 ```
 
-## Layer responsibilities
+The Coordinator publishes only decisions that must be identical on every
+rank. Each Agent turns the authoritative view into ordered active group ranks
+and peer routes. Collective-specific builders then construct typed kernel
+plans without seeing `GroupView`, `GlobalRank`, or either link manager.
 
-| Layer | Main modules | Owns | Must not own |
+## Responsibilities
+
+| Area | Main modules | Owns | Must not own |
 | --- | --- | --- | --- |
-| Dispatch | C API, `MooncakeCommunicator` | External argument validation and the incremental Planned/Legacy split | Rank-specific plans, routes, or algorithm execution |
-| Control policy | `CollectivePolicyBuilder`, `CollectivePlanSet` | One canonical algorithm per group and message-size bucket | Per-rank predecessors, addresses, QPs, or transport choice |
-| Binding | `GroupPeerResolver`, `CollectiveBindingMaterializer`, `GroupCollectiveBindings` | Convert an authoritative `GroupView` into group-local, typed, graph-stable execution state | Tensor pointers, streams, invocation lifetime, or algorithm execution |
-| Runtime and operation | `GroupCollectiveRuntime`, `CollectiveProgressEngine`, `CollectiveInvocation` | Admission, snapshot allocation, eager lease versus graph pin, failure gating, and operation ABI translation | Membership policy or collective-specific scheduling |
-| Executor | AllReduce executor and algorithm routines | Participant shards, transport tiles, reduction, and dependency order | `GroupView`, `GlobalRank`, local fallback policy, or CPU control-plane calls |
-| Transport/resources | buffer and link managers, host proxy, device transfer | Process-shared memory/link resources and per-edge put-and-signal | Collective algorithm selection |
+| Dispatch | C API, `MooncakeCommunicator` | Argument validation and Planned/Legacy split | Algorithm construction or transport selection |
+| Control policy | `CollectivePolicyBuilder`, `CollectivePlanSet` | Canonical algorithm and message-size buckets | Per-rank neighbors, addresses, QPs, or transport choice |
+| Active ranks | `ActiveGroupRanks` | Active `InGroupRank` order and local ordinal | Global ranks, endpoints, or routes |
+| Peer routes | `GroupPeerRoutes`, host/device link managers | Endpoint-to-route resolution and device-link lifetime | Ring/tree roles or collective algorithms |
+| Plan construction | `CollectivePlanBuilder`, typed builders | Algorithm-specific peer roles and typed kernel plans | `GroupView`, `GlobalRank`, or link-resource ownership |
+| Plan publication | `CollectivePlanPublisher`, `CollectivePlanHandle` | Stable double-buffered publication visible to graph replay | Invocation buffers, streams, or algorithm execution |
+| Runtime/operation | `GroupCollectiveRuntime`, `CollectiveInvocation`, progress | Admission, shared resource acquisition, graph retention, failure reporting | Membership or algorithm policy |
+| Executor | typed executor and algorithm routines | Reduction, dependency order, participant shards, transport tiling | CPU policy calls or local algorithm fallback |
+| Transport | `PeerRoute`, device transfer, host proxy | One-sided put-and-signal through the selected route | Collective algorithm selection |
 
-The five internal layers are policy, binding, runtime/operation, executor, and
-transport/resources. `MooncakeCommunicator` is the compatibility boundary in
-front of them, not a sixth planning layer.
+## GroupView projection and plan construction
 
-Resource teardown follows the inverse ownership order: stop progress first,
-destroy device mappings/QPs second, then unregister and release the process
-collective arena. Materialized P2P and RDMA edges retain their process-level
-resource owner, so replacing a view removes old links from resolution without
-invalidating an in-flight invocation or captured graph.
-
-## Three representations, three lifetimes
-
-The design deliberately avoids a single executable-plan object.
+There is no generic Group object between control and data plane. View
+application uses two concrete projections:
 
 ```text
- Logical plan                  Materialized binding             Invocation
- Coordinator-owned            Agent/rank-owned                 Call-owned
- --------------------------    ------------------------------   -----------------
- protocol                     active participant order         input/output
- size buckets                 local predecessor/successor      count/type/op
- algorithm                    peer routes and handles          stream
-                              stable double-buffered state      lane/failure cookie
-
- same on every rank           rebuilt for each GroupView       created per call
+ GroupView
+    |
+    +--> deriveActiveGroupRanks()
+    |        |
+    |        `--> ActiveGroupRanks
+    |             - active InGroupRank order
+    |             - optional local ordinal
+    |
+    `--> buildGroupPeerRoutes() <---- Host/Device LinkManager
+             |
+             `--> GroupPeerRoutes[InGroupRank]
+                  - PeerRoute kernel value
+                  - typed owner of referenced device resources
 ```
 
-Only the logical plan is broadcast by the Coordinator. The Agent derives
-neighbors from canonical active order and resolves process-shared links. This
-keeps Coordinator work proportional to groups and size buckets rather than to
-every rank's executable addresses.
+`ActiveGroupRanks` is a small value shared by every collective builder.
+It is the active projection of Coordinator-authoritative membership. An absent
+local ordinal represents an inactive local rank, which a captured graph must
+handle without host admission.
 
-`GroupPeerResolver` is the last place allowed to see `GlobalRank` and
-`GroupView`. Everything below it addresses peers by `InGroupRank` and consumes
-already materialized bindings.
+`GroupPeerRoutes` is built once for a communicator when a view is applied. It
+translates `InGroupRank` to `GlobalRank` only while consulting endpoints and
+process link managers. Everything below this boundary stays group-local. The
+table owns imported P2P mappings and device RDMA transports referenced by its
+POD `PeerRoute` entries. A published plan slot retains the route table, so its
+raw kernel addresses cannot outlive their concrete owner.
+
+This is local O(group size) work, not Coordinator-side per-rank planning and
+not a global capability matrix. Builders use only the routes required by their
+algorithm:
+
+```text
+ Flat Ring     predecessor + successor
+ Tree          parent + children
+ Hierarchical  local peers + leaders
+ Broadcast     parent + children
+```
+
+The first slice registers `AllReducePlanBuilder`. Future AllGather and
+Broadcast builders consume the same active-rank and route projections without
+duplicating rank-space or transport code.
+
+## Representations and lifetimes
+
+```text
+ Logical policy             Group-local routes          Kernel plan
+ Coordinator-owned         Agent/communicator-owned    collective-specific
+ ----------------------    --------------------------   ----------------------
+ protocol                  active InGroupRank order     algorithm dispatch
+ message-size buckets      endpoint-selected routes    peer roles
+ algorithm                 device resource owners      typed executor fields
+
+ same on every rank        rebuilt per GroupView       rebuilt per GroupView
+```
+
+Invocation state remains separate:
+
+```text
+ input/output + count/type/op + stream
+                    |
+                    v
+       GroupCollectiveRuntime resources
+                    |
+                    v
+        typed invocation launches kernel
+```
+
+Tensor pointers and invocation buffer offsets never enter the published
+kernel plan. A process-wide buffer pool may assign different offsets on each
+rank, so the kernel exchanges invocation-local offsets through the common
+peer-buffer protocol before running the selected algorithm.
 
 ## Transport agreement
 
-Ranks must agree on the collective algorithm and participant order. They do
-not need to use the same physical transport for every directed edge because
-all routes implement the same receiver-visible operation: write the remote
-arena, then publish its signal.
+Ranks agree on the collective algorithm and participant order. They do not
+need identical physical transports for every directed edge: `DevP2p`,
+`DevRdma`, and `Host` implement the same receiver-visible operation—write the
+remote arena and then publish its signal.
 
-- `DevP2p` uses the device P2P API without pretending it is NVLink or MNNVL.
+Route selection therefore remains local to view application:
+
+- `DevP2p` uses the device P2P API without inventing NVLink/MNNVL knowledge.
 - `DevRdma` uses the device RDMA API.
-- `Host` enqueues the same put-and-signal operation through the host proxy;
-  Transfer Engine owns its installed physical transport choice.
+- `Host` sends the same operation through the host proxy; Transfer Engine owns
+  its installed physical transport.
 
-Route selection therefore stays in Agent-side binding. It must fail closed if
-a selected local binding cannot be materialized; an executor must never
-silently choose another route or protocol.
+The executor receives one already selected `PeerRoute`. It never switches
+transport or algorithm after launch. If a required local route is unavailable,
+the builder publishes an invalid plan and the planned path fails closed.
 
-`DeviceLinkManager` owns concrete observations by `(local device, global
-peer)` and resolves a binding for the communicator's exact device. Only its
-aggregate process-level Device reachability is reported to the Agent state
-machine. A Host failure from the still-supported legacy data plane
-conservatively invalidates both provider contributions, so Device reachability
-cannot hide a failed legacy collective during the incremental migration.
+## Eager, CUDA Graph, and failure handling
 
-Once a group has selected the Planned wire protocol, a joining rank must
-publish its V2 endpoint before activation. A Legacy group may still admit a
-legacy-only rank; it switches to Planned only after every active rank has
-published the new endpoint.
-
-## Eager, graph replay, and failure recovery
-
-Eager and CUDA Graph execution use the same invocation and executor protocol.
-Their only difference is resource lifetime: eager temporarily leases a lane,
-while capture pins a lane at a stable address.
+Eager and CUDA Graph use the same invocation, runtime, executor, and transport
+protocol. Their difference is resource lifetime: eager resources return to the
+pool after completion, while a captured invocation retains its resources until
+communicator teardown.
 
 ```text
- invocation
-    |
-    +-- acquire/locate lane (eager lease or graph pin)
-    +-- allocate full input snapshot on the caller stream
-    +-- launch the same executor
-           |
-           +-- enter stable failure gate
-           +-- load current binding state
-           +-- run Coordinator-selected algorithm
-           +-- success: complete
-           |
-           +-- failure: publish evidence and park
+ invocation / graph replay
+          |
+          +--> acquire or locate retained runtime resources
+          +--> read current CollectivePlanHandle active slot
+          +--> run current Coordinator-selected plan
+                    |
+             +------+------+
+             |             |
+          success       failure
+             |             |
+          complete      publish failed peer and wait
                            |
                     CPU progress thread
                            |
                     report + syncAfterFailure
                            |
-                    apply new GroupView/binding
+                    apply authoritative GroupView
                            |
-             +-------------+-------------+
-             | safe to retry             | not safe to reuse
-             v                           v
-          gate Open                   gate Closed
-          newer view required         survive replay; no arena access
-          reload + retry snapshot     later replay may request recovery again
+                    acknowledge failed invocation
+                           |
+                    invocation returns failure
 ```
 
-The captured kernel sees stable state pointers, lane addresses, and a failure
-gate. Membership, algorithm choice, peer addresses, and link resources remain
-behind the double-buffered state and can change without graph recapture. The
-kernel never infers a fallback algorithm from a failure; it retries only after
-CPU has applied a newer, executable Coordinator-authoritative view.
+There is no collective-level retry. A failed invocation reports the failure
+and finishes after sync-after-failure aligns the observed view. The application
+owns any retry. A later eager invocation or graph replay reads the newly
+published active plan slot without graph recapture.
 
-Host admission rejects new collectives after self deactivation. A captured
-replay cannot run that host check, so the published execution state carries an
-explicit `self_participating` bit. An inactive replay is a transport-free
-local identity: it restores the invocation snapshot to output and never
-assumes another participant's ordinal. The restore also removes a partial
-writeback left by an attempt that failed before self deactivation.
+Host admission rejects a new collective after self deactivation. Replay has no
+host participation, so the published AllReduce plan carries an explicit local
+participation state. An inactive replay performs a local identity operation and
+does not touch peer transport.
 
-The per-lane sequence belongs to the invocation and remains fixed across its
-retry attempts. Sequence counters are monotonic within one view and reset when
-a new authoritative view is published, so a reactivated rank does not inherit
-sequence history different from the surviving ranks. A newer `view_epoch`
-separates the reset token domain, while an in-flight retry keeps the value it
-already acquired. This avoids letting locally different CPU recovery timing
-create different wire tokens on different ranks. The counters live in mapped
-control memory and are reset before active-state publication; view application
-does not enqueue GPU work behind the parked executor it is trying to recover.
-An invocation-local retry-attempt field separates that parked retry from a
-future invocation that starts at the reset sequence value. Reapplying the same
-view does not reset counters or create a new token domain.
-
-The full input snapshot is common recovery state, not a graph special case. A
-failed attempt may already have partially modified the output. Retrying from
-the snapshot avoids depending on partially committed output. Ring planning is
-over full participant shards; the fixed registered arena appears only as
-internal transport tiling, so copy-in, transfer, reduction, and copy-out can
-overlap without exposing a plan-level `window` or `RingChunk` concept.
+Per-lane invocation sequences are monotonic within one view and reset before a
+new-epoch plan is published. The view epoch and sequence form the wire-token
+domain. Reapplying the same view does not reset the counters.
 
 ## First-PR scope
 
 Implemented on the new path:
 
 - GPU AllReduce SUM for float16, bfloat16, and float32;
-- one Planned dispatch path for every configured PG GPU backend; compiler and
-  runtime selection remains in the existing platform adapters;
 - Flat Ring policy and execution;
-- per-directed-edge `DevP2p`, `DevRdma`, or `Host` materialization;
-- the device API and host proxy path;
-- one execution protocol shared by eager calls and CUDA Graph replay;
-- failure publication, `syncAfterFailure`, stable view replacement, and retry;
-- an explicit but unsupported Hierarchical plan/binding/executor shell.
+- per-peer `DevP2p`, `DevRdma`, or `Host` routes;
+- device API and host proxy paths;
+- one resource and execution protocol for eager and CUDA Graph;
+- failure publication and sync-after-failure;
+- an explicit but unsupported Hierarchical plan/executor shell.
 
 Kept on the legacy path:
 
@@ -215,72 +241,46 @@ Kept on the legacy path:
 - CPU AllReduce;
 - unsupported GPU AllReduce datatype/reduction signatures.
 
-The signature check is a deterministic migration boundary, not an error
-fallback. Once the Coordinator selects the Planned protocol for a supported
-signature, local materialization/runtime failure cannot send one rank back to
-the legacy wire protocol.
+The signature check is an incremental migration boundary, not an error
+fallback. Once the Coordinator selects Planned for a supported signature, a
+local plan/runtime error cannot move only one rank back to the legacy wire
+protocol.
 
 ## Deferred, not hidden
 
-The first slice intentionally leaves these follow-ups visible without solving
-them prematurely:
-
 - Hierarchical topology/performance policy and implementation;
-- multiple independently pinned graph lanes, concurrent graph replay, and a
-  graph-destruction callback for reclaiming retained resources;
-- device-RDMA endpoint/QP generation and reconnect semantics after an
-  uncertain in-flight operation;
-- cross-backend build/runtime validation of the shared cuda-alike graph and
-  device-source surface;
-- a proper odd/even publication protocol for `LinkManager`'s host-link read
-  model when segment refresh races a handle lookup;
-- more precise failure evidence than conservatively invalidating both host
-  and device provider contributions for a failed peer;
-- per-replay reset/epoch semantics for caller-visible failed-rank hints in a
-  retained CUDA Graph;
-- scalable device-RDMA endpoint/QP exchange beyond the current fixed
-  process-rank table;
-- configurable/dynamic process collective arena sizing;
-- a general cross-rank admission/lane agreement for concurrent submissions,
-  local lane exhaustion, and control-plane view application racing a
-  data-plane invocation;
-- a collective-wide success/failure rendezvous that proves every surviving
-  participant has parked before an in-flight invocation retries;
-- AllGather, Broadcast, and a general hybrid dependency scheduler.
+- AllGather, Broadcast, and a general hybrid dependency scheduler;
+- graph-destruction callbacks and independently pinned concurrent graph lanes;
+- device-RDMA reconnect/generation semantics after uncertain in-flight work;
+- scalable device-RDMA endpoint exchange beyond the current process-rank
+  table;
+- cross-rank admission/lane agreement for concurrent submissions;
+- collective-wide success/failure rendezvous;
+- configurable process collective arena sizing;
+- more precise failure evidence than invalidating both host and device
+  contributions for a failed peer.
 
 ## Suggested review path
 
-The commits are intentionally ordered by dependency. Reviewing them in this
-order avoids starting in the Flat Ring kernel before its ownership boundaries
-are established.
+1. Coordinator-owned logical policy:
+   `collective/plan/logical_plan.h`, `control_plane/collective_policy.*`.
+2. Serializable endpoint descriptors and process link state:
+   `collective/endpoint.h`, `control_plane/device_link_manager.*`,
+   `control_plane/link_manager.*`.
+3. The control-to-local boundary:
+   `collective/plan/active_group_ranks.*`,
+   `collective/route/group_peer_routes.*`, and
+   `collective/transport/peer_route.h`.
+4. Collective-specific plan construction and generic publication:
+   `collective/plan/allreduce_plan_builder.*`,
+   `collective/plan/collective_plan_registry.*`, and `plan_handle.cuh`.
+5. Common invocation resources and failure progress:
+   `collective/runtime/`, then `collective/operation/allreduce.*`.
+6. Kernel dispatch, Flat Ring, and route transports:
+   `collective/executor/allreduce.cu`,
+   `collective/executor/algorithm/flat_ring.cuh`, and
+   `collective/transport/`.
+7. Finally review communicator initialization, view application, and the one
+   incremental AllReduce dispatch point in `mooncake_communicator.cpp`.
 
-1. `caece66a` — logical schema and Coordinator policy:
-   `collective/plan.h`, `collective/types.h`, and
-   `control_plane/collective_policy.*`.
-2. `b8315a9b` — process-scoped resources and endpoint publication:
-   `collective/endpoint.h`, `collective/buffer/`, both link managers, and the
-   host transfer proxy.
-3. `427871a4` — the GlobalRank-to-InGroupRank boundary and graph-stable
-   publication: `collective/binding/`.
-4. `fb947322` — generic runtime/operation contract followed by the AllReduce
-   executor: `collective/runtime/`, `collective/operation/`, then
-   `collective/executor/algorithm/flat_ring.cuh`.
-5. `a0ab94f3` — communicator initialization, view application, recovery, and
-   the single incremental dispatch point in `mooncake_communicator.cpp`.
-6. `362c6e46` — failure-gate resource safety across later graph replay.
-7. `6deca315` — require a strictly newer authoritative binding before retry.
-8. `b3e9bdae` — keep wire sequence invocation-scoped across retry attempts.
-9. `9ac8dcab` — retain device link owners with materialized bindings and tear
-   them down before the process arena.
-10. `2d5dc217` — align replay across view changes: inactive ranks execute a
-    local identity, view-scoped sequences reset safely, and retry attempts use
-    a distinct wire-token domain.
-11. `0e69ddd1` — key concrete device mappings and QPs by the communicator's
-    local device while keeping one process-level reachability contribution.
-12. `e229afa7` — preserve incremental compatibility by requiring V2 endpoints
-    for Planned activation and preventing Device reachability from hiding a
-    failed legacy Host path.
-
-Finally, inspect the two Transfer Engine files changed for the narrow P2P peer
-mapping API. No file under `mooncake-pg/torch/` should differ from the
-decoupling baseline.
+No file under `mooncake-pg/torch/` belongs to this refactor.

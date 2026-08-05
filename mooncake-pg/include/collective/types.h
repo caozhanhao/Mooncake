@@ -10,7 +10,7 @@ using DeviceId = int32_t;
 inline constexpr DeviceId kCpuDeviceId = -1;
 inline constexpr DeviceId kInvalidDeviceId = -2;
 
-// Group-scoped identity used below the control-plane binding boundary.
+// Group-scoped identity used below the control-plane plan boundary.
 // GlobalRank must not leak into collective executors or transports.
 using InGroupRank = int32_t;
 
@@ -21,7 +21,7 @@ struct BufferSpan {
     bool operator==(const BufferSpan&) const = default;
 };
 
-enum class CollectiveRoute : uint8_t {
+enum class PeerRouteKind : uint8_t {
     DevP2p = 0,
     DevRdma,
     Host,

@@ -13,7 +13,8 @@ enum class CollectiveProtocolError : int32_t {
     None = 0,
     Timeout,
     Transport,
-    InvalidBinding,
+    InvalidPlan,
+    InvalidRoute,
     Unsupported,
 };
 
@@ -37,7 +38,7 @@ struct CollectiveFailureReport {
 
 // Common host-visible state for device and host transports. It is not owned by
 // HostTransferProxy; every invocation gets the same control ABI regardless of
-// the route selected by its current binding.
+// the route selected by its current plan.
 struct alignas(64) CollectiveControlBlock {
     int32_t first_error_code = 0;
     InGroupRank failed_peer = -1;

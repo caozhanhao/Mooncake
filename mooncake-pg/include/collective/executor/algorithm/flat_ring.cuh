@@ -9,7 +9,7 @@
 
 #include "collective/executor/allreduce_device.cuh"
 #include "collective/executor/tensor_partition.cuh"
-#include "collective/runtime/peer_buffer_binding.cuh"
+#include "collective/runtime/peer_buffer_exchange.cuh"
 #include "collective/transport/transfer.cuh"
 
 namespace mooncake::flat_ring {
@@ -17,7 +17,7 @@ namespace mooncake::flat_ring {
 using namespace mooncake::device;
 
 enum class Phase : uint32_t {
-    BufferBinding = 0,
+    BufferExchange = 0,
     ReduceScatter = 1,
     AllGather = 2,
 };
@@ -184,7 +184,7 @@ struct CopyOverlap {
 };
 
 inline __device__ bool transferFailed(const AllReduceExecutorArgs& args,
-                                      const CollectivePeerBinding& edge) {
+                                      const PeerRoute& edge) {
     int32_t error_code = args.context.resources.control->first_error_code;
     if (error_code == 0) {
         error_code = static_cast<int32_t>(CollectiveProtocolError::Transport);
@@ -374,33 +374,33 @@ inline __device__ bool run(const AllReduceExecutorArgs& args,
         return true;
     }
 
-    __shared__ FlatRingKernelPlan materialized_ring;
+    __shared__ FlatRingKernelPlan resolved_ring;
     __shared__ PeerBufferExchange buffer_exchanges[2];
     if (threadIdx.x == 0) {
-        materialized_ring.participant_count = ring.participant_count;
-        materialized_ring.self_ordinal = ring.self_ordinal;
+        resolved_ring.participant_count = ring.participant_count;
+        resolved_ring.self_ordinal = ring.self_ordinal;
         buffer_exchanges[0] = PeerBufferExchange{
-            .published = ring.predecessor,
+            .route = ring.predecessor,
             .remote_offset_target = kSuccessorBufferOffset,
             .remote_ready_target = kSuccessorBufferReady,
             .local_offset_source = kPredecessorBufferOffset,
             .local_ready_source = kPredecessorBufferReady,
-            .materialized = &materialized_ring.predecessor,
+            .resolved_route = &resolved_ring.predecessor,
         };
         buffer_exchanges[1] = PeerBufferExchange{
-            .published = ring.successor,
+            .route = ring.successor,
             .remote_offset_target = kPredecessorBufferOffset,
             .remote_ready_target = kPredecessorBufferReady,
             .local_offset_source = kSuccessorBufferOffset,
             .local_ready_source = kSuccessorBufferReady,
-            .materialized = &materialized_ring.successor,
+            .resolved_route = &resolved_ring.successor,
         };
     }
     __syncthreads();
-    const uint64_t binding_token = protocolToken(
-        view_epoch, collective_sequence, 0, Phase::BufferBinding, 0);
-    if (!materializePeerBuffers(resources, buffer_exchanges, binding_token,
-                                0)) {
+    const uint64_t exchange_token = protocolToken(
+        view_epoch, collective_sequence, 0, Phase::BufferExchange, 0);
+    if (!exchangePeerBufferOffsets(resources, buffer_exchanges, exchange_token,
+                                   0)) {
         return false;
     }
 
@@ -413,7 +413,7 @@ inline __device__ bool run(const AllReduceExecutorArgs& args,
     const uint64_t transfer_elements = stage_bytes / bytes_per_element;
     if (transfer_elements == 0) {
         setCollectiveError(
-            args, static_cast<int32_t>(CollectiveProtocolError::InvalidBinding),
+            args, static_cast<int32_t>(CollectiveProtocolError::InvalidPlan),
             -1);
         __syncthreads();
         return false;
@@ -423,20 +423,19 @@ inline __device__ bool run(const AllReduceExecutorArgs& args,
                  resources.buffer.staging_offset;
     void* work_stages[2]{work, work + stage_bytes};
     const uint64_t max_partition_elements =
-        (args.element_count + materialized_ring.participant_count - 1) /
-        materialized_ring.participant_count;
+        (args.element_count + resolved_ring.participant_count - 1) /
+        resolved_ring.participant_count;
     uint64_t transfer_index = 0;
     for (uint64_t transfer_offset = 0; transfer_offset < max_partition_elements;
          transfer_offset += transfer_elements, ++transfer_index) {
         uint32_t current_stage = 0;
-        if (!runReduceScatter(args, materialized_ring, input, view_epoch,
+        if (!runReduceScatter(args, resolved_ring, input, view_epoch,
                               collective_sequence, transfer_offset,
                               transfer_elements, transfer_index, work_stages,
                               &current_stage) ||
-            !runAllGather(args, materialized_ring, view_epoch,
-                          collective_sequence, transfer_offset,
-                          transfer_elements, transfer_index, work_stages,
-                          &current_stage)) {
+            !runAllGather(args, resolved_ring, view_epoch, collective_sequence,
+                          transfer_offset, transfer_elements, transfer_index,
+                          work_stages, &current_stage)) {
             return false;
         }
     }

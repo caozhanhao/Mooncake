@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_COLLECTIVE_TRANSPORT_PEER_BINDING_H
-#define MOONCAKE_PG_COLLECTIVE_TRANSPORT_PEER_BINDING_H
+#ifndef MOONCAKE_PG_COLLECTIVE_TRANSPORT_PEER_ROUTE_H
+#define MOONCAKE_PG_COLLECTIVE_TRANSPORT_PEER_ROUTE_H
 
 #include <cstdint>
 
@@ -8,18 +8,18 @@
 
 namespace mooncake {
 
-struct HostPeerBinding {
+struct HostPeerRoute {
     HostLinkHandle link = kInvalidHostLinkHandle;
     uint64_t remote_arena_address = 0;
     uint64_t remote_buffer_address = 0;
 };
 
-struct DeviceP2pPeerBinding {
+struct DeviceP2pPeerRoute {
     void* mapped_arena = nullptr;
     void* mapped_buffer = nullptr;
 };
 
-struct DeviceRdmaPeerBinding {
+struct DeviceRdmaPeerRoute {
     void* qp_contexts = nullptr;
     const uint32_t* remote_keys = nullptr;
     int32_t local_peer_index = -1;
@@ -29,16 +29,16 @@ struct DeviceRdmaPeerBinding {
     uint64_t remote_buffer_address = 0;
 };
 
-// One group-local, already materialized edge. Device transport indices are
+// One group-local route ready for kernel use. Device transport indices are
 // opaque process-level slots; collective code uses only peer_in_group_rank.
-struct CollectivePeerBinding {
-    CollectiveRoute route = CollectiveRoute::Host;
+struct PeerRoute {
+    PeerRouteKind kind = PeerRouteKind::Host;
     InGroupRank peer_in_group_rank = -1;
-    HostPeerBinding host;
-    DeviceP2pPeerBinding device_p2p;
-    DeviceRdmaPeerBinding device_rdma;
+    HostPeerRoute host;
+    DeviceP2pPeerRoute device_p2p;
+    DeviceRdmaPeerRoute device_rdma;
 };
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_COLLECTIVE_TRANSPORT_PEER_BINDING_H
+#endif  // MOONCAKE_PG_COLLECTIVE_TRANSPORT_PEER_ROUTE_H

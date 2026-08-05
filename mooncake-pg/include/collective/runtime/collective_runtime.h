@@ -24,11 +24,11 @@ namespace mooncake {
 
 // Host control and kernel-launch boundaries:
 //
-//   GroupView -> BindingMaterializer -> CollectiveBindingPublisher
-//                                           |
-//   API -> collective dispatch -------------+-> Binding
-//              |                                  |
-//              `-> Invocation --------------------+-> GroupCollectiveRuntime
+//   GroupView -> PlanBuilder -> CollectivePlanPublisher
+//                                    |
+//   API -> collective dispatch ------+-> PlanHandle
+//              |                           |
+//              `-> Invocation -------------+-> GroupCollectiveRuntime
 //                                                         |             |
 //                                                         v             v
 //                                                   ResourcePool ProgressEngine
@@ -37,9 +37,9 @@ namespace mooncake {
 //
 //   context -> operation executor -> algorithm -> transport route
 //
-// Materializers may inspect GroupView and process link managers. Everything
-// below CollectiveKernelContext is group-local and sees only published kernel
-// plans, raw kernel resources and InGroupRank peer bindings.
+// Plan builders see only ordered active ranks and group-local peer routes.
+// Everything below CollectiveKernelContext sees only published kernel plans,
+// raw kernel resources and InGroupRank peer routes.
 
 // One runtime per communicator and shared by all collective plugins. The first
 // vertical slice registers only AllReduce; the admission, lane, graph and
@@ -55,7 +55,7 @@ class GroupCollectiveRuntime {
     ~GroupCollectiveRuntime() noexcept;
 
     PGResult<void> execute(CollectiveInvocation& invocation,
-                           CollectiveBinding binding, uint64_t view_epoch,
+                           CollectivePlanHandle plan, uint64_t view_epoch,
                            cudaStream_t stream, int32_t* failed_ranks_hint,
                            size_t failed_ranks_hint_count);
 
@@ -79,7 +79,7 @@ class GroupCollectiveRuntime {
           timeout_device_ticks_(timeout_device_ticks) {}
 
     CollectiveKernelContext makeKernelContext(
-        const CollectiveResourceLease& resources, CollectiveBinding binding,
+        const CollectiveResourceLease& resources, CollectivePlanHandle plan,
         uint64_t failure_target_id) const;
     PGResult<std::shared_ptr<TrackedCollective>> acquireTrackedCollective(
         std::optional<uint64_t> capture_id, cudaStream_t capture_stream);

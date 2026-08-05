@@ -16,17 +16,20 @@ namespace mooncake {
 struct CollectiveArenaView;
 namespace device {
 class P2pPeerMapping;
-}
+class RdmaTransport;
+}  // namespace device
 
-struct DeviceP2pHandle {
+struct DeviceP2pLink {
+    // Owns mapped_arena_base.
     std::shared_ptr<device::P2pPeerMapping> mapping;
     void* mapped_arena_base = nullptr;
 };
 
 // The indices are opaque slots owned by TE's device RDMA implementation. They
 // are never used for group rank arithmetic.
-struct DeviceRdmaHandle {
-    std::shared_ptr<void> keepalive;
+struct DeviceRdmaLink {
+    // Owns qp_contexts and remote_keys.
+    std::shared_ptr<device::RdmaTransport> transport;
     void* qp_contexts = nullptr;
     const uint32_t* remote_keys = nullptr;
     int32_t local_peer_index = -1;
@@ -38,7 +41,8 @@ struct DeviceRdmaHandle {
 // Process-level owner of device mappings and QPs. Concrete observations are
 // keyed by (local device, global peer), while AgentStateMachine receives one
 // process-level Device reachability contribution aggregated across devices.
-// Groups retain immutable handles selected for their exact local device.
+// GroupPeerRoutes retains the resolved resources selected for one local
+// device and view.
 class DeviceLinkManager {
    public:
     DeviceLinkManager() = default;
@@ -50,12 +54,12 @@ class DeviceLinkManager {
     void observeGroupView(const GroupView& view,
                           const std::vector<uint64_t>& rank_epochs);
 
-    std::optional<DeviceP2pHandle> resolveP2p(DeviceId source_device,
+    std::optional<DeviceP2pLink> resolveP2p(DeviceId source_device,
+                                            GlobalRank peer,
+                                            uint64_t arena_generation) const;
+    std::optional<DeviceRdmaLink> resolveRdma(DeviceId source_device,
                                               GlobalRank peer,
                                               uint64_t arena_generation) const;
-    std::optional<DeviceRdmaHandle> resolveRdma(
-        DeviceId source_device, GlobalRank peer,
-        uint64_t arena_generation) const;
 
     void disconnect(GlobalRank peer);
     void clear();

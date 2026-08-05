@@ -28,8 +28,8 @@
 
 namespace mooncake {
 
-class CollectiveBindingPublisher;
-class GroupCollectiveBindings;
+class CollectivePlanPublisher;
+class CollectivePlanRegistry;
 class GroupCollectiveRuntime;
 class CollectiveLanePool;
 
@@ -319,15 +319,15 @@ class MooncakeCommunicator {
 
     // Only the dispatch discriminator and epoch cross from control-plane view
     // application to the application thread. GroupView, membership and global
-    // ranks are materialized into stable bindings and never captured by an
+    // ranks are projected into published plans and never captured by an
     // executor.
     mutable std::mutex collective_policy_mutex_;
     AllReduceProtocol allreduce_protocol_ = AllReduceProtocol::Legacy;
     uint64_t collective_view_epoch_ = 0;
 
     std::unique_ptr<CollectiveLanePool> collective_lanes_;
-    std::unique_ptr<GroupCollectiveBindings> collective_bindings_;
-    CollectiveBindingPublisher* allreduce_publisher_ = nullptr;
+    std::unique_ptr<CollectivePlanRegistry> collective_plan_registry_;
+    CollectivePlanPublisher* allreduce_plan_publisher_ = nullptr;
     std::unique_ptr<GroupCollectiveRuntime> collective_runtime_;
     std::optional<GroupEndpointV2> collective_endpoint_;
 

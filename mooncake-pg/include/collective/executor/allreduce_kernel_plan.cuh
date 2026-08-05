@@ -3,7 +3,7 @@
 
 #include <cstdint>
 
-#include "collective/transport/peer_binding.h"
+#include "collective/transport/peer_route.h"
 #include "collective/types.h"
 
 namespace mooncake {
@@ -16,8 +16,8 @@ enum class AllReduceAlgorithm : uint8_t {
 struct FlatRingKernelPlan {
     uint32_t participant_count = 0;
     uint32_t self_ordinal = 0;
-    CollectivePeerBinding predecessor;
-    CollectivePeerBinding successor;
+    PeerRoute predecessor;
+    PeerRoute successor;
 };
 
 // The topology ABI intentionally remains empty in the first vertical slice.
@@ -34,7 +34,7 @@ struct AllReduceBucketKernelPlan {
 
 inline constexpr uint32_t kMaxAllReduceSizeBuckets = 8;
 
-// Replay-time plan selected through CollectiveBinding.
+// Replay-time plan selected through CollectivePlanHandle.
 // Captured kernel arguments retain its stable envelope, never a GroupView or
 // frozen participant set.
 struct alignas(64) AllReduceKernelPlan {

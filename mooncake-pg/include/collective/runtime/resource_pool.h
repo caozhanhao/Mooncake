@@ -69,7 +69,7 @@ class CollectiveResourceLease {
 };
 
 // Eager calls lease and graphs pin the same data-plane resource. Every lease
-// includes a host command because a later authoritative binding may move a
+// includes a host command because a later authoritative plan may move a
 // captured collective between device and host routes. Device-only attempts do
 // not touch that command.
 class CollectiveResourcePool {

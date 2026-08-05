@@ -15,7 +15,7 @@
 #include "error_types.h"
 #include "gpu_runtime.h"
 #include "memory_location.h"
-#include "collective/binding/allreduce_binding.h"
+#include "collective/plan/allreduce_plan_builder.h"
 #include "collective/operation/allreduce.h"
 #include "collective/runtime/collective_runtime.h"
 
@@ -409,13 +409,12 @@ PGResult<void> MooncakeCommunicator::initializePlannedCollectives(
 
     const auto& control_layout = collective_lanes_->layout();
     const uint32_t lane_count = control_layout.lane_count;
-    collective_bindings_ =
-        std::make_unique<GroupCollectiveBindings>(device_index_, lane_count);
-    PG_TRY(allreduce_publisher_,
-           collective_bindings_->add(
-               std::make_unique<AllReduceBindingMaterializer>(
-                   &context_.device_link_manager, &context_.link_manager,
-                   device_index_, rank_)));
+    collective_plan_registry_ = std::make_unique<CollectivePlanRegistry>(
+        context_.device_link_manager, context_.link_manager, device_index_,
+        rank_, lane_count);
+    PG_TRY(allreduce_plan_publisher_,
+           collective_plan_registry_->addBuilder(
+               std::make_unique<AllReducePlanBuilder>()));
     CollectiveFailureReportCallback failure_report_callback =
         [this](InGroupRank failed_peer) {
             return reportCollectiveFailure(failed_peer);
@@ -441,7 +440,7 @@ PGResult<void> MooncakeCommunicator::initializePlannedCollectives(
         .control_layout = collective_lanes_->layout(),
     };
     if (!arena.p2p_handle.empty()) {
-        collective_endpoint_->device_p2p = P2pArenaBinding{
+        collective_endpoint_->device_p2p = P2pArenaDescriptor{
             .opaque_handle = arena.p2p_handle,
         };
     }
@@ -681,8 +680,8 @@ PGResult<void> MooncakeCommunicator::initialize(
                          << meta_->group_id << ": " << planned.error().message
                          << "; retaining the legacy collective protocol";
             collective_runtime_.reset();
-            allreduce_publisher_ = nullptr;
-            collective_bindings_.reset();
+            allreduce_plan_publisher_ = nullptr;
+            collective_plan_registry_.reset();
             collective_endpoint_.reset();
             if (collective_lanes_) {
                 (void)collective_lanes_->close(true);
@@ -948,14 +947,14 @@ PGResult<void> MooncakeCommunicator::allReduceGpu(
         }
         if (protocol == AllReduceProtocol::Planned) {
             PG_VALIDATE_STATE(
-                collective_runtime_ && allreduce_publisher_,
+                collective_runtime_ && allreduce_plan_publisher_,
                 "Coordinator selected planned AllReduce but its local "
                 "runtime is unavailable");
-            PG_TRY(auto binding, allreduce_publisher_->binding(view_epoch));
+            PG_TRY(auto plan, allreduce_plan_publisher_->handle(view_epoch));
             PG_TRY(auto invocation,
                    AllReduceInvocation::create(send_buffer, recv_buffer, count,
                                                datatype, op));
-            return collective_runtime_->execute(invocation, binding, view_epoch,
+            return collective_runtime_->execute(invocation, plan, view_epoch,
                                                 stream, failed_ranks_hint,
                                                 failed_ranks_hint_count);
         }
@@ -1434,13 +1433,13 @@ PGResult<void> MooncakeCommunicator::shutdown() {
     if (isValidGroup()) agent_.detachCommunicator(meta_->group_id);
 
     if (has_unsafe_collective) {
-        if (collective_bindings_) {
-            collective_bindings_->retainForProcessLifetime();
+        if (collective_plan_registry_) {
+            collective_plan_registry_->retainForProcessLifetime();
         }
     }
     collective_runtime_.reset();
-    allreduce_publisher_ = nullptr;
-    collective_bindings_.reset();
+    allreduce_plan_publisher_ = nullptr;
+    collective_plan_registry_.reset();
     collective_endpoint_.reset();
 
     // Phase 1: Drain P2P tasks.
@@ -1782,13 +1781,13 @@ void MooncakeCommunicator::applyViewUpdate(
         meta_->extensionMode.store(next_mode, std::memory_order_release);
     }
 
-    if (collective_bindings_) {
-        auto applied = collective_bindings_->apply(view);
+    if (collective_plan_registry_) {
+        auto applied = collective_plan_registry_->apply(view);
         if (!applied.has_value()) {
-            // materialize() publishes an explicit invalid state before
+            // The plan builder publishes an explicit invalid state before
             // returning this error. Planned execution therefore fails closed;
             // no rank silently selects legacy or a different local route.
-            LOG(WARNING) << "Failed to materialize collective view "
+            LOG(WARNING) << "Failed to build collective plan for view "
                          << view.epoch << " for group " << view.group_id << ": "
                          << applied.error().message;
         }

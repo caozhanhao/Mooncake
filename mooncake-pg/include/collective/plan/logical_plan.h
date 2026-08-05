@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_COLLECTIVE_PLAN_H
-#define MOONCAKE_PG_COLLECTIVE_PLAN_H
+#ifndef MOONCAKE_PG_COLLECTIVE_PLAN_LOGICAL_PLAN_H
+#define MOONCAKE_PG_COLLECTIVE_PLAN_LOGICAL_PLAN_H
 
 #include <cstdint>
 #include <limits>
@@ -10,7 +10,7 @@ namespace mooncake {
 
 // Coordinator-owned logical policy. Plans contain only choices that must be
 // identical on every rank. Membership roles, routes, and local resources are
-// materialized by each Agent from the authoritative GroupView.
+// resolved by each Agent from the authoritative GroupView.
 struct FlatRingPlan {
     bool operator==(const FlatRingPlan&) const = default;
 };
@@ -49,4 +49,4 @@ struct CollectivePlanSet {
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_COLLECTIVE_PLAN_H
+#endif  // MOONCAKE_PG_COLLECTIVE_PLAN_LOGICAL_PLAN_H
