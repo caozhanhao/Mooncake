@@ -32,7 +32,7 @@ struct CollectiveFailureReport {
     uint32_t state = static_cast<uint32_t>(CollectiveFailureState::Idle);
     int32_t error_code = 0;
     InGroupRank failed_peer = -1;
-    uint64_t failure_cookie = 0;
+    uint64_t failure_target_id = 0;
 };
 
 // Common host-visible state for device and host transports. It is not owned by

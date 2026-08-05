@@ -411,7 +411,7 @@ PGResult<void> MooncakeCommunicator::initializePlannedCollectives(
     const uint32_t lane_count = control_layout.lane_count;
     collective_bindings_ =
         std::make_unique<GroupCollectiveBindings>(device_index_, lane_count);
-    PG_TRY(allreduce_binding_,
+    PG_TRY(allreduce_publisher_,
            collective_bindings_->add(
                std::make_unique<AllReduceBindingMaterializer>(
                    &context_.device_link_manager, &context_.link_manager,
@@ -681,7 +681,7 @@ PGResult<void> MooncakeCommunicator::initialize(
                          << meta_->group_id << ": " << planned.error().message
                          << "; retaining the legacy collective protocol";
             collective_runtime_.reset();
-            allreduce_binding_ = nullptr;
+            allreduce_publisher_ = nullptr;
             collective_bindings_.reset();
             collective_endpoint_.reset();
             if (collective_lanes_) {
@@ -948,17 +948,16 @@ PGResult<void> MooncakeCommunicator::allReduceGpu(
         }
         if (protocol == AllReduceProtocol::Planned) {
             PG_VALIDATE_STATE(
-                collective_runtime_ && allreduce_binding_,
+                collective_runtime_ && allreduce_publisher_,
                 "Coordinator selected planned AllReduce but its local "
                 "runtime is unavailable");
-            PG_TRY(auto binding_view,
-                   allreduce_binding_->deviceView(view_epoch));
+            PG_TRY(auto binding, allreduce_publisher_->binding(view_epoch));
             PG_TRY(auto invocation,
                    AllReduceInvocation::create(send_buffer, recv_buffer, count,
                                                datatype, op));
-            return collective_runtime_->execute(
-                invocation, binding_view, view_epoch, stream, failed_ranks_hint,
-                failed_ranks_hint_count);
+            return collective_runtime_->execute(invocation, binding, view_epoch,
+                                                stream, failed_ranks_hint,
+                                                failed_ranks_hint_count);
         }
     }
 
@@ -1440,7 +1439,7 @@ PGResult<void> MooncakeCommunicator::shutdown() {
         }
     }
     collective_runtime_.reset();
-    allreduce_binding_ = nullptr;
+    allreduce_publisher_ = nullptr;
     collective_bindings_.reset();
     collective_endpoint_.reset();
 

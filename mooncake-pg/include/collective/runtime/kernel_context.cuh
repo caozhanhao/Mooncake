@@ -3,7 +3,7 @@
 
 #include <cstdint>
 
-#include "collective/binding/binding_view.cuh"
+#include "collective/binding/binding.cuh"
 #include "collective/transport/kernel_resources.cuh"
 
 namespace mooncake {
@@ -13,8 +13,8 @@ namespace mooncake {
 struct CollectiveKernelContext {
     CollectiveKernelResources resources;
     uint32_t lane_index = 0;
-    uint64_t failure_cookie = 0;
-    CollectiveBindingView binding;
+    uint64_t failure_target_id = 0;
+    CollectiveBinding binding;
 };
 
 }  // namespace mooncake

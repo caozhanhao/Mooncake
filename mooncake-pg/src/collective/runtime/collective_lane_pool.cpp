@@ -44,8 +44,8 @@ PGResult<std::unique_ptr<CollectiveLanePool>> CollectiveLanePool::create(
     uint32_t lane_count) {
     PG_TRY(auto layout, buildControlLayout(lane_count));
     PG_TRY(auto control,
-           buffers->tryAcquire(device, layout.total_bytes, layout.alignment,
-                               te_location, engine));
+           buffers->acquire(device, layout.total_bytes, layout.alignment,
+                            te_location, engine));
     auto control_rollback = makeScopeExit(
         [&]() noexcept { (void)buffers->release(*control, true); });
     const GpuDeviceGuard guard(device);
@@ -55,7 +55,7 @@ PGResult<std::unique_ptr<CollectiveLanePool>> CollectiveLanePool::create(
         new CollectiveLanePool(buffers, std::move(control), std::move(layout)));
 }
 
-PGResult<CollectiveLaneLease> CollectiveLanePool::tryAcquire(
+PGResult<CollectiveLaneLease> CollectiveLanePool::acquire(
     uint32_t preferred_lane) {
     std::lock_guard<std::mutex> lock(mutex_);
     PG_VALIDATE_STATE(!closed_, "collective lane pool is closed");

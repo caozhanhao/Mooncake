@@ -161,12 +161,10 @@ void CollectiveBufferPool::releaseArena(RegisteredArena& arena) noexcept {
     }
 }
 
-PGResult<std::unique_ptr<CollectiveBufferLease>>
-CollectiveBufferPool::tryAcquire(DeviceId device, uint64_t bytes,
-                                 uint64_t alignment,
-                                 const std::string& te_location,
-                                 TransferEngine* engine,
-                                 const CollectiveBufferPoolConfig& config) {
+PGResult<std::unique_ptr<CollectiveBufferLease>> CollectiveBufferPool::acquire(
+    DeviceId device, uint64_t bytes, uint64_t alignment,
+    const std::string& te_location, TransferEngine* engine,
+    const CollectiveBufferPoolConfig& config) {
     PG_VALIDATE_ARG(bytes != 0 && alignment != 0,
                     "invalid collective buffer allocation");
     auto lease =

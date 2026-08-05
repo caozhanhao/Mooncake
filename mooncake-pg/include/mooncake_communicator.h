@@ -28,7 +28,7 @@
 
 namespace mooncake {
 
-class CollectiveBinding;
+class CollectiveBindingPublisher;
 class GroupCollectiveBindings;
 class GroupCollectiveRuntime;
 class CollectiveLanePool;
@@ -327,7 +327,7 @@ class MooncakeCommunicator {
 
     std::unique_ptr<CollectiveLanePool> collective_lanes_;
     std::unique_ptr<GroupCollectiveBindings> collective_bindings_;
-    CollectiveBinding* allreduce_binding_ = nullptr;
+    CollectiveBindingPublisher* allreduce_publisher_ = nullptr;
     std::unique_ptr<GroupCollectiveRuntime> collective_runtime_;
     std::optional<GroupEndpointV2> collective_endpoint_;
 

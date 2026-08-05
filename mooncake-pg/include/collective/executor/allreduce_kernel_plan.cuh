@@ -34,7 +34,7 @@ struct AllReduceBucketKernelPlan {
 
 inline constexpr uint32_t kMaxAllReduceSizeBuckets = 8;
 
-// Replay-time plan selected through CollectiveBindingView.
+// Replay-time plan selected through CollectiveBinding.
 // Captured kernel arguments retain its stable envelope, never a GroupView or
 // frozen participant set.
 struct alignas(64) AllReduceKernelPlan {

@@ -31,9 +31,9 @@ uint64_t collectiveBufferBytes() {
 
 }  // namespace
 
-PGResult<CollectiveResourceLease> CollectiveResourcePool::tryAcquire(
+PGResult<CollectiveResourceLease> CollectiveResourcePool::acquire(
     uint32_t preferred_lane) {
-    PG_TRY(auto lane, lanes_->tryAcquire(preferred_lane));
+    PG_TRY(auto lane, lanes_->acquire(preferred_lane));
     auto lane_rollback =
         makeScopeExit([&]() noexcept { (void)lanes_->release(lane, true); });
     auto control = control_pool_->tryAcquire();
@@ -44,8 +44,8 @@ PGResult<CollectiveResourceLease> CollectiveResourcePool::tryAcquire(
     auto control_rollback = makeScopeExit(
         [&]() noexcept { (void)control_pool_->release(*control, true); });
     PG_TRY(auto buffer,
-           buffer_pool_->tryAcquire(device_, collectiveBufferBytes(),
-                                    kBufferAlignment, te_location_, engine_));
+           buffer_pool_->acquire(device_, collectiveBufferBytes(),
+                                 kBufferAlignment, te_location_, engine_));
     auto buffer_rollback = makeScopeExit(
         [&]() noexcept { (void)buffer_pool_->release(*buffer, true); });
 

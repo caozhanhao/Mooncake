@@ -26,10 +26,10 @@ std::optional<CollectiveFailureHandler::Claim> CollectiveFailureHandler::claim(
         const auto target = std::find_if(
             collective->failure_targets.begin(),
             collective->failure_targets.end(), [&](const auto& candidate) {
-                return candidate.failure_cookie == failure.failure_cookie;
+                return candidate.failure_target_id == failure.failure_target_id;
             });
         PG_ASSERT(target != collective->failure_targets.end(),
-                  "collective failure cookie has no tracked target");
+                  "collective failure report has no tracked target");
         return Claim{
             .collective = collective,
             .target = *target,

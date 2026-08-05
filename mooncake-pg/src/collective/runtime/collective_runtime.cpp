@@ -84,7 +84,7 @@ GroupCollectiveRuntime::acquireTrackedCollective(
         }
     }
 
-    PG_TRY(auto resources, resource_pool_.tryAcquire(next_lane_));
+    PG_TRY(auto resources, resource_pool_.acquire(next_lane_));
     next_lane_ = (resources.lane.index + 1) % lanes_->layout().lane_count;
     auto collective = std::make_shared<TrackedCollective>(std::move(resources));
     if (capture_id) {
@@ -122,8 +122,8 @@ void GroupCollectiveRuntime::rollbackEmptyCapturedCollective(
 }
 
 CollectiveKernelContext GroupCollectiveRuntime::makeKernelContext(
-    const CollectiveResourceLease& resources,
-    CollectiveBindingView binding_view, uint64_t failure_cookie) const {
+    const CollectiveResourceLease& resources, CollectiveBinding binding,
+    uint64_t failure_target_id) const {
     const auto& layout = CollectiveResourcePool::bufferLayout();
     const auto& control_layout = lanes_->layout().lanes[resources.lane.index];
     return CollectiveKernelContext{
@@ -148,15 +148,17 @@ CollectiveKernelContext GroupCollectiveRuntime::makeKernelContext(
                 .timeout_device_ticks = timeout_device_ticks_,
             },
         .lane_index = resources.lane.index,
-        .failure_cookie = failure_cookie,
-        .binding = binding_view,
+        .failure_target_id = failure_target_id,
+        .binding = binding,
     };
 }
 
-PGResult<void> GroupCollectiveRuntime::execute(
-    CollectiveInvocation& invocation, CollectiveBindingView binding_view,
-    uint64_t view_epoch, cudaStream_t stream, int32_t* failed_ranks_hint,
-    size_t failed_ranks_hint_count) {
+PGResult<void> GroupCollectiveRuntime::execute(CollectiveInvocation& invocation,
+                                               CollectiveBinding binding,
+                                               uint64_t view_epoch,
+                                               cudaStream_t stream,
+                                               int32_t* failed_ranks_hint,
+                                               size_t failed_ranks_hint_count) {
     PG_VALIDATE_STATE(accepting_.load(std::memory_order_acquire),
                       "collective runtime is stopping");
     PG_VALIDATE_ARG(failed_ranks_hint, "failed-ranks hint is null");
@@ -173,11 +175,11 @@ PGResult<void> GroupCollectiveRuntime::execute(
 
     PG_TRY(auto collective, acquireTrackedCollective(capture_id, stream));
 
-    const uint64_t failure_cookie = next_failure_cookie_++;
+    const uint64_t failure_target_id = next_failure_target_id_++;
     const auto context =
-        makeKernelContext(collective->resources, binding_view, failure_cookie);
+        makeKernelContext(collective->resources, binding, failure_target_id);
     CollectiveFailureTarget failure_target{
-        .failure_cookie = failure_cookie,
+        .failure_target_id = failure_target_id,
         .failed_ranks_hint = failed_ranks_hint,
         .failed_ranks_hint_count = failed_ranks_hint_count,
     };

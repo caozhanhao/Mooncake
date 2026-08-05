@@ -61,7 +61,7 @@ class CollectiveResourcePool {
           te_location_(std::move(te_location)),
           engine_(engine) {}
 
-    PGResult<CollectiveResourceLease> tryAcquire(uint32_t preferred_lane);
+    PGResult<CollectiveResourceLease> acquire(uint32_t preferred_lane);
     static const CollectiveBufferLayout& bufferLayout();
     bool release(const CollectiveResourceLease& resources, bool resource_idle);
 

@@ -111,7 +111,7 @@ inline __device__ void reportCollectiveFailureAndWait(
         auto& failure = control.failure;
         failure.error_code = control.first_error_code;
         failure.failed_peer = control.failed_peer;
-        failure.failure_cookie = context.failure_cookie;
+        failure.failure_target_id = context.failure_target_id;
         mc_st_release_u32(&failure.state, static_cast<uint32_t>(
                                               CollectiveFailureState::Pending));
         while (static_cast<CollectiveFailureState>(mc_ld_acquire(

@@ -24,9 +24,9 @@ namespace mooncake {
 
 // Host control and kernel-launch boundaries:
 //
-//   GroupView -> BindingMaterializer -> CollectiveBinding
+//   GroupView -> BindingMaterializer -> CollectiveBindingPublisher
 //                                           |
-//   API -> collective dispatch -------------+-> BindingView
+//   API -> collective dispatch -------------+-> Binding
 //              |                                  |
 //              `-> Invocation --------------------+-> GroupCollectiveRuntime
 //                                                         |             |
@@ -55,9 +55,8 @@ class GroupCollectiveRuntime {
     ~GroupCollectiveRuntime() noexcept;
 
     PGResult<void> execute(CollectiveInvocation& invocation,
-                           CollectiveBindingView binding_view,
-                           uint64_t view_epoch, cudaStream_t stream,
-                           int32_t* failed_ranks_hint,
+                           CollectiveBinding binding, uint64_t view_epoch,
+                           cudaStream_t stream, int32_t* failed_ranks_hint,
                            size_t failed_ranks_hint_count);
 
     void stopAccepting();
@@ -80,8 +79,8 @@ class GroupCollectiveRuntime {
           timeout_device_ticks_(timeout_device_ticks) {}
 
     CollectiveKernelContext makeKernelContext(
-        const CollectiveResourceLease& resources,
-        CollectiveBindingView binding_view, uint64_t failure_cookie) const;
+        const CollectiveResourceLease& resources, CollectiveBinding binding,
+        uint64_t failure_target_id) const;
     PGResult<std::shared_ptr<TrackedCollective>> acquireTrackedCollective(
         std::optional<uint64_t> capture_id, cudaStream_t capture_stream);
     void trackCollective(const std::shared_ptr<TrackedCollective>& collective,
@@ -105,7 +104,7 @@ class GroupCollectiveRuntime {
     std::mutex admission_mutex_;
     uint32_t next_lane_ = 0;
     std::optional<uint64_t> lane_view_epoch_;
-    uint64_t next_failure_cookie_ = 1;
+    uint64_t next_failure_target_id_ = 1;
     std::unordered_map<uint64_t, CapturedCollective> captured_collectives_;
     std::atomic<bool> accepting_{true};
 };

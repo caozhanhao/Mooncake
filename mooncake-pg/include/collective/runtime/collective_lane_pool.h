@@ -30,7 +30,7 @@ class CollectiveLanePool {
     const CollectiveControlLayout& layout() const { return layout_; }
     void* controlBase() const { return control_->base(); }
 
-    PGResult<CollectiveLaneLease> tryAcquire(uint32_t preferred_lane);
+    PGResult<CollectiveLaneLease> acquire(uint32_t preferred_lane);
     bool release(const CollectiveLaneLease& lane, bool resource_idle);
     bool close(bool resource_idle);
 

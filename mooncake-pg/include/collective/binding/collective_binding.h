@@ -10,7 +10,7 @@
 #include <variant>
 #include <vector>
 
-#include "collective/binding/binding_view.cuh"
+#include "collective/binding/binding.cuh"
 #include "error_types.h"
 
 namespace mooncake {
@@ -45,19 +45,20 @@ class CollectiveBindingMaterializer {
         const GroupView& view) const = 0;
 };
 
-// One communicator-scoped binding for one collective implementation. It owns
-// the stable device publication read by every invocation of that collective.
-class CollectiveBinding {
+// Owns and publishes one communicator-scoped binding for one collective
+// implementation. Every invocation reads the same stable device publication.
+class CollectiveBindingPublisher {
    public:
-    PGResult<CollectiveBindingView> deviceView(uint64_t view_epoch) const;
+    PGResult<CollectiveBinding> binding(uint64_t view_epoch) const;
 
-    CollectiveBinding(const CollectiveBinding&) = delete;
-    CollectiveBinding& operator=(const CollectiveBinding&) = delete;
+    CollectiveBindingPublisher(const CollectiveBindingPublisher&) = delete;
+    CollectiveBindingPublisher& operator=(const CollectiveBindingPublisher&) =
+        delete;
 
    private:
     friend class GroupCollectiveBindings;
 
-    CollectiveBinding(
+    CollectiveBindingPublisher(
         std::unique_ptr<CollectiveBindingMaterializer> materializer,
         size_t slot_bytes)
         : materializer_(std::move(materializer)), slot_bytes_(slot_bytes) {}
@@ -84,7 +85,7 @@ class GroupCollectiveBindings {
         : device_(device), control_lane_count_(control_lane_count) {}
     ~GroupCollectiveBindings() noexcept;
 
-    PGResult<CollectiveBinding*> add(
+    PGResult<CollectiveBindingPublisher*> add(
         std::unique_ptr<CollectiveBindingMaterializer> materializer);
     PGResult<void> apply(const GroupView& view);
 
@@ -94,14 +95,14 @@ class GroupCollectiveBindings {
     GroupCollectiveBindings& operator=(const GroupCollectiveBindings&) = delete;
 
    private:
-    PGResult<void> allocate(CollectiveBinding& binding);
-    void publish(CollectiveBinding& binding, const void* kernel_plan,
+    PGResult<void> allocate(CollectiveBindingPublisher& publisher);
+    void publish(CollectiveBindingPublisher& publisher, const void* kernel_plan,
                  std::vector<std::shared_ptr<void>> resources);
-    void release(CollectiveBinding& binding) noexcept;
+    void release(CollectiveBindingPublisher& publisher) noexcept;
 
     DeviceId device_ = kInvalidDeviceId;
     uint32_t control_lane_count_ = 0;
-    std::vector<std::unique_ptr<CollectiveBinding>> bindings_;
+    std::vector<std::unique_ptr<CollectiveBindingPublisher>> publishers_;
     std::mutex mutex_;
     bool retained_ = false;
 };

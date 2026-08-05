@@ -64,7 +64,7 @@ class CollectiveBufferPool {
     CollectiveBufferPool() = default;
     ~CollectiveBufferPool() noexcept;
 
-    PGResult<std::unique_ptr<CollectiveBufferLease>> tryAcquire(
+    PGResult<std::unique_ptr<CollectiveBufferLease>> acquire(
         DeviceId device, uint64_t bytes, uint64_t alignment,
         const std::string& te_location, TransferEngine* engine,
         const CollectiveBufferPoolConfig& config = {});
