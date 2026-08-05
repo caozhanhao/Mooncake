@@ -30,6 +30,7 @@
 // The header intentionally avoids including cuda_alike.h so it can be included
 // from pure C++ translation units.  Implementations include cuda_alike.h.
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -37,6 +38,16 @@
 
 namespace mooncake {
 namespace device {
+
+// Immutable mapping for one peer allocation. Unlike the EP rank table, this
+// object can be retained by one GroupView binding without later imports
+// mutating its address.
+class P2pPeerMapping {
+   public:
+    virtual ~P2pPeerMapping() = default;
+    virtual void* mappedBase() const = 0;
+    virtual size_t mappedBytes() const = 0;
+};
 
 // ---------------------------------------------------------------------------
 // P2pTransport
@@ -86,6 +97,11 @@ class P2pTransport {
     // succeeds.  On failure, sets all_peers_accessible to false.
     virtual bool verifyPeerAccess() = 0;
 };
+
+// Kept outside P2pTransport's vtable so existing users retain their ABI and
+// EP keeps its mutable table-oriented interface unchanged.
+std::shared_ptr<P2pPeerMapping> importP2pPeerBuffer(
+    const std::vector<int32_t>& opaque_handle);
 
 // ---------------------------------------------------------------------------
 // RdmaLocalMetadata — exchanged between ranks during IBGDA bootstrap.

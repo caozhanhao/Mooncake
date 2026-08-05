@@ -6,9 +6,10 @@
 
 #include <glog/logging.h>
 
-#include "mooncake_communicator.h"
+#include "control_plane/device_link_manager.h"
 #include "control_plane/link_manager.h"
 #include "control_plane/rpc_runtime.h"
+#include "mooncake_communicator.h"
 #include "pg_utils.h"
 
 namespace mooncake {
@@ -53,10 +54,12 @@ void AgentRpcServiceImpl::onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
 AgentHost::AgentHost(std::string coordinator_addr, const std::string& host_ip,
                      GlobalRank rank, int max_world_size,
                      LinkManager& link_manager,
+                     DeviceLinkManager& device_link_manager,
                      int64_t fault_reconciliation_window_us)
     : agent_(rank, max_world_size),
       executor_("AgentHost"),
       link_manager_(link_manager),
+      device_link_manager_(device_link_manager),
       host_ip_(host_ip),
       rank_(rank),
       max_world_size_(max_world_size),
@@ -82,12 +85,16 @@ PGResult<void> AgentHost::start() {
     link_manager_.setEventCallback([this](TELinkUpEvent event) {
         if (shutdown_requested_.load(std::memory_order_acquire)) return;
         if (event.peer < 0 || event.peer >= max_world_size_) return;
-        LinkEvent link_event;
-        link_event.events.assign(max_world_size_, LinkEvent::EventType::None);
-        link_event.target_rank_epochs.assign(max_world_size_, 0);
-        link_event.events[event.peer] = LinkEvent::EventType::Success;
-        link_event.target_rank_epochs[event.peer] = event.target_rank_epoch;
-        pushLinkEvent(link_event);
+        pushLinkEvent(LinkEvent{{PeerLinkUpdate{
+            .peer = event.peer,
+            .target_rank_epoch = event.target_rank_epoch,
+            .provider = LinkProvider::Host,
+            .reachable = true,
+        }}});
+    });
+    device_link_manager_.setEventCallback([this](PeerLinkUpdate update) {
+        if (shutdown_requested_.load(std::memory_order_acquire)) return;
+        pushLinkEvent(LinkEvent{{std::move(update)}});
     });
 
     rpc_server_ = std::make_unique<RpcServer>(/*port=*/0, /*thread_num=*/2);
@@ -99,6 +106,7 @@ PGResult<void> AgentHost::start() {
     bool server_started = rpc_server_->start();
     if (!server_started) {
         link_manager_.setEventCallback(nullptr);
+        device_link_manager_.setEventCallback(nullptr);
         rpc_impl_.reset();
         rpc_server_.reset();
         return makePGError(PGErrorCode::SystemError,
@@ -116,6 +124,7 @@ void AgentHost::shutdown() {
     if (shutdown_requested_.exchange(true, std::memory_order_acq_rel)) return;
 
     link_manager_.setEventCallback(nullptr);
+    device_link_manager_.setEventCallback(nullptr);
     if (rpc_server_) rpc_server_->shutdown();
     // Finish operations that callers already submitted, including explicit
     // unregisterGroup calls, before releasing process-level rank ownership.
@@ -629,6 +638,7 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                 },
                 [this](const DisconnectLink& e) {
                     link_manager_.disconnect(e.peer);
+                    device_link_manager_.disconnect(e.peer);
                 },
                 [this](const RequestLinkHealthCheck& e) {
                     link_manager_.requestHealthCheck(e.peer);
@@ -672,10 +682,12 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                     for (int i = 0; i < max_world_size_; ++i) {
                         if (i != rank_) {
                             link_manager_.disconnect(i);
+                            device_link_manager_.disconnect(i);
                         }
                     }
                 },
                 [this](const ClearAllPeerMetadata&) {
+                    device_link_manager_.clear();
                     for (int i = 0; i < max_world_size_; ++i) {
                         if (i != rank_) {
                             link_manager_.publishLinkDown(i);
@@ -683,6 +695,8 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                     }
                 },
                 [this](const ApplyViewToCommunicator& e) {
+                    device_link_manager_.observeGroupView(e.view,
+                                                          e.rank_epochs);
                     withCommunicator(e.view.group_id, [&](auto communicator) {
                         communicator->applyViewUpdate(e.view, e.rank_states,
                                                       e.rank_epochs,

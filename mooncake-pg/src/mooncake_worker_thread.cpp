@@ -382,20 +382,17 @@ void MooncakeWorker::startWorker() {
                             }
                             if (has_any_attempted) {
                                 LinkEvent event;
-                                event.events.assign(kMaxNumRanks,
-                                                    LinkEvent::EventType::None);
-                                event.target_rank_epochs.assign(kMaxNumRanks,
-                                                                0);
                                 for (int j = 0; j < group->maxGroupSize; ++j) {
                                     const auto peer_global =
                                         group->rank_order[j];
                                     if (!hasAttempted(i, j)) continue;
-                                    event.events[peer_global] =
-                                        hasFailed(i, j)
-                                            ? LinkEvent::EventType::Failure
-                                            : LinkEvent::EventType::Success;
-                                    event.target_rank_epochs[peer_global] =
-                                        group->rankEpochs[peer_global];
+                                    event.updates.push_back(PeerLinkUpdate{
+                                        .peer = peer_global,
+                                        .target_rank_epoch =
+                                            group->rankEpochs[peer_global],
+                                        .provider = LinkProvider::Host,
+                                        .reachable = !hasFailed(i, j),
+                                    });
                                 }
                                 group->communicator->getAgent().pushLinkEvent(
                                     event);

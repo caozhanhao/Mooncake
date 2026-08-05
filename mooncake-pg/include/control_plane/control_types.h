@@ -6,6 +6,10 @@
 #include <string>
 #include <vector>
 
+#include "collective/endpoint.h"
+#include "collective/plan.h"
+#include "collective/types.h"
+
 namespace mooncake {
 
 // There are two rank namespaces that are easy to confuse:
@@ -16,7 +20,6 @@ namespace mooncake {
 //                   Used inside a single process group and mapped to a
 //                   GlobalRank through GroupView::rank_order.
 using GlobalRank = int32_t;
-using InGroupRank = int32_t;
 
 // Bootstrap ID: Backend type ("cpu:" or "device:") + PyTorch-assigned group_id.
 using GroupBootstrapId = std::string;
@@ -105,6 +108,7 @@ enum class GroupMemberState : uint8_t {
 struct GroupMember {
     GroupMemberState status = GroupMemberState::None;
     std::optional<GroupEndpointInfo> endpoint;
+    std::optional<GroupEndpointV2> endpoint_v2;
 
     bool isNone() const { return status == GroupMemberState::None; }
     bool isActive() const { return status == GroupMemberState::Active; }
@@ -118,6 +122,7 @@ struct GroupMember {
     }
     bool hasLeft() const { return status == GroupMemberState::Left; }
     bool hasEndpoint() const { return endpoint.has_value(); }
+    bool hasEndpointV2() const { return endpoint_v2.has_value(); }
 
     bool operator==(const GroupMember&) const = default;
 };
@@ -147,22 +152,37 @@ struct GroupView {
     int32_t max_group_size = 0;          // fixed in-group slot capacity
     std::vector<GlobalRank> rank_order;  // InGroupRank -> GlobalRank
     std::vector<GroupMember> members;    // indexed by GlobalRank
+    CollectivePlanSet collective_plans;
 
     bool operator==(const GroupView&) const = default;
 };
 
-struct LinkEvent {
-    enum class EventType : uint8_t {
-        None = 0,
-        Success = 1,
-        Failure = 2,
-    };
+// Process-level reachability after Agent merges independently owned host and
+// device link contributions. Concrete capabilities stay local to the Agent;
+// Coordinator only needs the consistent liveness graph.
+struct PeerLinkState {
+    uint64_t target_rank_epoch = 0;
+    bool reachable = false;
 
-    std::vector<EventType> events;
-    // The Coordinator-assigned epoch of the target rank observed by the
-    // event source.  This is parallel to events and prevents a late event for
-    // an old process incarnation from being attributed to its replacement.
-    std::vector<uint64_t> target_rank_epochs;
+    bool operator==(const PeerLinkState&) const = default;
+};
+
+enum class LinkProvider : uint8_t {
+    Host = 0,
+    Device,
+};
+
+struct PeerLinkUpdate {
+    GlobalRank peer = kInvalidGlobalRank;
+    uint64_t target_rank_epoch = 0;
+    LinkProvider provider = LinkProvider::Host;
+    bool reachable = false;
+
+    bool operator==(const PeerLinkUpdate&) const = default;
+};
+
+struct LinkEvent {
+    std::vector<PeerLinkUpdate> updates;
 };
 
 }  // namespace mooncake

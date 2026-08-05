@@ -341,12 +341,14 @@ void P2PProxy::handleFailedSendOp(SendOpContext& op_ctx) {
     const auto peer_global = meta_->rank_order[op_ctx.peer_rank_];
     const auto target_rank_epoch = meta_->rankEpochs[peer_global];
     if (meta_->communicator) {
-        LinkEvent event;
-        event.events.assign(kMaxNumRanks, LinkEvent::EventType::None);
-        event.target_rank_epochs.assign(kMaxNumRanks, 0);
-        event.events[peer_global] = LinkEvent::EventType::Failure;
-        event.target_rank_epochs[peer_global] = target_rank_epoch;
-        meta_->communicator->getAgent().pushLinkEvent(event);
+        meta_->communicator->getAgent().pushLinkEvent(LinkEvent{{
+            PeerLinkUpdate{
+                .peer = peer_global,
+                .target_rank_epoch = target_rank_epoch,
+                .provider = LinkProvider::Host,
+                .reachable = false,
+            },
+        }});
     }
     op_ctx.completion_->set_value();
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P SendOp to peer "
@@ -363,12 +365,14 @@ void P2PProxy::handleFailedRecvOp(RecvOpContext& op_ctx) {
     const auto peer_global = meta_->rank_order[op_ctx.peer_rank_];
     const auto target_rank_epoch = meta_->rankEpochs[peer_global];
     if (meta_->communicator) {
-        LinkEvent event;
-        event.events.assign(kMaxNumRanks, LinkEvent::EventType::None);
-        event.target_rank_epochs.assign(kMaxNumRanks, 0);
-        event.events[peer_global] = LinkEvent::EventType::Failure;
-        event.target_rank_epochs[peer_global] = target_rank_epoch;
-        meta_->communicator->getAgent().pushLinkEvent(event);
+        meta_->communicator->getAgent().pushLinkEvent(LinkEvent{{
+            PeerLinkUpdate{
+                .peer = peer_global,
+                .target_rank_epoch = target_rank_epoch,
+                .provider = LinkProvider::Host,
+                .reachable = false,
+            },
+        }});
     }
     op_ctx.completion_->set_value();
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P RecvOp from peer "

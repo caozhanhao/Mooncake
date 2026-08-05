@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "rpc.h"
+#include "control_plane/collective_policy.h"
 
 namespace mooncake {
 
@@ -138,13 +139,15 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         // Monotonically increasing version of the authoritative rank state.
         uint64_t rank_state_version = 0;
         std::chrono::steady_clock::time_point last_heartbeat;
-        std::vector<uint8_t> link_status;
+        std::vector<std::optional<PeerLinkState>> peer_links;
         uint64_t last_link_event_report_id = 0;
         uint64_t warmup_recv_addr = 0;
     };
 
     // Per-GlobalRank coordinator state.
     std::vector<RankInfo> ranks_;
+
+    CollectivePolicyBuilder collective_policy_;
 
     std::unordered_map<GroupId, GroupView> group_views_;
 
@@ -213,6 +216,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     std::unordered_set<GlobalRank> shutdown_pending_ranks_;
 
     static constexpr auto kHeartbeatTimeout = std::chrono::seconds(30);
+
+    void refreshCollectivePlans(GroupView& view) const;
+    void advanceGroupView(GroupView& view) const;
 
     bool invalidateAgentSession(GlobalRank rank);
 

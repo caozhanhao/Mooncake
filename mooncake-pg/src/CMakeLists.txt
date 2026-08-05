@@ -1,4 +1,6 @@
-set(_pg_device_source "${CMAKE_CURRENT_SOURCE_DIR}/mooncake_worker.cu")
+set(_pg_device_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/mooncake_worker.cu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/collective/executor/allreduce.cu")
 if(USE_CUDA)
   # Preserve the existing sm_80/sm_90 coverage unless the caller selects
   # architectures through CMake's standard variable or CUDAARCHS environment.
@@ -7,34 +9,21 @@ if(USE_CUDA)
     set(CMAKE_CUDA_ARCHITECTURES 80-real 90-real)
   endif()
   enable_language(CUDA)
-  set(_pg_device_input "${_pg_device_source}")
+  set(_pg_device_inputs ${_pg_device_sources})
 elseif(USE_MUSA OR USE_MACA)
-  set(_pg_device_object
-      "${CMAKE_CURRENT_BINARY_DIR}/mooncake_worker_device.o")
-  set(_pg_device_depfile
-      "${CMAKE_CURRENT_BINARY_DIR}/mooncake_worker_device.d")
   set(_pg_device_flags
       -std=c++20
       -O3
       --compiler-options=-fPIC
       -MMD
-      -MT "${_pg_device_object}"
-      -MF "${_pg_device_depfile}"
       "-I${CMAKE_CURRENT_SOURCE_DIR}/../include"
       "-I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include")
   set(_pg_device_dependencies
-      "${_pg_device_source}"
       "${CMAKE_CURRENT_SOURCE_DIR}/../include/mooncake_worker_kernels.cuh"
       "${CMAKE_CURRENT_SOURCE_DIR}/../include/error_types.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include/common.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include/cuda_alike.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include/transfer_engine.h")
-  set(_pg_depfile_argument)
-  if(CMAKE_GENERATOR MATCHES "^Ninja" OR
-     (CMAKE_GENERATOR MATCHES "Makefiles" AND
-      CMAKE_VERSION VERSION_GREATER_EQUAL 3.20))
-    set(_pg_depfile_argument DEPFILE "${_pg_device_depfile}")
-  endif()
 
   if(USE_MUSA)
     set(_pg_platform_name MUSA)
@@ -61,22 +50,46 @@ elseif(USE_MUSA OR USE_MACA)
             "USE_${_pg_platform_name}=ON requires the "
             "${_pg_platform_name} compiler (${_pg_device_compiler_name})")
   endif()
+  # Transfer Engine's device-side portability headers currently use the
+  # MOONCAKE_EP_USE_* selector for non-CUDA compilers.
   list(APPEND _pg_device_flags
        "-DUSE_${_pg_platform_name}"
+       "-DMOONCAKE_EP_USE_${_pg_platform_name}"
        ${_pg_platform_device_flags})
 
-  add_custom_command(
-    OUTPUT "${_pg_device_object}"
-    COMMAND "${_pg_device_compiler}" ${_pg_device_flags}
-            -c "${_pg_device_source}" -o "${_pg_device_object}"
-    DEPENDS ${_pg_device_dependencies}
-    ${_pg_depfile_argument}
-    COMMENT "Compiling the Mooncake PG ${_pg_platform_name} worker"
-    COMMAND_EXPAND_LISTS
-    VERBATIM)
-  set_source_files_properties("${_pg_device_object}"
-                              PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
-  set(_pg_device_input "${_pg_device_object}")
+  set(_pg_device_inputs)
+  foreach(_pg_device_source IN LISTS _pg_device_sources)
+    get_filename_component(_pg_device_stem "${_pg_device_source}" NAME_WE)
+    set(_pg_device_object
+        "${CMAKE_CURRENT_BINARY_DIR}/${_pg_device_stem}_device.o")
+    set(_pg_device_depfile
+        "${CMAKE_CURRENT_BINARY_DIR}/${_pg_device_stem}_device.d")
+    set(_pg_source_device_flags
+        ${_pg_device_flags}
+        -MT "${_pg_device_object}"
+        -MF "${_pg_device_depfile}")
+    set(_pg_depfile_argument)
+    if(CMAKE_GENERATOR MATCHES "^Ninja" OR
+       (CMAKE_GENERATOR MATCHES "Makefiles" AND
+        CMAKE_VERSION VERSION_GREATER_EQUAL 3.20))
+      set(_pg_depfile_argument DEPFILE "${_pg_device_depfile}")
+    endif()
+
+    add_custom_command(
+      OUTPUT "${_pg_device_object}"
+      COMMAND "${_pg_device_compiler}" ${_pg_source_device_flags}
+              -c "${_pg_device_source}" -o "${_pg_device_object}"
+      DEPENDS "${_pg_device_source}" ${_pg_device_dependencies}
+      ${_pg_depfile_argument}
+      COMMENT
+        "Compiling Mooncake PG ${_pg_platform_name} device source ${_pg_device_stem}"
+      COMMAND_EXPAND_LISTS
+      VERBATIM)
+    set_source_files_properties(
+      "${_pg_device_object}"
+      PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+    list(APPEND _pg_device_inputs "${_pg_device_object}")
+  endforeach()
 else()
   message(FATAL_ERROR
           "Mooncake PG currently requires one of USE_CUDA, USE_MUSA, or USE_MACA")
@@ -84,7 +97,7 @@ endif()
 
 # Keep the GPU fatbin out of the host core so auditwheel can safely repair the
 # core while the device library is added to the wheel afterwards.
-add_library(mooncake_pg_device SHARED "${_pg_device_input}")
+add_library(mooncake_pg_device SHARED ${_pg_device_inputs})
 target_include_directories(
   mooncake_pg_device
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
@@ -118,7 +131,21 @@ set_target_properties(
              BUILD_RPATH_USE_ORIGIN YES)
 
 add_library(mooncake_pg SHARED
+    collective/binding/allreduce_binding.cpp
+    collective/binding/collective_binding.cpp
+    collective/binding/group_binding.cpp
+    collective/buffer/collective_buffer_pool.cpp
+    collective/operation/allreduce.cpp
+    collective/runtime/collective_failure.cpp
+    collective/runtime/collective_lane_pool.cpp
+    collective/runtime/collective_progress.cpp
+    collective/runtime/collective_runtime.cpp
+    collective/runtime/control_pool.cpp
+    collective/runtime/resource_pool.cpp
+    collective/transport/host_transfer_proxy.cpp
     control_plane/link_manager.cpp
+    control_plane/device_link_manager.cpp
+    control_plane/collective_policy.cpp
     control_plane/coordinator.cpp
     control_plane/coordinator_host.cpp
     control_plane/agent.cpp

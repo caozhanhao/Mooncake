@@ -21,8 +21,19 @@ CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
     ranks_.resize(max_world_size_);
     endpoint_epochs_.assign(max_world_size_, 0);
     for (int r = 0; r < max_world_size_; ++r) {
-        ranks_[r].link_status.assign(max_world_size_, 0);
+        ranks_[r].peer_links.resize(max_world_size_);
     }
+}
+
+void CentralizedCoordinatorStateMachine::refreshCollectivePlans(
+    GroupView& view) const {
+    view.collective_plans = collective_policy_.build(view);
+}
+
+void CentralizedCoordinatorStateMachine::advanceGroupView(
+    GroupView& view) const {
+    ++view.epoch;
+    refreshCollectivePlans(view);
 }
 
 void CentralizedCoordinatorStateMachine::setFaultReconciliationWindow(
@@ -85,9 +96,9 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     // A new rank epoch invalidates both outgoing and incoming observations for
     // the previous incarnation. No old edge is allowed to make the replacement
     // Healthy before fresh, epoch-matched evidence arrives.
-    info.link_status.assign(max_world_size_, 0);
+    info.peer_links.assign(max_world_size_, std::nullopt);
     for (auto& peer : ranks_) {
-        peer.link_status[req.rank] = 0;
+        peer.peer_links[req.rank].reset();
     }
     info.last_link_event_report_id = 0;
 
@@ -109,9 +120,13 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
             member.endpoint = std::nullopt;
             view_changed = true;
         }
+        if (member.hasEndpointV2()) {
+            member.endpoint_v2 = std::nullopt;
+            view_changed = true;
+        }
 
         if (view_changed) {
-            view.epoch++;
+            advanceGroupView(view);
             result.effects.push_back(PushViewUpdate{view});
         }
     }
@@ -273,7 +288,7 @@ CentralizedCoordinatorStateMachine::handleConfirmReadyForActivation(
     }
 
     member.status = GroupMemberState::AwaitingActivation;
-    view.epoch++;
+    advanceGroupView(view);
     result.effects.push_back(PushViewUpdate{view});
     result.response.success = true;
     return result;
@@ -308,7 +323,8 @@ CentralizedCoordinatorStateMachine::handleUnregisterGroup(
 
     member.status = GroupMemberState::Left;
     member.endpoint = std::nullopt;
-    view.epoch++;
+    member.endpoint_v2 = std::nullopt;
+    advanceGroupView(view);
     rejectPendingProposals(req.group_id, req.rank, "target rank left the group",
                            result.effects);
     rejectPendingSyncs(req.group_id, req.rank, "rank left the group",
@@ -344,13 +360,21 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
             return result;
         }
 
+        const auto endpoint_epoch = ++endpoint_epochs_[req.rank];
+        auto endpoint = ep.endpoint;
+        endpoint.endpoint_epoch = endpoint_epoch;
+        auto endpoint_v2 = ep.endpoint_v2;
+        if (endpoint_v2.has_value()) {
+            endpoint_v2->endpoint_epoch = endpoint_epoch;
+        }
+
         auto& view = it->second;
         auto& member = view.members[req.rank];
-        member.endpoint = ep.endpoint_info;
-        member.endpoint->endpoint_epoch = ++endpoint_epochs_[req.rank];
+        member.endpoint = std::move(endpoint);
+        member.endpoint_v2 = std::move(endpoint_v2);
 
         if (member.isMember() && view.status == GroupStatus::Ready) {
-            view.epoch++;
+            advanceGroupView(view);
             result.effects.push_back(PushViewUpdate{view});
         }
     }
@@ -372,10 +396,10 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     return result;
 }
 
-// Update link_status from data-plane evidence. Negative transitions open the
-// shared reconciliation window; the healthy-set and membership decision is
-// deferred until that window closes. Positive-only transitions are applied
-// immediately only when no reconciliation is already in progress.
+// Update the merged link graph from data-plane evidence. Negative transitions
+// open the shared reconciliation window; the healthy-set and membership
+// decision is deferred until that window closes. Positive-only transitions are
+// applied immediately only when no reconciliation is already in progress.
 CoordinatorApplyResult<LinkEventReportAck>
 CentralizedCoordinatorStateMachine::handleLinkEventReport(
     const LinkEventReport& req) {
@@ -422,10 +446,8 @@ CentralizedCoordinatorStateMachine::processLinkEventReport(
         return std::nullopt;
     }
 
-    if (report.events.size() != static_cast<size_t>(max_world_size_) ||
-        report.target_rank_epochs.size() !=
-            static_cast<size_t>(max_world_size_)) {
-        LOG(WARNING) << "[COORD] invalid LinkEventReport vectors";
+    if (report.peer_links.size() != static_cast<size_t>(max_world_size_)) {
+        LOG(WARNING) << "[COORD] invalid LinkEventReport peer_links";
         return std::nullopt;
     }
 
@@ -439,23 +461,24 @@ CentralizedCoordinatorStateMachine::processLinkEventReport(
     bool has_positive = false;
     bool has_negative = false;
     for (int32_t peer = 0; peer < max_world_size_; ++peer) {
-        auto type = report.events[peer];
-        if (type == LinkEvent::EventType::None) continue;
+        const auto& observed = report.peer_links[peer];
+        if (!observed.has_value()) continue;
 
         const auto& target = ranks_[peer];
         if (target.state == RankState::Offline ||
-            report.target_rank_epochs[peer] != target.rank_epoch) {
+            observed->target_rank_epoch != target.rank_epoch) {
             continue;
         }
 
-        bool was_up = reporter.link_status[peer] != 0;
-        bool is_up = type == LinkEvent::EventType::Success;
-        if (was_up == is_up) continue;
+        auto& current = reporter.peer_links[peer];
+        if (current.has_value() && *current == *observed) continue;
 
-        reporter.link_status[peer] = is_up ? 1 : 0;
-        if (is_up) {
+        const bool was_up = current.has_value() && current->reachable;
+        const bool is_up = observed->reachable;
+        current = *observed;
+        if (!was_up && is_up) {
             has_positive = true;
-        } else {
+        } else if (was_up && !is_up) {
             has_negative = true;
         }
     }
@@ -632,12 +655,11 @@ bool CentralizedCoordinatorStateMachine::invalidateAgentSession(
 
     ranks_[rank].state = RankState::Offline;
     ++ranks_[rank].rank_state_version;
-    ranks_[rank].link_status.assign(max_world_size_, 0);
+    ranks_[rank].peer_links.assign(max_world_size_, std::nullopt);
 
     // Clear this rank's connectivity from all peers.
     for (auto& peer : ranks_) {
-        if (static_cast<size_t>(rank) < peer.link_status.size())
-            peer.link_status[rank] = 0;
+        peer.peer_links[rank].reset();
     }
 
     if (shutdown_requested_) shutdown_pending_ranks_.erase(rank);
@@ -675,6 +697,10 @@ void CentralizedCoordinatorStateMachine::handleTimedOutAgent(
             member.endpoint = std::nullopt;
             view_changed = true;
         }
+        if (member.hasEndpointV2()) {
+            member.endpoint_v2 = std::nullopt;
+            view_changed = true;
+        }
 
         if (view.auto_deactivate && member.isActive()) {
             member.status = GroupMemberState::Inactive;
@@ -682,7 +708,7 @@ void CentralizedCoordinatorStateMachine::handleTimedOutAgent(
         }
 
         if (view_changed) {
-            view.epoch++;
+            advanceGroupView(view);
             effects.push_back(PushViewUpdate{view});
         }
     }
@@ -758,9 +784,12 @@ bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
     if (ranks_[a].state == RankState::Offline ||
         ranks_[b].state == RankState::Offline)
         return false;
-    return static_cast<size_t>(b) < ranks_[a].link_status.size() &&
-           static_cast<size_t>(a) < ranks_[b].link_status.size() &&
-           ranks_[a].link_status[b] != 0 && ranks_[b].link_status[a] != 0;
+    const auto& a_to_b = ranks_[a].peer_links[b];
+    const auto& b_to_a = ranks_[b].peer_links[a];
+    return a_to_b.has_value() && b_to_a.has_value() &&
+           a_to_b->target_rank_epoch == ranks_[b].rank_epoch &&
+           b_to_a->target_rank_epoch == ranks_[a].rank_epoch &&
+           a_to_b->reachable && b_to_a->reachable;
 }
 
 std::vector<GlobalRank> CentralizedCoordinatorStateMachine::extendHealthySet()
@@ -884,13 +913,14 @@ void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
             if (!in_healthy) {
                 view.members[i].status = GroupMemberState::Inactive;
                 view.members[i].endpoint = std::nullopt;
+                view.members[i].endpoint_v2 = std::nullopt;
                 deactivated_ranks.push_back(i);
                 LOG(INFO) << "[COORD] auto_deactivate group=" << group_id
                           << " rank=" << i;
             }
         }
         if (!deactivated_ranks.empty()) {
-            view.epoch++;
+            advanceGroupView(view);
             effects.push_back(PushViewUpdate{view});
             LOG(INFO) << "[COORD] auto_deactivate view update group="
                       << group_id << " epoch=" << view.epoch;
@@ -1020,7 +1050,7 @@ void CentralizedCoordinatorStateMachine::tryAdmitPendingProposals(
 
         const auto propose_id = pending.propose_id;
         queue.pop_front();
-        view.epoch++;
+        advanceGroupView(view);
 
         auto required_acks = computeBarrierAckSet(old_view, view);
         pending_barriers_[group_id][view.epoch] = PendingViewUpdateBarrier{
@@ -1157,7 +1187,7 @@ bool CentralizedCoordinatorStateMachine::isRankActivatable(
 
     const auto& member = group->second.members[rank];
     return (member.isActive() || member.isAwaitingActivation()) &&
-           member.hasEndpoint();
+           hasRequiredCollectiveEndpoints(group->second, member);
 }
 
 void CentralizedCoordinatorStateMachine::checkGroupTransitions(
@@ -1185,7 +1215,7 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                 // All active ranks have endpoints and are Healthy.
                 // Transition to BootstrapSyncing and initiate a barrier.
                 view.status = GroupStatus::BootstrapSyncing;
-                view.epoch++;
+                advanceGroupView(view);
 
                 auto required_acks = computeBarrierAckSet(view, view);
                 pending_barriers_[group_id][view.epoch] =
@@ -1393,6 +1423,7 @@ void CentralizedCoordinatorStateMachine::processGroupRegistration(
         view.status = GroupStatus::Bootstrapping;
         group_views_[group_id] = std::move(view);
         group_views_[group_id].auto_deactivate = request.auto_deactivate;
+        refreshCollectivePlans(group_views_[group_id]);
         return;
     }
 
@@ -1417,6 +1448,7 @@ void CentralizedCoordinatorStateMachine::processGroupRegistration(
         joining_member.status == GroupMemberState::Left) {
         joining_member.status = GroupMemberState::Inactive;
         joining_member.endpoint = std::nullopt;
+        joining_member.endpoint_v2 = std::nullopt;
         view_changed = true;
     }
 
@@ -1427,7 +1459,7 @@ void CentralizedCoordinatorStateMachine::processGroupRegistration(
         // A changed payload must never be published under an epoch that agents
         // may already have applied. Repeated registrations with no view change
         // remain idempotent and reuse the current epoch.
-        if (view_changed) view.epoch++;
+        if (view_changed) advanceGroupView(view);
         effects.push_back(PushViewUpdate{view});
     }
 }
@@ -1555,7 +1587,7 @@ void CentralizedCoordinatorStateMachine::commitBarrier(
                 if (it == group_views_.end()) return;
                 GroupView& view = it->second;
                 view.status = GroupStatus::Ready;
-                view.epoch++;
+                advanceGroupView(view);
                 effects.push_back(PushViewUpdate{view});
             },
         },

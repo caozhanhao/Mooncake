@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -57,10 +58,9 @@ struct LinkEventReport {
     uint64_t agent_session_id = 0;
     uint64_t reporter_rank_epoch = 0;
     uint64_t report_id = 0;
-    std::vector<LinkEvent::EventType> events;
-    // Parallel to events. Each entry identifies the target
-    // incarnation against which the observation was made.
-    std::vector<uint64_t> target_rank_epochs;
+    // Full merged snapshot indexed by GlobalRank. nullopt means this Agent has
+    // not observed the current peer incarnation.
+    std::vector<std::optional<PeerLinkState>> peer_links;
 };
 
 struct LinkEventReportAck {
@@ -139,7 +139,8 @@ struct ProposeViewUpdateResponse {
 
 struct GroupEndpointPublication {
     GroupId group_id;
-    GroupEndpointInfo endpoint_info;
+    GroupEndpointInfo endpoint;
+    std::optional<GroupEndpointV2> endpoint_v2;
 };
 
 struct PublishEndpointRequest {

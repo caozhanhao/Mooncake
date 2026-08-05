@@ -13,8 +13,12 @@
 
 #include <transfer_engine.h>
 
+#include "collective/buffer/collective_buffer_pool.h"
+#include "collective/runtime/control_pool.h"
+#include "collective/transport/host_transfer_proxy.h"
 #include "control_plane/agent_host.h"
 #include "control_plane/coordinator_host.h"
+#include "control_plane/device_link_manager.h"
 #include "control_plane/link_manager.h"
 #include "error_types.h"
 #include "mooncake_pg.h"
@@ -23,6 +27,10 @@
 #include "comm_types.h"
 
 namespace mooncake {
+
+class GroupCollectiveBindings;
+class GroupCollectiveRuntime;
+class CollectiveLanePool;
 
 static constexpr size_t kDefaultCollectiveTimeoutUs = 10000000;  // 10 s
 static constexpr int64_t kDefaultP2PTimeoutUs = 10000000;        // 10 s
@@ -49,6 +57,10 @@ struct MooncakePGContext {
     int max_world_size = 0;
 
     LinkManager link_manager;
+    CollectiveBufferPool collective_buffer_pool;
+    DeviceLinkManager device_link_manager;
+    CollectiveControlPool collective_control_pool;
+    CollectiveHostTransferProxy collective_host_proxy;
     MooncakeWorkerManager worker_manager;
     P2PDeviceWorkerManager p2p_device_worker_manager;
     // Coordinator (rank 0 only).
@@ -251,6 +263,10 @@ class MooncakeCommunicator {
                          const MooncakeCommunicatorConfig& config);
     PGResult<void> initialize(MooncakeCommunicatorConfig config);
 
+    PGResult<void> initializePlannedCollectives(
+        const std::string& device_location);
+    PGResult<void> recoverCollectiveFailure(InGroupRank failed_peer);
+
     PGResult<std::unique_ptr<WorkCompletion>> enqueueSend(
         const void* buffer, size_t count, DataType datatype, int peer,
         cudaStream_t stream, int32_t* failed_ranks_hint,
@@ -299,6 +315,20 @@ class MooncakeCommunicator {
     std::array<int32_t*, 2> cpu_sync_send_region_{};
     std::array<int32_t*, 2> cpu_sync_recv_region_{};
     std::shared_ptr<TransferGroupMeta> meta_;
+
+    // Only the dispatch discriminator and epoch cross from control-plane view
+    // application to the application thread. GroupView, membership and global
+    // ranks are materialized into stable bindings and never captured by an
+    // executor.
+    mutable std::mutex collective_policy_mutex_;
+    AllReduceProtocol allreduce_protocol_ = AllReduceProtocol::Legacy;
+    uint64_t collective_view_epoch_ = 0;
+
+    std::unique_ptr<CollectiveLanePool> collective_lanes_;
+    std::unique_ptr<GroupCollectiveBindings> collective_bindings_;
+    CollectiveBindingId allreduce_binding_id_ = kInvalidCollectiveBindingId;
+    std::unique_ptr<GroupCollectiveRuntime> collective_runtime_;
+    std::optional<GroupEndpointV2> collective_endpoint_;
 
     // P2P async infrastructure. p2p_proxy_ is created by this communicator but
     // can live longer because P2PDeviceWorker retains it until all transfers

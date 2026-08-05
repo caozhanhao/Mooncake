@@ -260,6 +260,40 @@ std::optional<TransferMetadata::SegmentID> LinkManager::resolvePeer(
     return target_id;
 }
 
+std::optional<HostLinkHandle> LinkManager::resolvePeerHandle(
+    GlobalRank peer) const {
+    if (!rankInRange(peer)) return std::nullopt;
+    const auto& state = read_state_[peer];
+    const auto first = state.version.load(std::memory_order_acquire);
+    if (state.link_connected.load(std::memory_order_acquire) == 0) {
+        return std::nullopt;
+    }
+    const auto target_rank_epoch =
+        state.target_rank_epoch.load(std::memory_order_relaxed);
+    const auto second = state.version.load(std::memory_order_acquire);
+    if (first != second) return std::nullopt;
+    return HostLinkHandle{static_cast<uint32_t>(peer), target_rank_epoch};
+}
+
+std::optional<TransferMetadata::SegmentID> LinkManager::resolvePeer(
+    HostLinkHandle handle) const {
+    if (handle == kInvalidHostLinkHandle ||
+        handle.slot >= static_cast<uint32_t>(max_world_size_)) {
+        return std::nullopt;
+    }
+    const auto& state = read_state_[handle.slot];
+    const auto first = state.version.load(std::memory_order_acquire);
+    if (state.link_connected.load(std::memory_order_acquire) == 0 ||
+        state.target_rank_epoch.load(std::memory_order_relaxed) !=
+            handle.target_rank_epoch) {
+        return std::nullopt;
+    }
+    const auto target_id = state.target_id.load(std::memory_order_acquire);
+    const auto second = state.version.load(std::memory_order_acquire);
+    if (first != second) return std::nullopt;
+    return target_id;
+}
+
 void LinkManager::refreshPeerSegment(GlobalRank peer) {
     if (peer == rank_) return;
     if (!rankInRange(peer)) return;
@@ -284,6 +318,8 @@ void LinkManager::publishLinkUp(GlobalRank peer,
                                 TransferMetadata::SegmentID target_id,
                                 uint64_t target_rank_epoch) {
     if (!rankInRange(peer)) return;
+    read_state_[peer].target_rank_epoch.store(target_rank_epoch,
+                                              std::memory_order_relaxed);
     read_state_[peer].target_id.store(target_id, std::memory_order_relaxed);
     read_state_[peer].link_connected.store(1, std::memory_order_release);
     read_state_[peer].version.fetch_add(1, std::memory_order_release);

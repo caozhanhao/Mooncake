@@ -4,6 +4,7 @@
 #include <utility>
 #include <glog/logging.h>
 
+#include "control_plane/collective_policy.h"
 #include "error_types.h"
 
 namespace mooncake {
@@ -16,8 +17,9 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     global_rank_epochs_.assign(max_world_size_, 0);
     global_rank_state_versions_.assign(max_world_size_, 0);
     rank_connections_.resize(max_world_size_);
-    observed_link_state_.assign(max_world_size_, LinkEvent::EventType::None);
-    observed_target_rank_epochs_.assign(max_world_size_, 0);
+    observed_host_links_.resize(max_world_size_);
+    observed_device_links_.resize(max_world_size_);
+    observed_peer_links_.resize(max_world_size_);
 }
 
 void AgentStateMachine::appendApplyViewEffect(const GroupView& view,
@@ -29,7 +31,7 @@ void AgentStateMachine::appendApplyViewEffect(const GroupView& view,
         const auto& member = view.members[gr];
         activatable[i] = healthy &&
                          (member.isActive() || member.isAwaitingActivation()) &&
-                         member.hasEndpoint();
+                         hasRequiredCollectiveEndpoints(view, member);
     }
     effects.push_back(ApplyViewToCommunicator{view, global_rank_states_,
                                               global_rank_epochs_,
@@ -72,6 +74,12 @@ void AgentStateMachine::resetRankForNewEpoch(GlobalRank rank,
     global_rank_state_versions_[rank] = 0;
     global_rank_states_[rank] = RankState::Offline;
     rank_connections_[rank].reset();
+    observed_host_links_[rank].reset();
+    observed_device_links_[rank].reset();
+    if (observed_peer_links_[rank].has_value()) {
+        observed_peer_links_[rank].reset();
+        ++link_state_version_;
+    }
 
     if (rank != rank_) {
         effects.push_back(DisconnectLink{rank});
@@ -320,10 +328,9 @@ AgentApplyResult AgentStateMachine::reset(uint64_t new_session_id) {
 
     agent_session_id_.store(new_session_id, std::memory_order_release);
     self_rank_epoch_.store(0, std::memory_order_release);
-    std::fill(observed_link_state_.begin(), observed_link_state_.end(),
-              LinkEvent::EventType::None);
-    std::fill(observed_target_rank_epochs_.begin(),
-              observed_target_rank_epochs_.end(), 0);
+    for (auto& link : observed_host_links_) link.reset();
+    for (auto& link : observed_device_links_) link.reset();
+    for (auto& link : observed_peer_links_) link.reset();
     link_state_version_ = 0;
     acked_link_state_version_ = 0;
     groups_.clear();
@@ -342,34 +349,35 @@ AgentApplyResult AgentStateMachine::reset(uint64_t new_session_id) {
 AgentApplyResult AgentStateMachine::pushLinkEvent(const LinkEvent& event) {
     AgentApplyResult effects;
 
-    if (event.events.size() != static_cast<size_t>(max_world_size_) ||
-        event.target_rank_epochs.size() !=
-            static_cast<size_t>(max_world_size_)) {
-        LOG(WARNING) << "AgentStateMachine: invalid LinkEvent size. "
-                     << "Expected max_world_size=" << max_world_size_
-                     << "; dropping.";
-        return effects;
-    }
-
     bool changed = false;
-    for (int peer = 0; peer < max_world_size_; ++peer) {
-        auto type = event.events[peer];
-        if (type == LinkEvent::EventType::None) continue;
-        const bool has_prior_link_observation =
-            observed_link_state_[peer] != LinkEvent::EventType::None;
-        if (!recordLinkEvent(peer, event.target_rank_epochs[peer], type))
-            continue;
-
-        changed = true;
-        if (type == LinkEvent::EventType::Failure) {
-            effects.push_back(RequestLinkHealthCheck{peer});
-        } else if (peer != rank_) {
-            // Reset only when this success follows an earlier observation,
-            // i.e. a recovery or a new peer incarnation.
-            if (has_prior_link_observation) {
-                effects.push_back(ResetPeerState{peer});
+    for (const auto& update : event.updates) {
+        if (!rankInRange(update.peer)) continue;
+        const auto previous = observed_peer_links_[update.peer];
+        const bool had_host_observation =
+            observed_host_links_[update.peer].has_value();
+        const bool host_data_plane_failure =
+            update.provider == LinkProvider::Host && !update.reachable;
+        if (!recordLinkEvent(update)) {
+            if (host_data_plane_failure) {
+                effects.push_back(DisconnectLink{update.peer});
             }
-            effects.push_back(NotifyLinkRefreshed{peer});
+            continue;
+        }
+
+        changed |= previous != observed_peer_links_[update.peer];
+        if (host_data_plane_failure) {
+            // Legacy collectives execute through the host provider and cannot
+            // switch to a device route after an in-flight failure. Invalidate
+            // both process-level providers so the merged OR view cannot hide
+            // that failure from Coordinator reconciliation. More precise
+            // per-route failure evidence is intentionally deferred.
+            effects.push_back(DisconnectLink{update.peer});
+        } else if (update.provider == LinkProvider::Host &&
+                   update.peer != rank_) {
+            if (had_host_observation) {
+                effects.push_back(ResetPeerState{update.peer});
+            }
+            effects.push_back(NotifyLinkRefreshed{update.peer});
         }
     }
 
@@ -392,8 +400,7 @@ std::optional<LinkEventReport> AgentStateMachine::getLinkEventReport() const {
     report.agent_session_id = getAgentSessionId();
     report.reporter_rank_epoch = getRankEpoch();
     report.report_id = link_state_version_;
-    report.events = observed_link_state_;
-    report.target_rank_epochs = observed_target_rank_epochs_;
+    report.peer_links = observed_peer_links_;
     return report;
 }
 
@@ -407,20 +414,42 @@ void AgentStateMachine::handleLinkEventReportAck(
         std::max(acked_link_state_version_, ack.report_id);
 }
 
-bool AgentStateMachine::recordLinkEvent(GlobalRank peer,
-                                        uint64_t target_rank_epoch,
-                                        LinkEvent::EventType type) {
-    if (target_rank_epoch != global_rank_epochs_[peer]) return false;
-
-    if (observed_target_rank_epochs_[peer] == target_rank_epoch &&
-        observed_link_state_[peer] == type) {
+bool AgentStateMachine::recordLinkEvent(const PeerLinkUpdate& update) {
+    if (update.target_rank_epoch != global_rank_epochs_[update.peer]) {
         return false;
     }
 
-    observed_target_rank_epochs_[peer] = target_rank_epoch;
-    observed_link_state_[peer] = type;
+    auto& contribution = update.provider == LinkProvider::Host
+                             ? observed_host_links_[update.peer]
+                             : observed_device_links_[update.peer];
+    const PeerLinkState next{
+        .target_rank_epoch = update.target_rank_epoch,
+        .reachable = update.reachable,
+    };
+    if (contribution.has_value() && *contribution == next) return false;
+    contribution = next;
+
+    auto merged = mergePeerLink(update.peer);
+    auto& observed = observed_peer_links_[update.peer];
+    if (observed == merged) return true;
+    observed = std::move(merged);
     ++link_state_version_;
     return true;
+}
+
+std::optional<PeerLinkState> AgentStateMachine::mergePeerLink(
+    GlobalRank peer) const {
+    const auto& host = observed_host_links_[peer];
+    const auto& device = observed_device_links_[peer];
+    if (!host.has_value() && !device.has_value()) return std::nullopt;
+
+    PeerLinkState merged{
+        .target_rank_epoch = global_rank_epochs_[peer],
+        .reachable = false,
+    };
+    if (host.has_value()) merged.reachable |= host->reachable;
+    if (device.has_value()) merged.reachable |= device->reachable;
+    return merged;
 }
 
 }  // namespace mooncake

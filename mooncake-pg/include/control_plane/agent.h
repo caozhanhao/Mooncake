@@ -71,8 +71,9 @@ class AgentStateMachine {
     std::vector<uint64_t> global_rank_state_versions_;
     std::vector<std::optional<RankConnectionMetadata>> rank_connections_;
 
-    std::vector<LinkEvent::EventType> observed_link_state_;
-    std::vector<uint64_t> observed_target_rank_epochs_;
+    std::vector<std::optional<PeerLinkState>> observed_host_links_;
+    std::vector<std::optional<PeerLinkState>> observed_device_links_;
+    std::vector<std::optional<PeerLinkState>> observed_peer_links_;
     uint64_t link_state_version_ = 0;
     uint64_t acked_link_state_version_ = 0;
 
@@ -89,8 +90,8 @@ class AgentStateMachine {
                                        AgentApplyResult& effects) const;
     void resetRankForNewEpoch(GlobalRank rank, uint64_t rank_epoch,
                               AgentApplyResult& effects);
-    bool recordLinkEvent(GlobalRank peer, uint64_t target_rank_epoch,
-                         LinkEvent::EventType type);
+    bool recordLinkEvent(const PeerLinkUpdate& update);
+    std::optional<PeerLinkState> mergePeerLink(GlobalRank peer) const;
 };
 
 }  // namespace mooncake

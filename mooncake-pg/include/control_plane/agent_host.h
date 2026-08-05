@@ -12,9 +12,10 @@
 #include <vector>
 
 #include "agent.h"
+#include "device_link_manager.h"
+#include "link_manager.h"
 #include "rpc.h"
 #include "serialized_executor.h"
-#include "link_manager.h"
 
 #include "error_types.h"
 namespace mooncake {
@@ -125,6 +126,7 @@ class AgentHost : public AgentInterface {
 
     AgentHost(std::string coordinator_addr, const std::string& host_ip,
               GlobalRank rank, int max_world_size, LinkManager& link_manager,
+              DeviceLinkManager& device_link_manager,
               int64_t fault_reconciliation_window_us);
 
     ~AgentHost() override;
@@ -173,6 +175,7 @@ class AgentHost : public AgentInterface {
     SerializedExecutor executor_;
 
     LinkManager& link_manager_;
+    DeviceLinkManager& device_link_manager_;
 
     std::string host_ip_;
     GlobalRank rank_;

@@ -236,6 +236,56 @@ bool macaP2pPairAllowed(int src_physical, int dst_physical) {
 }  // namespace
 #endif
 
+class IpcPeerMapping final : public P2pPeerMapping {
+   public:
+    IpcPeerMapping(void* base, int device) : base_(base), device_(device) {}
+
+    ~IpcPeerMapping() override {
+        if (base_ == nullptr) return;
+        int previous = -1;
+        cudaGetDevice(&previous);
+        cudaSetDevice(device_);
+        cudaIpcCloseMemHandle(base_);
+        if (previous >= 0) cudaSetDevice(previous);
+    }
+
+    void* mappedBase() const override { return base_; }
+    size_t mappedBytes() const override { return 0; }
+
+   private:
+    void* base_ = nullptr;
+    int device_ = -1;
+};
+
+#if defined(USE_CUDA)
+class FabricPeerBufferMapping final : public P2pPeerMapping {
+   public:
+    FabricPeerBufferMapping(CUdeviceptr base, size_t bytes,
+                            CUmemGenericAllocationHandle handle, int device)
+        : base_(base), bytes_(bytes), handle_(handle), device_(device) {}
+
+    ~FabricPeerBufferMapping() override {
+        if (base_ == 0) return;
+        int previous = -1;
+        cudaGetDevice(&previous);
+        cudaSetDevice(device_);
+        cuMemUnmap(base_, bytes_);
+        cuMemAddressFree(base_, bytes_);
+        cuMemRelease(handle_);
+        if (previous >= 0) cudaSetDevice(previous);
+    }
+
+    void* mappedBase() const override { return reinterpret_cast<void*>(base_); }
+    size_t mappedBytes() const override { return bytes_; }
+
+   private:
+    CUdeviceptr base_ = 0;
+    size_t bytes_ = 0;
+    CUmemGenericAllocationHandle handle_{};
+    int device_ = -1;
+};
+#endif
+
 class P2pDeviceTransportImpl : public P2pTransport {
    public:
     explicit P2pDeviceTransportImpl(int num_ranks)
@@ -486,6 +536,100 @@ class P2pDeviceTransportImpl : public P2pTransport {
         std::vector<int32_t> result(kNumInt32s);
         memcpy(result.data(), &handle, kHandleBytes);
         return result;
+    }
+
+    static std::shared_ptr<P2pPeerMapping> importPeerBuffer(
+        const std::vector<int32_t>& opaque_handle) {
+        if (opaque_handle.empty()) return nullptr;
+
+        int device = -1;
+        if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
+
+#if defined(USE_CUDA)
+        constexpr size_t kFabricPayloadBytes =
+            sizeof(CUmemFabricHandle) + sizeof(uint64_t);
+        constexpr size_t kFabricHandleWords =
+            (kFabricPayloadBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+        if (opaque_handle.size() == kFabricHandleWords) {
+            CUmemFabricHandle export_handle;
+            size_t mapped_size = 0;
+            if (!deserializeFabricHandle(opaque_handle, &export_handle,
+                                         &mapped_size)) {
+                return nullptr;
+            }
+
+            CUmemGenericAllocationHandle handle;
+            auto result = cuMemImportFromShareableHandle(
+                &handle, &export_handle, CU_MEM_HANDLE_TYPE_FABRIC);
+            if (result != CUDA_SUCCESS) return nullptr;
+
+            CUdeviceptr peer_base = 0;
+            result = cuMemAddressReserve(&peer_base, mapped_size, 0, 0, 0);
+            if (result != CUDA_SUCCESS) {
+                cuMemRelease(handle);
+                return nullptr;
+            }
+            result = cuMemMap(peer_base, mapped_size, 0, handle, 0);
+            if (result != CUDA_SUCCESS) {
+                cuMemAddressFree(peer_base, mapped_size);
+                cuMemRelease(handle);
+                return nullptr;
+            }
+
+            CUmemAccessDesc access{};
+            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access.location.id = device;
+            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            result = cuMemSetAccess(peer_base, mapped_size, &access, 1);
+            if (result != CUDA_SUCCESS) {
+                cuMemUnmap(peer_base, mapped_size);
+                cuMemAddressFree(peer_base, mapped_size);
+                cuMemRelease(handle);
+                return nullptr;
+            }
+            return std::make_shared<FabricPeerBufferMapping>(
+                peer_base, mapped_size, handle, device);
+        }
+#endif
+
+#ifdef USE_MACA
+        if (parseBoolEnv("MOONCAKE_EP_MACA_DISABLE_IPC")) return nullptr;
+        const std::string ipc_mode = macaIpcMode();
+        if (ipc_mode == "cross-v2" || ipc_mode == "cross_v2") {
+            constexpr size_t kHandleBytes = sizeof(mcIpcCrossMemHandle_t);
+            constexpr size_t kHandleWords =
+                (kHandleBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+            if (opaque_handle.size() < kHandleWords) return nullptr;
+            mcIpcCrossMemHandle_t handle;
+            memcpy(&handle, opaque_handle.data(), kHandleBytes);
+            void* peer_base = nullptr;
+            const auto error = mcIpcOpenMemHandleCross_v2(
+                &peer_base, &handle, cudaIpcMemLazyEnablePeerAccess);
+            if (error != cudaSuccess) return nullptr;
+            return std::make_shared<IpcPeerMapping>(peer_base, device);
+        }
+#endif
+
+        constexpr size_t kHandleBytes = sizeof(cudaIpcMemHandle_t);
+        constexpr size_t kHandleWords =
+            (kHandleBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+        if (opaque_handle.size() != kHandleWords) return nullptr;
+        cudaIpcMemHandle_t handle;
+        memcpy(&handle, opaque_handle.data(), kHandleBytes);
+        void* peer_base = nullptr;
+#ifdef USE_MACA
+        const auto error =
+            ipc_mode == "cross"
+                ? mcIpcOpenMemHandleCross(&peer_base, handle,
+                                          cudaIpcMemLazyEnablePeerAccess)
+                : cudaIpcOpenMemHandle(&peer_base, handle,
+                                       cudaIpcMemLazyEnablePeerAccess);
+#else
+        const auto error = cudaIpcOpenMemHandle(&peer_base, handle,
+                                                cudaIpcMemLazyEnablePeerAccess);
+#endif
+        if (error != cudaSuccess) return nullptr;
+        return std::make_shared<IpcPeerMapping>(peer_base, device);
     }
 
     void importPeerHandles(
@@ -842,6 +986,11 @@ class P2pDeviceTransportImpl : public P2pTransport {
     std::unordered_map<void*, FabricAllocation> fabric_allocations_;
 #endif
 };
+
+std::shared_ptr<P2pPeerMapping> importP2pPeerBuffer(
+    const std::vector<int32_t>& opaque_handle) {
+    return P2pDeviceTransportImpl::importPeerBuffer(opaque_handle);
+}
 
 std::unique_ptr<P2pTransport> createP2pDeviceTransport(int num_ranks) {
     return std::make_unique<P2pDeviceTransportImpl>(num_ranks);

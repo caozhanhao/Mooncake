@@ -16,6 +16,7 @@
 #include <transfer_engine.h>
 
 #include "control_plane/control_types.h"
+#include "collective/transport/link.h"
 #include "error_types.h"
 
 namespace mooncake {
@@ -62,6 +63,10 @@ class LinkManager {
 
     std::optional<TransferMetadata::SegmentID> resolvePeer(
         GlobalRank peer) const;
+
+    std::optional<HostLinkHandle> resolvePeerHandle(GlobalRank peer) const;
+    std::optional<TransferMetadata::SegmentID> resolvePeer(
+        HostLinkHandle handle) const;
 
     void refreshPeerSegment(GlobalRank peer);
 
@@ -116,6 +121,7 @@ class LinkManager {
         std::atomic<uint64_t> version{0};
         std::atomic<uint8_t> link_connected{0};
         std::atomic<TransferMetadata::SegmentID> target_id{};
+        std::atomic<uint64_t> target_rank_epoch{0};
     };
 
     std::vector<PeerReadState> read_state_;
