@@ -35,21 +35,41 @@ struct CollectiveArenaView {
     std::vector<int32_t> p2p_handle;
 };
 
-// One byte range from the process/device arena. Its caller decides what the
-// bytes mean and how long to retain them.
+// Move-only ownership of one byte range from the process/device arena. Normal
+// destruction returns it to the pool; abandon() is the explicit asynchronous
+// safety escape hatch.
 class CollectiveBufferLease {
    public:
+    ~CollectiveBufferLease() noexcept;
+
     CollectiveBufferLease(const CollectiveBufferLease&) = delete;
     CollectiveBufferLease& operator=(const CollectiveBufferLease&) = delete;
+    CollectiveBufferLease(CollectiveBufferLease&& other) noexcept;
+    CollectiveBufferLease& operator=(CollectiveBufferLease&& other) noexcept;
 
     void* base() const { return base_; }
     uint64_t offset() const { return offset_; }
     uint64_t bytes() const { return bytes_; }
 
+    void release() noexcept;
+    // Permanently removes an asynchronously referenced range from reuse. Its
+    // registered arena is retained for process lifetime.
+    void abandon() noexcept;
+
    private:
     friend class CollectiveBufferPool;
-    CollectiveBufferLease() = default;
+    CollectiveBufferLease(CollectiveBufferPool* pool, DeviceId device,
+                          void* base, uint64_t offset, uint64_t bytes)
+        : pool_(pool),
+          device_(device),
+          base_(base),
+          offset_(offset),
+          bytes_(bytes) {}
 
+    void moveFrom(CollectiveBufferLease&& other) noexcept;
+    void clear() noexcept;
+
+    CollectiveBufferPool* pool_ = nullptr;
     DeviceId device_ = kInvalidDeviceId;
     void* base_ = nullptr;
     uint64_t offset_ = 0;
@@ -64,22 +84,19 @@ class CollectiveBufferPool {
     CollectiveBufferPool() = default;
     ~CollectiveBufferPool() noexcept;
 
-    PGResult<std::unique_ptr<CollectiveBufferLease>> acquire(
+    PGResult<CollectiveBufferLease> acquire(
         DeviceId device, uint64_t bytes, uint64_t alignment,
         const std::string& te_location, TransferEngine* engine,
         const CollectiveBufferPoolConfig& config = {});
     CollectiveArenaView arena(DeviceId device) const;
-
-    void release(CollectiveBufferLease& lease);
-    // Permanently removes an asynchronously referenced range from reuse. Its
-    // registered arena is retained for process lifetime.
-    void abandon(CollectiveBufferLease& lease);
     void shutdown();
 
     CollectiveBufferPool(const CollectiveBufferPool&) = delete;
     CollectiveBufferPool& operator=(const CollectiveBufferPool&) = delete;
 
    private:
+    friend class CollectiveBufferLease;
+
     struct FreeBlock {
         uint64_t offset = 0;
         uint64_t bytes = 0;
@@ -108,6 +125,8 @@ class CollectiveBufferPool {
     static void releaseBlock(RegisteredArena& arena, uint64_t offset,
                              uint64_t bytes);
     static void releaseArena(RegisteredArena& arena) noexcept;
+    void release(CollectiveBufferLease& lease);
+    void abandon(CollectiveBufferLease& lease);
 
     mutable std::mutex mutex_;
     bool shutdown_ = false;

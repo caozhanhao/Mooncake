@@ -165,20 +165,18 @@ PGResult<void> AllReduce::apply(const CollectivePlanSet& plans,
 
 PGResult<std::shared_ptr<CollectiveSubmission>>
 AllReduce::prepareSubmission(uint64_t timeout_device_ticks) {
+    // Do not advance the wire-visible channel order until local buffer
+    // acquisition succeeds. The buffer lease rolls back automatically if the
+    // exact channel is unavailable.
     PG_TRY(auto buffer,
            buffer_pool_.acquire(device_, kAllReduceBufferBytes,
                                 kBufferAlignment, te_location_, engine_));
-    auto acquired_channel = channels_.acquire();
-    if (!acquired_channel.has_value()) {
-        buffer_pool_.release(*buffer);
-        return makePGError(std::move(acquired_channel).error());
-    }
-    auto channel = std::move(acquired_channel).value();
+    PG_TRY(auto channel, channels_.acquire());
     const auto kernel_resources = CollectiveKernelResources{
         .buffer =
             CollectiveKernelBuffer{
-                .base = buffer->base(),
-                .arena_offset = buffer->offset(),
+                .base = buffer.base(),
+                .arena_offset = buffer.offset(),
                 .staging_offset = 0,
                 .staging_bytes = kStagingBytes,
                 .protocol_offset = kProtocolOffset,
@@ -194,7 +192,7 @@ AllReduce::prepareSubmission(uint64_t timeout_device_ticks) {
         .timeout_device_ticks = timeout_device_ticks,
     };
     return std::make_shared<CollectiveSubmission>(
-        buffer_pool_, channels_, channel, std::move(buffer), kernel_resources);
+        std::move(channel), std::move(buffer), kernel_resources);
 }
 
 PGResult<void> AllReduce::submit(CollectiveRuntime& runtime,

@@ -221,7 +221,10 @@ The pooled bulk buffer and its exact channel are retired together:
 ```
 
 Only the large buffer returns to the process pool for cross-group reuse. A
-quarantined buffer range and channel are never silently selected again.
+quarantined buffer range and channel are never silently selected again. Both
+acquisition results are move-only RAII leases: preparation errors naturally
+return earlier resources, while only an asynchronously uncertain submitted
+operation calls `abandon()`.
 
 ## Failure boundary
 

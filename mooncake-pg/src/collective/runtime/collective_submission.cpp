@@ -17,11 +17,9 @@ bool commandSettled(HostTransferCommand& command) {
 }  // namespace
 
 CollectiveSubmission::~CollectiveSubmission() noexcept {
-    if (!channels_) return;
     if (submitted_) {
-        abandon();
-    } else {
-        release();
+        buffer_.abandon();
+        channel_.abandon();
     }
 }
 
@@ -35,32 +33,18 @@ CollectiveKernelArgs CollectiveSubmission::kernelArgs(
 }
 
 bool CollectiveSubmission::retire() noexcept {
-    if (!channels_) return true;
+    if (!channel_.host_control) return true;
     const bool transport_idle =
         std::atomic_ref<uint32_t>(channel_.host_control->transport_idle)
             .load(std::memory_order_acquire) != 0;
     if (transport_idle && commandSettled(*channel_.host_command)) {
-        release();
+        buffer_.release();
+        channel_.release();
         return true;
     }
-    abandon();
+    buffer_.abandon();
+    channel_.abandon();
     return false;
-}
-
-void CollectiveSubmission::release() noexcept {
-    buffer_pool_->release(*buffer_);
-    buffer_.reset();
-    channels_->release(channel_);
-    channels_ = nullptr;
-    buffer_pool_ = nullptr;
-}
-
-void CollectiveSubmission::abandon() noexcept {
-    buffer_pool_->abandon(*buffer_);
-    buffer_.reset();
-    channels_->abandon(channel_);
-    channels_ = nullptr;
-    buffer_pool_ = nullptr;
 }
 
 }  // namespace mooncake

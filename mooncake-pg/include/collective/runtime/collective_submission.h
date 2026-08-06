@@ -2,7 +2,6 @@
 #define MOONCAKE_PG_COLLECTIVE_RUNTIME_COLLECTIVE_SUBMISSION_H
 
 #include <cstdint>
-#include <memory>
 #include <utility>
 
 #include "collective/buffer/collective_buffer_pool.h"
@@ -13,17 +12,15 @@ namespace mooncake {
 
 // Owns the resources prepared by an operation for one device submission.
 // Runtime only retains this object until eager completion or graph teardown;
-// it does not decide which resources an operation needs.
+// it does not decide which resources an operation needs. Before submission,
+// member RAII performs normal rollback. After submission, destruction defaults
+// to quarantine unless retire() has proved safe reuse.
 class CollectiveSubmission {
    public:
-    CollectiveSubmission(CollectiveBufferPool& buffer_pool,
-                         CollectiveChannels& channels,
-                         CollectiveChannel channel,
-                         std::unique_ptr<CollectiveBufferLease> buffer,
+    CollectiveSubmission(CollectiveChannelLease&& channel,
+                         CollectiveBufferLease&& buffer,
                          CollectiveKernelResources kernel_resources)
-        : buffer_pool_(&buffer_pool),
-          channels_(&channels),
-          channel_(channel),
+        : channel_(std::move(channel)),
           buffer_(std::move(buffer)),
           kernel_resources_(kernel_resources) {}
     ~CollectiveSubmission() noexcept;
@@ -43,13 +40,8 @@ class CollectiveSubmission {
     bool retire() noexcept;
 
    private:
-    void release() noexcept;
-    void abandon() noexcept;
-
-    CollectiveBufferPool* buffer_pool_ = nullptr;
-    CollectiveChannels* channels_ = nullptr;
-    CollectiveChannel channel_;
-    std::unique_ptr<CollectiveBufferLease> buffer_;
+    CollectiveChannelLease channel_;
+    CollectiveBufferLease buffer_;
     CollectiveKernelResources kernel_resources_;
     bool submitted_ = false;
 };

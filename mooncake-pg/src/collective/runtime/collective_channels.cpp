@@ -74,6 +74,60 @@ void resetHostCommand(HostTransferCommand& command) {
 
 }  // namespace
 
+CollectiveChannelLease::~CollectiveChannelLease() noexcept { release(); }
+
+CollectiveChannelLease::CollectiveChannelLease(
+    CollectiveChannelLease&& other) noexcept {
+    moveFrom(std::move(other));
+}
+
+CollectiveChannelLease& CollectiveChannelLease::operator=(
+    CollectiveChannelLease&& other) noexcept {
+    if (this != &other) {
+        release();
+        moveFrom(std::move(other));
+    }
+    return *this;
+}
+
+void CollectiveChannelLease::release() noexcept {
+    if (!owner_) return;
+    auto* owner = std::exchange(owner_, nullptr);
+    owner->release(index_);
+    clear();
+}
+
+void CollectiveChannelLease::abandon() noexcept {
+    if (!owner_) return;
+    auto* owner = std::exchange(owner_, nullptr);
+    owner->abandon(index_);
+    clear();
+}
+
+void CollectiveChannelLease::moveFrom(
+    CollectiveChannelLease&& other) noexcept {
+    owner_ = std::exchange(other.owner_, nullptr);
+    index_ = std::exchange(other.index_, 0);
+    invocation_sequence = std::exchange(other.invocation_sequence, nullptr);
+    peer_signals_base = std::exchange(other.peer_signals_base, nullptr);
+    peer_signals_offset = std::exchange(other.peer_signals_offset, 0);
+    host_control = std::exchange(other.host_control, nullptr);
+    device_control = std::exchange(other.device_control, nullptr);
+    host_command = std::exchange(other.host_command, nullptr);
+    device_command = std::exchange(other.device_command, nullptr);
+}
+
+void CollectiveChannelLease::clear() noexcept {
+    index_ = 0;
+    invocation_sequence = nullptr;
+    peer_signals_base = nullptr;
+    peer_signals_offset = 0;
+    host_control = nullptr;
+    device_control = nullptr;
+    host_command = nullptr;
+    device_command = nullptr;
+}
+
 PGResult<std::unique_ptr<CollectiveChannels>> CollectiveChannels::create(
     CollectiveBufferPool* buffers, HostTransferExecutor* host_executor,
     DeviceId device, const std::string& te_location, TransferEngine* engine,
@@ -112,22 +166,20 @@ PGResult<std::unique_ptr<CollectiveChannels>> CollectiveChannels::create(
                             te_location, engine));
     const GpuDeviceGuard guard(device);
     auto initialized = cudaError(
-        cudaMemset(peer_control->base(), 0, peer_control->bytes()),
+        cudaMemset(peer_control.base(), 0, peer_control.bytes()),
         "cudaMemset collective peer control");
     if (!initialized.has_value()) {
-        buffers->release(*peer_control);
         return makePGError(std::move(initialized).error());
     }
 
     auto registered = host_executor->registerCommands(
         host_commands, host_controls, channel_count);
     if (!registered.has_value()) {
-        buffers->release(*peer_control);
         return makePGError(std::move(registered).error());
     }
 
     return std::unique_ptr<CollectiveChannels>(new CollectiveChannels(
-        buffers, host_executor, std::move(peer_control), std::move(layout),
+        host_executor, std::move(peer_control), std::move(layout),
         host_memory.release(), host_controls, device_controls, host_commands,
         device_commands));
 }
@@ -136,7 +188,7 @@ CollectiveChannels::~CollectiveChannels() noexcept {
     if (!closed_) (void)close(false);
 }
 
-PGResult<CollectiveChannel> CollectiveChannels::acquire() {
+PGResult<CollectiveChannelLease> CollectiveChannels::acquire() {
     std::lock_guard<std::mutex> lock(mutex_);
     PG_VALIDATE_STATE(!closed_, "collective channels are closed");
     const auto channel_index = next_channel_index_;
@@ -149,17 +201,19 @@ PGResult<CollectiveChannel> CollectiveChannels::acquire() {
     next_channel_index_ = (channel_index + 1) % states_.size();
     host_controls_[channel_index] = CollectiveControlBlock{};
     resetHostCommand(host_commands_[channel_index]);
-    return CollectiveChannel{
-        .index = channel_index,
-        .invocation_sequence =
-            static_cast<uint64_t*>(peer_control_->base()) + channel_index,
-        .peer_signals_base = peer_control_->base(),
-        .peer_signals_offset = layout_.channels[channel_index].signals.offset,
-        .host_control = host_controls_ + channel_index,
-        .device_control = device_controls_ + channel_index,
-        .host_command = host_commands_ + channel_index,
-        .device_command = device_commands_ + channel_index,
-    };
+    CollectiveChannelLease channel;
+    channel.owner_ = this;
+    channel.index_ = channel_index;
+    channel.invocation_sequence =
+        static_cast<uint64_t*>(peer_control_.base()) + channel_index;
+    channel.peer_signals_base = peer_control_.base();
+    channel.peer_signals_offset =
+        layout_.channels[channel_index].signals.offset;
+    channel.host_control = host_controls_ + channel_index;
+    channel.device_control = device_controls_ + channel_index;
+    channel.host_command = host_commands_ + channel_index;
+    channel.device_command = device_commands_ + channel_index;
+    return channel;
 }
 
 void CollectiveChannels::resetOrder() {
@@ -168,23 +222,23 @@ void CollectiveChannels::resetOrder() {
     next_channel_index_ = 0;
 }
 
-void CollectiveChannels::release(const CollectiveChannel& channel) {
+void CollectiveChannels::release(uint32_t channel_index) {
     std::lock_guard<std::mutex> lock(mutex_);
     PG_ASSERT(!closed_, "collective channels are closed");
-    PG_ASSERT(channel.index < states_.size(),
+    PG_ASSERT(channel_index < states_.size(),
               "collective channel index is invalid");
-    auto& state = states_[channel.index];
+    auto& state = states_[channel_index];
     PG_ASSERT(state == ChannelState::Acquired,
               "collective channel was released twice");
     state = ChannelState::Free;
 }
 
-void CollectiveChannels::abandon(const CollectiveChannel& channel) {
+void CollectiveChannels::abandon(uint32_t channel_index) {
     std::lock_guard<std::mutex> lock(mutex_);
     PG_ASSERT(!closed_, "collective channels are closed");
-    PG_ASSERT(channel.index < states_.size(),
+    PG_ASSERT(channel_index < states_.size(),
               "collective channel index is invalid");
-    auto& state = states_[channel.index];
+    auto& state = states_[channel_index];
     PG_ASSERT(state == ChannelState::Acquired,
               "collective channel was abandoned twice");
     state = ChannelState::Abandoned;
@@ -205,12 +259,11 @@ bool CollectiveChannels::close(bool resources_safe) {
     }
 
     if (released) {
-        buffers_->release(*peer_control_);
+        peer_control_.release();
         (void)cudaFreeHost(host_memory_);
     } else {
-        buffers_->abandon(*peer_control_);
+        peer_control_.abandon();
     }
-    peer_control_.reset();
     host_memory_ = nullptr;
     host_controls_ = nullptr;
     device_controls_ = nullptr;

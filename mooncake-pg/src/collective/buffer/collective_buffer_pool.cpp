@@ -26,6 +26,52 @@ void* byteOffset(void* base, uint64_t offset) {
 
 }  // namespace
 
+CollectiveBufferLease::~CollectiveBufferLease() noexcept { release(); }
+
+CollectiveBufferLease::CollectiveBufferLease(
+    CollectiveBufferLease&& other) noexcept {
+    moveFrom(std::move(other));
+}
+
+CollectiveBufferLease& CollectiveBufferLease::operator=(
+    CollectiveBufferLease&& other) noexcept {
+    if (this != &other) {
+        release();
+        moveFrom(std::move(other));
+    }
+    return *this;
+}
+
+void CollectiveBufferLease::release() noexcept {
+    if (!pool_) return;
+    auto* pool = std::exchange(pool_, nullptr);
+    pool->release(*this);
+    clear();
+}
+
+void CollectiveBufferLease::abandon() noexcept {
+    if (!pool_) return;
+    auto* pool = std::exchange(pool_, nullptr);
+    pool->abandon(*this);
+    clear();
+}
+
+void CollectiveBufferLease::moveFrom(
+    CollectiveBufferLease&& other) noexcept {
+    pool_ = std::exchange(other.pool_, nullptr);
+    device_ = std::exchange(other.device_, kInvalidDeviceId);
+    base_ = std::exchange(other.base_, nullptr);
+    offset_ = std::exchange(other.offset_, 0);
+    bytes_ = std::exchange(other.bytes_, 0);
+}
+
+void CollectiveBufferLease::clear() noexcept {
+    device_ = kInvalidDeviceId;
+    base_ = nullptr;
+    offset_ = 0;
+    bytes_ = 0;
+}
+
 CollectiveBufferPool::RegisteredArena::~RegisteredArena() noexcept {
     CollectiveBufferPool::releaseArena(*this);
 }
@@ -152,24 +198,19 @@ void CollectiveBufferPool::releaseArena(RegisteredArena& arena) noexcept {
     }
 }
 
-PGResult<std::unique_ptr<CollectiveBufferLease>> CollectiveBufferPool::acquire(
+PGResult<CollectiveBufferLease> CollectiveBufferPool::acquire(
     DeviceId device, uint64_t bytes, uint64_t alignment,
     const std::string& te_location, TransferEngine* engine,
     const CollectiveBufferPoolConfig& config) {
     PG_VALIDATE_ARG(bytes != 0 && alignment != 0,
                     "invalid collective buffer allocation");
-    auto lease =
-        std::unique_ptr<CollectiveBufferLease>(new CollectiveBufferLease);
     std::lock_guard<std::mutex> lock(mutex_);
     PG_VALIDATE_STATE(!shutdown_, "collective buffer pool is shut down");
     PG_TRY(auto arena, getOrCreateArena(device, te_location, engine, config));
     PG_TRY(auto offset, allocateBlock(*arena, bytes, alignment));
     ++arena->active_allocations;
-    lease->device_ = device;
-    lease->base_ = byteOffset(arena->base, offset);
-    lease->offset_ = offset;
-    lease->bytes_ = bytes;
-    return lease;
+    return CollectiveBufferLease(this, device, byteOffset(arena->base, offset),
+                                 offset, bytes);
 }
 
 void CollectiveBufferPool::release(CollectiveBufferLease& lease) {
