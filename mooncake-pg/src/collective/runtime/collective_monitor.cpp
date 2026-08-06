@@ -95,10 +95,12 @@ void CollectiveMonitor::unregisterFailureTarget(
 }
 
 PGResult<std::shared_ptr<CollectiveSubmission>>
-CollectiveMonitor::acquireGraphSubmission(
+CollectiveMonitor::acquireSubmission(
     const GraphCaptureState& capture, cudaStream_t capture_stream,
     const std::function<PGResult<std::shared_ptr<CollectiveSubmission>>()>&
         prepare) {
+    if (!capture.active) return prepare();
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto found = graph_submissions_.find(capture.id);

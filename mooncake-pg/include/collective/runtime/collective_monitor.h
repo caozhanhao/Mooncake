@@ -60,9 +60,10 @@ class CollectiveMonitor {
     void unregisterFailureTarget(
         const std::shared_ptr<CollectiveSubmission>& submission,
         uint64_t failure_target_id);
-    // Reuse the graph-held submission, or prepare and attach it on first use.
-    // Runtime admission serializes creation for one communicator.
-    PGResult<std::shared_ptr<CollectiveSubmission>> acquireGraphSubmission(
+    // Eager execution prepares a fresh submission. Graph capture reuses its
+    // retained submission, or prepares and attaches it on first use. Runtime
+    // admission serializes creation for one communicator.
+    PGResult<std::shared_ptr<CollectiveSubmission>> acquireSubmission(
         const GraphCaptureState& capture, cudaStream_t capture_stream,
         const std::function<
             PGResult<std::shared_ptr<CollectiveSubmission>>()>& prepare);

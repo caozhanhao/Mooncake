@@ -47,11 +47,6 @@ class CollectiveRuntime {
         : device_(device),
           timeout_device_ticks_(timeout_device_ticks) {}
 
-    PGResult<std::shared_ptr<CollectiveSubmission>> acquireSubmission(
-        const GraphCaptureState& capture, cudaStream_t stream,
-        const std::function<
-            PGResult<std::shared_ptr<CollectiveSubmission>>()>& prepare);
-
     std::unique_ptr<CollectiveMonitor> monitor_;
     DeviceId device_ = kInvalidDeviceId;
     uint64_t timeout_device_ticks_ = 0;
