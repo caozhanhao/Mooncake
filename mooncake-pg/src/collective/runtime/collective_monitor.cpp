@@ -93,7 +93,7 @@ void CollectiveMonitor::unregisterFailureTarget(
     if (source->targets.empty()) failure_sources_.erase(source);
 }
 
-PGResult<void> CollectiveMonitor::retainGraphSubmission(
+PGResult<void> CollectiveMonitor::adoptGraphSubmission(
     const GraphCaptureState& capture,
     std::shared_ptr<CollectiveSubmission> submission) {
     // This callback proves that no graph or executable can use the submission
@@ -118,7 +118,7 @@ void CollectiveMonitor::markCompletionUnproven() {
     has_unproven_completion_ = true;
 }
 
-void CollectiveMonitor::retainStreamCompletion(
+void CollectiveMonitor::adoptStreamCompletion(
     std::unique_ptr<StreamCompletion> completion) {
     std::lock_guard<std::mutex> lock(mutex_);
     stream_completions_.push_back(std::move(completion));

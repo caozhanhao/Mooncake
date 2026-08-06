@@ -60,13 +60,13 @@ class CollectiveMonitor {
     void unregisterFailureTarget(
         const std::shared_ptr<CollectiveSubmission>& submission,
         uint64_t failure_target_id);
-    // Attach submission ownership to the captured graph. The user-object
-    // callback only queues retirement; it never runs collective work.
-    PGResult<void> retainGraphSubmission(
+    // Adopt retirement responsibility for a captured submission. The graph
+    // keeps it alive; its user-object callback only queues retirement.
+    PGResult<void> adoptGraphSubmission(
         const GraphCaptureState& capture,
         std::shared_ptr<CollectiveSubmission> submission);
     void markCompletionUnproven();
-    void retainStreamCompletion(std::unique_ptr<StreamCompletion> completion);
+    void adoptStreamCompletion(std::unique_ptr<StreamCompletion> completion);
 
     bool drain(std::chrono::milliseconds timeout);
     void stop() noexcept;

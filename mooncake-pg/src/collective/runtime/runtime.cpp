@@ -69,7 +69,7 @@ CollectiveRuntime::acquireSubmission(
     });
 
     PG_TRY(auto submission, prepare());
-    PG_TRY(monitor_->retainGraphSubmission(capture, submission));
+    PG_TRY(monitor_->adoptGraphSubmission(capture, submission));
     captured_submissions_.emplace(
         capture.id, CapturedSubmission{.capture_stream = stream,
                                        .submission = submission});
@@ -130,7 +130,7 @@ PGResult<void> CollectiveRuntime::submit(
             return cudaFailure(record_error,
                                "collective completion event record");
         }
-        monitor_->retainStreamCompletion(std::move(stream_completion));
+        monitor_->adoptStreamCompletion(std::move(stream_completion));
     }
     return {};
 }
