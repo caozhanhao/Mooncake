@@ -117,7 +117,7 @@ PGResult<void> CollectiveMonitor::retainGraphResources(
     });
     auto* payload_ptr = payload.get();
     PG_TRY(auto user_object,
-           CudaGraphUserObject::create(payload_ptr, graphResourcesReleased));
+           GpuGraphUserObject::create(payload_ptr, graphResourcesReleased));
     (void)payload.release();
     PG_TRY(user_object.moveTo(capture.graph));
     payload_ptr->notify = true;

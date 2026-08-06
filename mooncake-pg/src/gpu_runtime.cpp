@@ -38,22 +38,21 @@ PGResult<GraphCaptureState> queryGraphCapture(cudaStream_t stream) {
     };
 }
 
-PGResult<CudaGraphUserObject> CudaGraphUserObject::create(
+PGResult<GpuGraphUserObject> GpuGraphUserObject::create(
     void* payload, cudaHostFn_t destructor) {
     cudaUserObject_t object = nullptr;
     PG_TRY_CUDA(cudaUserObjectCreate(&object, payload, destructor, 1,
                                      cudaUserObjectNoDestructorSync));
-    return CudaGraphUserObject(object);
+    return GpuGraphUserObject(object);
 }
 
-CudaGraphUserObject::~CudaGraphUserObject() noexcept { reset(); }
+GpuGraphUserObject::~GpuGraphUserObject() noexcept { reset(); }
 
-CudaGraphUserObject::CudaGraphUserObject(
-    CudaGraphUserObject&& other) noexcept
+GpuGraphUserObject::GpuGraphUserObject(GpuGraphUserObject&& other) noexcept
     : object_(std::exchange(other.object_, nullptr)) {}
 
-CudaGraphUserObject& CudaGraphUserObject::operator=(
-    CudaGraphUserObject&& other) noexcept {
+GpuGraphUserObject& GpuGraphUserObject::operator=(
+    GpuGraphUserObject&& other) noexcept {
     if (this != &other) {
         reset();
         object_ = std::exchange(other.object_, nullptr);
@@ -61,14 +60,14 @@ CudaGraphUserObject& CudaGraphUserObject::operator=(
     return *this;
 }
 
-PGResult<void> CudaGraphUserObject::moveTo(cudaGraph_t graph) {
+PGResult<void> GpuGraphUserObject::moveTo(cudaGraph_t graph) {
     PG_TRY_CUDA(cudaGraphRetainUserObject(graph, object_, 1,
                                           cudaGraphUserObjectMove));
     object_ = nullptr;
     return {};
 }
 
-void CudaGraphUserObject::reset() noexcept {
+void GpuGraphUserObject::reset() noexcept {
     if (!object_) return;
     const auto error = cudaUserObjectRelease(object_, 1);
     if (error != cudaSuccess) {
