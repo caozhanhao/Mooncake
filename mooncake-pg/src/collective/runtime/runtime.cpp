@@ -47,6 +47,15 @@ CollectiveRuntime::~CollectiveRuntime() noexcept {
     }
 }
 
+PGResult<std::shared_ptr<CollectiveSubmission>>
+CollectiveRuntime::acquireSubmission(
+    const GraphCaptureState& capture, cudaStream_t stream,
+    const std::function<PGResult<std::shared_ptr<CollectiveSubmission>>()>&
+        prepare) {
+    if (!capture.active) return prepare();
+    return monitor_->acquireGraphSubmission(capture, stream, prepare);
+}
+
 PGResult<void> CollectiveRuntime::submit(
     cudaStream_t stream, int32_t* failed_ranks_hint,
     size_t failed_ranks_hint_count,
@@ -63,18 +72,7 @@ PGResult<void> CollectiveRuntime::submit(
     PG_VALIDATE_STATE(accepting_.load(std::memory_order_acquire),
                       "collective runtime is stopping");
 
-    std::shared_ptr<CollectiveSubmission> submission;
-    if (capture.active) {
-        PG_TRY(submission,
-               monitor_->findGraphSubmission(capture.id, stream));
-    }
-    if (!submission) {
-        PG_TRY(submission, prepare());
-        if (capture.active) {
-            PG_TRY(
-                monitor_->retainGraphSubmission(capture, stream, submission));
-        }
-    }
+    PG_TRY(auto submission, acquireSubmission(capture, stream, prepare));
 
     std::unique_ptr<StreamCompletion> stream_completion;
     if (!capture.active) {

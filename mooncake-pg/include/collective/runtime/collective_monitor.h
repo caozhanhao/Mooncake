@@ -60,11 +60,12 @@ class CollectiveMonitor {
     void unregisterFailureTarget(
         const std::shared_ptr<CollectiveSubmission>& submission,
         uint64_t failure_target_id);
-    PGResult<std::shared_ptr<CollectiveSubmission>> findGraphSubmission(
-        uint64_t graph_id, cudaStream_t capture_stream) const;
-    PGResult<void> retainGraphSubmission(
+    // Reuse the graph-held submission, or prepare and attach it on first use.
+    // Runtime admission serializes creation for one communicator.
+    PGResult<std::shared_ptr<CollectiveSubmission>> acquireGraphSubmission(
         const GraphCaptureState& capture, cudaStream_t capture_stream,
-        std::shared_ptr<CollectiveSubmission> submission);
+        const std::function<
+            PGResult<std::shared_ptr<CollectiveSubmission>>()>& prepare);
     void markCompletionUnproven();
     void retainStreamCompletion(std::unique_ptr<StreamCompletion> completion);
 

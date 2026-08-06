@@ -95,22 +95,22 @@ void CollectiveMonitor::unregisterFailureTarget(
 }
 
 PGResult<std::shared_ptr<CollectiveSubmission>>
-CollectiveMonitor::findGraphSubmission(uint64_t graph_id,
-                                       cudaStream_t capture_stream) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto found = graph_submissions_.find(graph_id);
-    if (found == graph_submissions_.end()) {
-        return std::shared_ptr<CollectiveSubmission>{};
-    }
-    PG_VALIDATE_STATE(
-        found->second.capture_stream == capture_stream,
-        "multi-stream collective CUDA Graph capture is unsupported");
-    return found->second.submission;
-}
-
-PGResult<void> CollectiveMonitor::retainGraphSubmission(
+CollectiveMonitor::acquireGraphSubmission(
     const GraphCaptureState& capture, cudaStream_t capture_stream,
-    std::shared_ptr<CollectiveSubmission> submission) {
+    const std::function<PGResult<std::shared_ptr<CollectiveSubmission>>()>&
+        prepare) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = graph_submissions_.find(capture.id);
+        if (found != graph_submissions_.end()) {
+            PG_VALIDATE_STATE(
+                found->second.capture_stream == capture_stream,
+                "multi-stream collective CUDA Graph capture is unsupported");
+            return found->second.submission;
+        }
+    }
+
+    PG_TRY(auto submission, prepare());
     // This callback proves that no graph or executable can use the submission
     // again. It does not represent completion of any individual replay.
     auto payload = std::make_unique<GraphReleasePayload>(GraphReleasePayload{
@@ -127,8 +127,8 @@ PGResult<void> CollectiveMonitor::retainGraphSubmission(
     std::lock_guard<std::mutex> lock(mutex_);
     graph_submissions_.emplace(
         capture.id, GraphSubmission{.capture_stream = capture_stream,
-                                    .submission = std::move(submission)});
-    return {};
+                                    .submission = submission});
+    return submission;
 }
 
 void CollectiveMonitor::markCompletionUnproven() {
