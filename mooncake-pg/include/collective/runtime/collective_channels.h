@@ -42,9 +42,12 @@ class CollectiveChannels {
     const CollectiveControlLayout& layout() const { return layout_; }
     void* peerControlBase() const { return peer_control_->base(); }
 
-    // Channel identity is wire-visible. Callers must request the exact channel
-    // selected by the matching collective order on every rank.
-    PGResult<CollectiveChannel> acquire(uint32_t channel_index);
+    // Channel identity is wire-visible. Acquisition selects only the next
+    // channel in collective order and never falls back to a locally free one.
+    PGResult<CollectiveChannel> acquire();
+    // View application is collective-quiescent. Resetting here gives every
+    // rank the same channel order for the replacement view.
+    void resetOrder();
     void release(const CollectiveChannel& channel);
     void abandon(const CollectiveChannel& channel);
     bool close(bool resources_safe);
@@ -91,6 +94,7 @@ class CollectiveChannels {
 
     std::mutex mutex_;
     std::vector<ChannelState> states_;
+    uint32_t next_channel_index_ = 0;
     bool closed_ = false;
 };
 

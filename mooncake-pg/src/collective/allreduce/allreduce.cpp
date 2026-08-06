@@ -4,9 +4,11 @@
 #include <utility>
 
 #include "collective/buffer/collective_buffer_pool.h"
+#include "collective/plan/device_plan.h"
 #include "collective/runtime/collective_channels.h"
 #include "collective/runtime/collective_submission.h"
 #include "collective/runtime/control_block.cuh"
+#include "collective/runtime/runtime.h"
 
 namespace mooncake {
 namespace {
@@ -117,18 +119,61 @@ PGResult<AllReducePlan> buildAllReducePlan(const CollectivePlanSet& plans,
     return plan;
 }
 
-PGResult<std::shared_ptr<CollectiveSubmission>> prepareAllReduceSubmission(
+PGResult<std::unique_ptr<AllReduce>> AllReduce::create(
     CollectiveBufferPool& buffer_pool, CollectiveChannels& channels,
-    uint32_t channel_index, DeviceId device, const std::string& te_location,
-    TransferEngine* engine, uint64_t timeout_device_ticks) {
-    PG_TRY(auto channel, channels.acquire(channel_index));
-    auto acquired = buffer_pool.acquire(device, kAllReduceBufferBytes,
-                                        kBufferAlignment, te_location, engine);
-    if (!acquired.has_value()) {
-        channels.release(channel);
-        return makePGError(std::move(acquired).error());
+    TransferEngine* engine, DeviceId device, std::string te_location) {
+    PG_TRY(auto plan, DevicePlan<AllReducePlan>::create(device));
+    return std::unique_ptr<AllReduce>(new AllReduce(
+        buffer_pool, channels, engine, device, std::move(te_location),
+        std::move(plan)));
+}
+
+AllReduce::AllReduce(CollectiveBufferPool& buffer_pool,
+                     CollectiveChannels& channels, TransferEngine* engine,
+                     DeviceId device, std::string te_location,
+                     std::unique_ptr<DevicePlan<AllReducePlan>> plan)
+    : buffer_pool_(buffer_pool),
+      channels_(channels),
+      engine_(engine),
+      device_(device),
+      te_location_(std::move(te_location)),
+      plan_(std::move(plan)) {}
+
+AllReduce::~AllReduce() noexcept = default;
+
+bool AllReduce::supports(DataType datatype, ReduceOp op) const {
+    return protocol_ == AllReduceProtocol::Planned &&
+           supportsPlannedAllReduce(datatype, op);
+}
+
+PGResult<void> AllReduce::apply(const CollectivePlanSet& plans,
+                                const ResolvedCollectiveView& view) {
+    protocol_ = plans.allreduce_protocol;
+    auto built = buildAllReducePlan(plans, view);
+    if (!built.has_value()) {
+        AllReducePlan invalid;
+        invalid.view_epoch = view.epoch;
+        invalid.self_participating = view.self_ordinal.has_value() ? 1 : 0;
+        invalid.error_code =
+            static_cast<int32_t>(CollectiveProtocolError::InvalidPlan);
+        plan_->publishInvalid(invalid);
+        return makePGError(std::move(built).error());
     }
-    auto buffer = std::move(acquired).value();
+    plan_->publish(built.value());
+    return {};
+}
+
+PGResult<std::shared_ptr<CollectiveSubmission>>
+AllReduce::prepareSubmission(uint64_t timeout_device_ticks) {
+    PG_TRY(auto buffer,
+           buffer_pool_.acquire(device_, kAllReduceBufferBytes,
+                                kBufferAlignment, te_location_, engine_));
+    auto acquired_channel = channels_.acquire();
+    if (!acquired_channel.has_value()) {
+        buffer_pool_.release(*buffer);
+        return makePGError(std::move(acquired_channel).error());
+    }
+    auto channel = std::move(acquired_channel).value();
     const auto kernel_resources = CollectiveKernelResources{
         .buffer =
             CollectiveKernelBuffer{
@@ -149,21 +194,38 @@ PGResult<std::shared_ptr<CollectiveSubmission>> prepareAllReduceSubmission(
         .timeout_device_ticks = timeout_device_ticks,
     };
     return std::make_shared<CollectiveSubmission>(
-        buffer_pool, channels, channel, std::move(buffer), kernel_resources);
+        buffer_pool_, channels_, channel, std::move(buffer), kernel_resources);
 }
 
-void launchAllReduce(const AllReduceRequest& request, const AllReducePlan* plan,
-                     const CollectiveKernelArgs& common, cudaStream_t stream) {
-    launchAllReduceExecutor(
-        AllReduceKernelArgs{
-            .input = request.input,
-            .output = request.output,
-            .common = common,
-            .plan = plan,
-            .element_count = request.element_count,
-            .datatype = request.datatype,
+PGResult<void> AllReduce::submit(CollectiveRuntime& runtime,
+                                 const AllReduceRequest& request,
+                                 cudaStream_t stream,
+                                 int32_t* failed_ranks_hint,
+                                 size_t failed_ranks_hint_count) {
+    PG_VALIDATE_STATE(protocol_ == AllReduceProtocol::Planned,
+                      "planned AllReduce is not enabled for this group");
+    PG_TRY(auto plan, plan_->devicePlan());
+    return runtime.submit(
+        stream, failed_ranks_hint, failed_ranks_hint_count,
+        [this, &runtime]() {
+            return prepareSubmission(runtime.timeoutDeviceTicks());
         },
-        stream);
+        [request, plan, stream](const CollectiveKernelArgs& common) {
+            launchAllReduceExecutor(
+                AllReduceKernelArgs{
+                    .input = request.input,
+                    .output = request.output,
+                    .common = common,
+                    .plan = plan,
+                    .element_count = request.element_count,
+                    .datatype = request.datatype,
+                },
+                stream);
+        });
+}
+
+void AllReduce::retainPlanForProcessLifetime() {
+    plan_->retainForProcessLifetime();
 }
 
 }  // namespace mooncake

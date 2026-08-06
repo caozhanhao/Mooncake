@@ -136,18 +136,17 @@ CollectiveChannels::~CollectiveChannels() noexcept {
     if (!closed_) (void)close(false);
 }
 
-PGResult<CollectiveChannel> CollectiveChannels::acquire(
-    uint32_t channel_index) {
+PGResult<CollectiveChannel> CollectiveChannels::acquire() {
     std::lock_guard<std::mutex> lock(mutex_);
     PG_VALIDATE_STATE(!closed_, "collective channels are closed");
-    PG_VALIDATE_ARG(channel_index < states_.size(),
-                    "collective channel index is invalid");
+    const auto channel_index = next_channel_index_;
     auto& state = states_[channel_index];
     if (state != ChannelState::Free) {
         return makePGError(PGErrorCode::ResourceBusy,
                            "collective channel is busy");
     }
     state = ChannelState::Acquired;
+    next_channel_index_ = (channel_index + 1) % states_.size();
     host_controls_[channel_index] = CollectiveControlBlock{};
     resetHostCommand(host_commands_[channel_index]);
     return CollectiveChannel{
@@ -161,6 +160,12 @@ PGResult<CollectiveChannel> CollectiveChannels::acquire(
         .host_command = host_commands_ + channel_index,
         .device_command = device_commands_ + channel_index,
     };
+}
+
+void CollectiveChannels::resetOrder() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    PG_ASSERT(!closed_, "collective channels are closed");
+    next_channel_index_ = 0;
 }
 
 void CollectiveChannels::release(const CollectiveChannel& channel) {

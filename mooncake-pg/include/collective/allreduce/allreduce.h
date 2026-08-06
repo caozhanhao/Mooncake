@@ -19,8 +19,11 @@ namespace mooncake {
 
 class CollectiveBufferPool;
 class CollectiveChannels;
+class CollectiveRuntime;
 class CollectiveSubmission;
 class TransferEngine;
+template <typename Plan>
+class DevicePlan;
 
 struct FlatRingPlan {
     uint32_t participant_count = 0;
@@ -64,13 +67,45 @@ PGResult<AllReduceRequest> makeAllReduceRequest(const void* input, void* output,
 PGResult<AllReducePlan> buildAllReducePlan(const CollectivePlanSet& plans,
                                            const ResolvedCollectiveView& view);
 
-// The current bulk AllReduce protocol chooses and lays out its own registered
-// transfer buffer. Runtime receives only the finished submission and remains
-// independent of operation-specific memory requirements.
-PGResult<std::shared_ptr<CollectiveSubmission>> prepareAllReduceSubmission(
-    CollectiveBufferPool& buffer_pool, CollectiveChannels& channels,
-    uint32_t channel_index, DeviceId device, const std::string& te_location,
-    TransferEngine* engine, uint64_t timeout_device_ticks);
+// Group-scoped owner of the typed AllReduce feature. It contains the complete
+// policy-to-plan, submission-preparation and launch path without introducing a
+// virtual collective registry.
+class AllReduce {
+   public:
+    static PGResult<std::unique_ptr<AllReduce>> create(
+        CollectiveBufferPool& buffer_pool, CollectiveChannels& channels,
+        TransferEngine* engine, DeviceId device, std::string te_location);
+    ~AllReduce() noexcept;
+
+    bool supports(DataType datatype, ReduceOp op) const;
+    PGResult<void> apply(const CollectivePlanSet& plans,
+                         const ResolvedCollectiveView& view);
+    PGResult<void> submit(CollectiveRuntime& runtime,
+                          const AllReduceRequest& request,
+                          cudaStream_t stream, int32_t* failed_ranks_hint,
+                          size_t failed_ranks_hint_count);
+    void retainPlanForProcessLifetime();
+
+    AllReduce(const AllReduce&) = delete;
+    AllReduce& operator=(const AllReduce&) = delete;
+
+   private:
+    AllReduce(CollectiveBufferPool& buffer_pool,
+              CollectiveChannels& channels, TransferEngine* engine,
+              DeviceId device, std::string te_location,
+              std::unique_ptr<DevicePlan<AllReducePlan>> plan);
+
+    PGResult<std::shared_ptr<CollectiveSubmission>> prepareSubmission(
+        uint64_t timeout_device_ticks);
+
+    CollectiveBufferPool& buffer_pool_;
+    CollectiveChannels& channels_;
+    TransferEngine* engine_ = nullptr;
+    DeviceId device_ = kInvalidDeviceId;
+    std::string te_location_;
+    std::unique_ptr<DevicePlan<AllReducePlan>> plan_;
+    AllReduceProtocol protocol_ = AllReduceProtocol::Legacy;
+};
 
 struct AllReduceKernelArgs {
     const void* input = nullptr;
@@ -81,8 +116,6 @@ struct AllReduceKernelArgs {
     DataType datatype = DataType::Float16;
 };
 
-void launchAllReduce(const AllReduceRequest& request, const AllReducePlan* plan,
-                     const CollectiveKernelArgs& common, cudaStream_t stream);
 void launchAllReduceExecutor(const AllReduceKernelArgs& args,
                              cudaStream_t stream);
 

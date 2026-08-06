@@ -21,17 +21,18 @@ The Torch adapter remains unchanged. Dispatch changes only inside
                     applyView                       allReduce
                        |                                |
                        v                                v
-          resolveCollectiveView          prepareAllReduceSubmission
-          GroupView + LinkManagers        channel + transfer buffer
-                       |                                |
-                       v                                v
-             buildAllReducePlan                CollectiveRuntime
-                       |                     lifetime + launch
-                       v                                |
-              DevicePlan::publish                       v
-                                               AllReduce executor
-                       |                                |
-                       `---------------------->     Flat Ring
+          resolveCollectiveView                 AllReduce
+          GroupView + LinkManagers       typed feature owner
+                       |                 /                 \
+                       v                v                   v
+              AllReduce::apply    prepare submission  launch executor
+                       |                \                   /
+                       v                 v                 v
+             buildAllReducePlan          CollectiveRuntime
+                       |                 lifetime + launch
+                       v                         |
+              DevicePlan::publish               v
+                                             Flat Ring
                                                         |
                                                         v
                                               PeerRoute transport
@@ -57,7 +58,8 @@ Process-level services remain shared across groups:
  GroupCollectiveEngine
  ├── GroupEndpointV2
  ├── CollectiveChannels            fixed signals, status and Host commands
- ├── DevicePlan<AllReducePlan>
+ ├── AllReduce
+ │   └── DevicePlan<AllReducePlan>
  └── CollectiveRuntime
       └── CollectiveMonitor
 ```
@@ -95,8 +97,8 @@ endpoints, `GroupView`, or link-manager APIs. Operation builders assign roles
 such as predecessor/successor, parent/children, or local leader from this
 shared projection.
 
-Adding AllGather does not require another framework layer. It adds one
-parallel feature module and explicit typed state to the existing group owner:
+Adding AllGather does not require another framework layer or another Engine
+submission recipe. It adds one parallel typed feature owner:
 
 ```text
  collective/allgather/
@@ -106,17 +108,18 @@ parallel feature module and explicit typed state to the existing group owner:
  └── ring/tree algorithm routine
 
  GroupCollectiveEngine
- ├── DevicePlan<AllReducePlan> allreduce_plan
- ├── DevicePlan<AllGatherPlan> allgather_plan
- ├── allReduce(AllReduceRequest)
- └── allGather(AllGatherRequest)
+ ├── AllReduce allreduce
+ ├── AllGather allgather
+ ├── allReduce(request)  -> allreduce.submit(...)
+ └── allGather(request)  -> allgather.submit(...)
 ```
 
 `applyView()` resolves membership and routes once, then explicitly builds and
-publishes each operation's typed plan. The finite list is intentionally visible
-instead of hidden behind a virtual builder registry. `CollectiveRuntime`,
-collective monitoring, and transport code remain shared. Each operation owns
-the preparation of any algorithm-specific transfer memory it needs.
+applies each typed feature owner. The finite list is intentionally visible
+instead of hidden behind a virtual builder registry. Each owner contains its
+protocol state, stable typed plan, operation-specific submission preparation,
+and executor launch. `CollectiveRuntime`, collective monitoring, channels, and
+transport code remain shared.
 
 Ranks agree on algorithm and participant order. They do not need identical
 physical transports for a directed edge: `DevP2p`, `DevRdma`, and `Host` all
@@ -131,8 +134,7 @@ with the resolved local view and returns the executable `AllReducePlan`.
 `DevicePlan<T>` owns only its stable device-visible value; it has no GroupView,
 invocation state, or operation-building responsibilities. Physical channels
 own the invocation sequence shared by every collective operation on that
-channel, so
-adding an operation cannot create an overlapping wire-token domain.
+channel, so adding an operation cannot create an overlapping wire-token domain.
 
 ```text
  GroupView + LinkManagers
@@ -184,7 +186,10 @@ allocator hierarchy.
 ```text
  GroupCollectiveEngine::allReduce
           |
-          +--> prepareAllReduceSubmission
+          v
+ AllReduce::submit
+          |
+          +--> prepareSubmission
           |    ├── acquire exact communicator channel
           |    └── lease bulk transfer buffer
           |              |
@@ -194,7 +199,7 @@ allocator hierarchy.
           |              |
           v              v
  CollectiveRuntime::submit(prepare, launch)
-          ├── launchAllReduce
+          ├── AllReduce executor
           └── CollectiveMonitor
                ├── eager event retirement
                ├── graph user-object retirement
@@ -257,12 +262,12 @@ Deferred:
 
 ## Review path
 
-1. Feature owner and complete happy paths:
+1. Group owner and typed feature delegation:
    `collective/group_collective_engine.*`.
 2. Control-to-local projection:
    `collective/resolved_collective_view.*`, then
    `collective/transport/peer_route.h`.
-3. Typed AllReduce request and plan:
+3. Complete typed AllReduce feature—request, plan, preparation and launch:
    `collective/allreduce/allreduce.*` and `collective/plan/device_plan.h`.
 4. Submission lifetime and monitoring:
    `collective/runtime/runtime.*`, `collective_submission.*`,
