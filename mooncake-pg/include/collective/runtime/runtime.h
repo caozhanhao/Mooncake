@@ -10,7 +10,6 @@
 #include <mutex>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <utility>
 
 #include <cuda_alike.h>
@@ -64,13 +63,6 @@ class CollectiveRuntime {
         const CollectiveResourceLease& resources,
         uint64_t failure_target_id) const;
 
-    struct GraphResources {
-        // Reusing one resource set is safe only while captured nodes remain
-        // ordered by the same stream. Multi-stream graph capture is deferred.
-        cudaStream_t bound_stream = nullptr;
-        std::shared_ptr<CollectiveResourceLease> resources;
-    };
-
     // GroupCollectiveEngine owns the runtime and destroys it before lanes_.
     CollectiveLanePool* lanes_ = nullptr;
     CollectiveResourcePool resource_pool_;
@@ -82,7 +74,6 @@ class CollectiveRuntime {
     uint32_t next_lane_ = 0;
     std::optional<uint64_t> lane_view_epoch_;
     uint64_t next_failure_target_id_ = 1;
-    std::unordered_map<uint64_t, GraphResources> graph_resources_;
     std::atomic<bool> accepting_{true};
 };
 

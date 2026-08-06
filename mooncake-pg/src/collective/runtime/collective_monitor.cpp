@@ -11,7 +11,19 @@
 
 namespace mooncake {
 
-EagerSubmission::~EagerSubmission() noexcept {
+struct CollectiveMonitor::GraphReleaseQueue {
+    std::mutex mutex;
+    std::vector<uint64_t> released;
+    bool closed = false;
+};
+
+struct CollectiveMonitor::GraphReleasePayload {
+    std::shared_ptr<GraphReleaseQueue> queue;
+    uint64_t graph_id = 0;
+    bool notify = false;
+};
+
+StreamCompletion::~StreamCompletion() noexcept {
     if (completion) (void)cudaEventDestroy(completion);
 }
 
@@ -19,6 +31,7 @@ PGResult<std::unique_ptr<CollectiveMonitor>> CollectiveMonitor::create(
     DeviceId device, CollectiveFailureReportCallback report_failure) {
     auto monitor = std::unique_ptr<CollectiveMonitor>(
         new CollectiveMonitor(device, std::move(report_failure)));
+    monitor->graph_release_queue_ = std::make_shared<GraphReleaseQueue>();
     try {
         monitor->thread_ =
             std::thread(&CollectiveMonitor::monitorLoop, monitor.get());
@@ -79,10 +92,41 @@ void CollectiveMonitor::unregisterFailureTarget(
     if (source->targets.empty()) failure_sources_.erase(source);
 }
 
-void CollectiveMonitor::stopObserving(
-    const std::shared_ptr<CollectiveResourceLease>& resources) {
+PGResult<std::shared_ptr<CollectiveResourceLease>>
+CollectiveMonitor::findGraphResources(uint64_t graph_id,
+                                      cudaStream_t capture_stream) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    removeFailureSourceLocked(resources);
+    const auto found = graph_resources_.find(graph_id);
+    if (found == graph_resources_.end()) {
+        return std::shared_ptr<CollectiveResourceLease>{};
+    }
+    PG_VALIDATE_STATE(
+        found->second.capture_stream == capture_stream,
+        "multi-stream collective CUDA Graph capture is unsupported");
+    return found->second.resources;
+}
+
+PGResult<void> CollectiveMonitor::retainGraphResources(
+    const GraphCaptureState& capture, cudaStream_t capture_stream,
+    std::shared_ptr<CollectiveResourceLease> resources) {
+    // This callback proves that no graph or executable can use the resources
+    // again. It does not represent completion of any individual replay.
+    auto payload = std::make_unique<GraphReleasePayload>(GraphReleasePayload{
+        .queue = graph_release_queue_,
+        .graph_id = capture.id,
+    });
+    auto* payload_ptr = payload.get();
+    PG_TRY(auto user_object,
+           CudaGraphUserObject::create(payload_ptr, graphResourcesReleased));
+    (void)payload.release();
+    PG_TRY(user_object.moveTo(capture.graph));
+    payload_ptr->notify = true;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    graph_resources_.emplace(
+        capture.id, CapturedResources{.capture_stream = capture_stream,
+                                      .resources = std::move(resources)});
+    return {};
 }
 
 void CollectiveMonitor::markCompletionUnproven() {
@@ -90,28 +134,48 @@ void CollectiveMonitor::markCompletionUnproven() {
     has_unproven_completion_ = true;
 }
 
-void CollectiveMonitor::submit(std::unique_ptr<EagerSubmission> submission) {
+void CollectiveMonitor::retainStreamCompletion(
+    std::unique_ptr<StreamCompletion> completion) {
     std::lock_guard<std::mutex> lock(mutex_);
-    eager_submissions_.push_back(std::move(submission));
+    stream_completions_.push_back(std::move(completion));
 }
 
-bool CollectiveMonitor::retireCompletedSubmission() {
-    std::unique_ptr<EagerSubmission> completed;
+void CUDART_CB CollectiveMonitor::graphResourcesReleased(void* opaque) {
+    auto payload = std::unique_ptr<GraphReleasePayload>(
+        static_cast<GraphReleasePayload*>(opaque));
+    if (!payload->notify) return;
+
+    const auto queue = payload->queue;
+    std::lock_guard<std::mutex> lock(queue->mutex);
+    if (queue->closed) return;
+    queue->released.push_back(payload->graph_id);
+}
+
+void CollectiveMonitor::retireResources(
+    const std::shared_ptr<CollectiveResourceLease>& resources) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        removeFailureSourceLocked(resources);
+    }
+    if (!resources->retire()) {
+        LOG(WARNING) << "Retained collective resources after retirement";
+    }
+}
+
+bool CollectiveMonitor::retireCompletedStream() {
+    std::unique_ptr<StreamCompletion> completed;
     cudaError_t query = cudaErrorNotReady;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (size_t index = 0; index < eager_submissions_.size(); ++index) {
-            query = cudaEventQuery(eager_submissions_[index]->completion);
+        for (size_t index = 0; index < stream_completions_.size(); ++index) {
+            query = cudaEventQuery(stream_completions_[index]->completion);
             if (query == cudaErrorNotReady) continue;
 
-            completed = std::move(eager_submissions_[index]);
-            eager_submissions_[index] = std::move(eager_submissions_.back());
-            eager_submissions_.pop_back();
-            if (query == cudaSuccess) {
-                removeFailureSourceLocked(completed->resources);
-            } else {
-                has_unproven_completion_ = true;
-            }
+            completed = std::move(stream_completions_[index]);
+            stream_completions_[index] =
+                std::move(stream_completions_.back());
+            stream_completions_.pop_back();
+            if (query != cudaSuccess) has_unproven_completion_ = true;
             break;
         }
     }
@@ -125,9 +189,28 @@ bool CollectiveMonitor::retireCompletedSubmission() {
                      << cudaGetErrorString(query);
         return true;
     }
-    if (!completed->resources->retire()) {
-        LOG(WARNING) << "Retained collective resources after completion";
+    retireResources(completed->resources);
+    return true;
+}
+
+bool CollectiveMonitor::retireReleasedGraph() {
+    uint64_t graph_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(graph_release_queue_->mutex);
+        if (graph_release_queue_->released.empty()) return false;
+        graph_id = graph_release_queue_->released.back();
+        graph_release_queue_->released.pop_back();
     }
+
+    std::shared_ptr<CollectiveResourceLease> resources;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = graph_resources_.find(graph_id);
+        if (found == graph_resources_.end()) return true;
+        resources = std::move(found->second.resources);
+        graph_resources_.erase(found);
+    }
+    retireResources(resources);
     return true;
 }
 
@@ -200,7 +283,8 @@ void CollectiveMonitor::monitorLoop() noexcept {
     }
     while (!stopping_.load(std::memory_order_acquire)) {
         bool progressed = handleOneFailure();
-        progressed |= retireCompletedSubmission();
+        progressed |= retireReleasedGraph();
+        progressed |= retireCompletedStream();
         if (!progressed) {
             std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
@@ -213,16 +297,37 @@ bool CollectiveMonitor::drain(std::chrono::milliseconds timeout) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (has_unproven_completion_) return false;
-            if (eager_submissions_.empty()) return true;
+            if (stream_completions_.empty()) return true;
         }
         if (std::chrono::steady_clock::now() >= deadline) return false;
         std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
 }
 
+void CollectiveMonitor::retireGraphResourcesAtShutdown() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(graph_release_queue_->mutex);
+        graph_release_queue_->closed = true;
+        graph_release_queue_->released.clear();
+    }
+
+    while (true) {
+        std::shared_ptr<CollectiveResourceLease> resources;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (graph_resources_.empty()) return;
+            auto graph = graph_resources_.begin();
+            resources = std::move(graph->second.resources);
+            graph_resources_.erase(graph);
+        }
+        retireResources(resources);
+    }
+}
+
 void CollectiveMonitor::stop() noexcept {
     if (stopping_.exchange(true, std::memory_order_acq_rel)) return;
     if (thread_.joinable()) thread_.join();
+    retireGraphResourcesAtShutdown();
 }
 
 }  // namespace mooncake

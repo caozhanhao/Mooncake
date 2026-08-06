@@ -50,10 +50,6 @@ CollectiveRuntime::~CollectiveRuntime() noexcept {
         (void)monitor_->drain(std::chrono::milliseconds(100));
         monitor_->stop();
     }
-    for (const auto& [_, graph] : graph_resources_) {
-        monitor_->stopObserving(graph.resources);
-        (void)graph.resources->retire();
-    }
 }
 
 CollectiveKernelArgs CollectiveRuntime::makeKernelArgs(
@@ -106,34 +102,22 @@ PGResult<void> CollectiveRuntime::submit(
     }
 
     std::shared_ptr<CollectiveResourceLease> resources;
-    bool new_graph_resources = false;
     if (capture.active) {
-        if (const auto found = graph_resources_.find(capture.id);
-            found != graph_resources_.end()) {
-            PG_VALIDATE_STATE(
-                found->second.bound_stream == stream,
-                "multi-stream collective CUDA Graph capture is unsupported");
-            resources = found->second.resources;
-        } else {
-            PG_TRY(auto lease, resource_pool_.acquire(next_lane_));
-            next_lane_ = (lease.lane.index + 1) % lanes_->layout().lane_count;
-            resources =
-                std::make_shared<CollectiveResourceLease>(std::move(lease));
-            graph_resources_.emplace(
-                capture.id,
-                GraphResources{.bound_stream = stream, .resources = resources});
-            new_graph_resources = true;
-        }
-    } else {
+        PG_TRY(resources, monitor_->findGraphResources(capture.id, stream));
+    }
+    if (!resources) {
         PG_TRY(auto lease, resource_pool_.acquire(next_lane_));
         next_lane_ = (lease.lane.index + 1) % lanes_->layout().lane_count;
         resources = std::make_shared<CollectiveResourceLease>(std::move(lease));
+        if (capture.active) {
+            PG_TRY(monitor_->retainGraphResources(capture, stream, resources));
+        }
     }
 
-    std::unique_ptr<EagerSubmission> eager_submission;
+    std::unique_ptr<StreamCompletion> stream_completion;
     if (!capture.active) {
-        eager_submission = std::make_unique<EagerSubmission>(resources);
-        PG_TRY_CUDA(cudaEventCreateWithFlags(&eager_submission->completion,
+        stream_completion = std::make_unique<StreamCompletion>(resources);
+        PG_TRY_CUDA(cudaEventCreateWithFlags(&stream_completion->completion,
                                              cudaEventDisableTiming));
     }
 
@@ -151,23 +135,23 @@ PGResult<void> CollectiveRuntime::submit(
     const auto launch_error = cudaGetLastError();
     if (launch_error != cudaSuccess) {
         monitor_->unregisterFailureTarget(resources, failure_target_id);
-        if (new_graph_resources) graph_resources_.erase(capture.id);
         return cudaFailure(launch_error, "collective kernel launch");
     }
     resources->markSubmitted();
 
-    if (capture.active) return {};
-
-    const auto record_error =
-        cudaEventRecord(eager_submission->completion, stream);
-    if (record_error != cudaSuccess) {
-        // The monitor continues to observe a possible device failure. With
-        // no completion evidence, the submitted resources are retained and
-        // will be quarantined when the runtime is destroyed.
-        monitor_->markCompletionUnproven();
-        return cudaFailure(record_error, "collective completion event record");
+    if (stream_completion) {
+        const auto record_error =
+            cudaEventRecord(stream_completion->completion, stream);
+        if (record_error != cudaSuccess) {
+            // The monitor continues to observe a possible device failure. With
+            // no completion evidence, the submitted resources are retained and
+            // will be quarantined when the runtime is destroyed.
+            monitor_->markCompletionUnproven();
+            return cudaFailure(record_error,
+                               "collective completion event record");
+        }
+        monitor_->retainStreamCompletion(std::move(stream_completion));
     }
-    monitor_->submit(std::move(eager_submission));
     return {};
 }
 

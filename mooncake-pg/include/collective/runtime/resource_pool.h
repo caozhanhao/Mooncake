@@ -33,7 +33,7 @@ struct CollectiveBufferLayout {
 //   |- CollectiveLanePool         stable wire-control addresses + lane owners
 //   `- CollectiveRuntime
 //       |- eager invocation       temporary CollectiveResourceLease
-//       `- graph_resources[id]    same lease, retained until destruction
+//       `- captured graph         same lease, retired by its CUDA User Object
 //
 // The lease owns the composed resources. Before submission, destruction is a
 // normal acquisition rollback. After markSubmitted(), destruction

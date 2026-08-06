@@ -20,14 +20,62 @@ void warnCleanupFailure(const char* operation, const char* error) noexcept {
 PGResult<GraphCaptureState> queryGraphCapture(cudaStream_t stream) {
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
     unsigned long long capture_id = 0;
-    PG_TRY_CUDA(cudaStreamGetCaptureInfo(stream, &status, &capture_id));
+    cudaGraph_t graph = nullptr;
+#if CUDART_VERSION >= 13000
+    PG_TRY_CUDA(cudaStreamGetCaptureInfo(stream, &status, &capture_id, &graph,
+                                        nullptr, nullptr, nullptr));
+#else
+    PG_TRY_CUDA(cudaStreamGetCaptureInfo_v2(
+        stream, &status, &capture_id, &graph, nullptr, nullptr));
+#endif
     if (status == cudaStreamCaptureStatusNone) return GraphCaptureState{};
     PG_VALIDATE_STATE(status == cudaStreamCaptureStatusActive,
                       "collective CUDA Graph capture is invalidated");
     return GraphCaptureState{
         .active = true,
         .id = static_cast<uint64_t>(capture_id),
+        .graph = graph,
     };
+}
+
+PGResult<CudaGraphUserObject> CudaGraphUserObject::create(
+    void* payload, cudaHostFn_t destructor) {
+    cudaUserObject_t object = nullptr;
+    PG_TRY_CUDA(cudaUserObjectCreate(&object, payload, destructor, 1,
+                                     cudaUserObjectNoDestructorSync));
+    return CudaGraphUserObject(object);
+}
+
+CudaGraphUserObject::~CudaGraphUserObject() noexcept { reset(); }
+
+CudaGraphUserObject::CudaGraphUserObject(
+    CudaGraphUserObject&& other) noexcept
+    : object_(std::exchange(other.object_, nullptr)) {}
+
+CudaGraphUserObject& CudaGraphUserObject::operator=(
+    CudaGraphUserObject&& other) noexcept {
+    if (this != &other) {
+        reset();
+        object_ = std::exchange(other.object_, nullptr);
+    }
+    return *this;
+}
+
+PGResult<void> CudaGraphUserObject::moveTo(cudaGraph_t graph) {
+    PG_TRY_CUDA(cudaGraphRetainUserObject(graph, object_, 1,
+                                          cudaGraphUserObjectMove));
+    object_ = nullptr;
+    return {};
+}
+
+void CudaGraphUserObject::reset() noexcept {
+    if (!object_) return;
+    const auto error = cudaUserObjectRelease(object_, 1);
+    if (error != cudaSuccess) {
+        warnCleanupFailure("release CUDA Graph user object",
+                           cudaGetErrorString(error));
+    }
+    object_ = nullptr;
 }
 
 GpuDeviceGuard::GpuDeviceGuard(int device) {

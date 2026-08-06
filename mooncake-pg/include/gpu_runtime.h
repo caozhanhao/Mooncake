@@ -12,9 +12,35 @@ namespace mooncake {
 struct GraphCaptureState {
     bool active = false;
     uint64_t id = 0;
+    cudaGraph_t graph = nullptr;
 };
 
 PGResult<GraphCaptureState> queryGraphCapture(cudaStream_t stream);
+
+// Owns the initial reference returned by cudaUserObjectCreate. moveTo()
+// transfers that reference to a CUDA Graph; destruction releases it when the
+// transfer did not happen. The user payload itself remains owned by CUDA's
+// destructor callback once create() succeeds.
+class CudaGraphUserObject {
+   public:
+    static PGResult<CudaGraphUserObject> create(void* payload,
+                                                cudaHostFn_t destructor);
+    ~CudaGraphUserObject() noexcept;
+
+    CudaGraphUserObject(const CudaGraphUserObject&) = delete;
+    CudaGraphUserObject& operator=(const CudaGraphUserObject&) = delete;
+    CudaGraphUserObject(CudaGraphUserObject&& other) noexcept;
+    CudaGraphUserObject& operator=(CudaGraphUserObject&& other) noexcept;
+
+    PGResult<void> moveTo(cudaGraph_t graph);
+
+   private:
+    explicit CudaGraphUserObject(cudaUserObject_t object) : object_(object) {}
+
+    void reset() noexcept;
+
+    cudaUserObject_t object_ = nullptr;
+};
 
 class GpuDeviceGuard {
    public:
