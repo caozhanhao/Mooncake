@@ -21,14 +21,17 @@ The Torch adapter remains unchanged. Dispatch changes only inside
                     applyView                       allReduce
                        |                                |
                        v                                v
-          resolveCollectiveView                 CollectiveRuntime
-          GroupView + LinkManagers              resources + launch
+          resolveCollectiveView          prepareAllReduceSubmission
+          GroupView + LinkManagers        channel + transfer buffer
                        |                                |
                        v                                v
-             buildAllReducePlan                AllReduce executor
+             buildAllReducePlan                CollectiveRuntime
+                       |                     lifetime + launch
+                       v                                |
+              DevicePlan::publish                       v
+                                               AllReduce executor
                        |                                |
-                       v                                v
-              DevicePlan::publish                  Flat Ring
+                       `---------------------->     Flat Ring
                                                         |
                                                         v
                                               PeerRoute transport
@@ -47,21 +50,22 @@ Process-level services remain shared across groups:
 ```text
  MooncakePGContext
  ├── CollectiveBufferPool          registered device arena per device
- ├── CollectiveControlPool         mapped host/device status blocks
- ├── HostTransferExecutor          mapped commands + Host TE execution
+ ├── HostTransferExecutor          polls communicator command regions
  ├── DeviceLinkManager             process-owned device links
  └── LinkManager                   process-owned Host TE links
 
  GroupCollectiveEngine
  ├── GroupEndpointV2
- ├── CollectiveLanePool            shared invocation order + peer signals
+ ├── CollectiveChannels            fixed signals, status and Host commands
  ├── DevicePlan<AllReducePlan>
  └── CollectiveRuntime
+      └── CollectiveMonitor
 ```
 
-Consequently, invocation buffers, status blocks, and Host commands are reused
-across groups. Peer-signal spans and graph-retained invocation resources are
-group scoped.
+Only the large registered transfer buffers are time-shared across groups.
+Peer signals, mapped status blocks, Host commands, and invocation sequences
+have stable communicator lifetime. `HostTransferExecutor` executes commands
+from registered communicator regions but does not own their storage.
 
 ## Control policy and local resolution
 
@@ -111,7 +115,8 @@ parallel feature module and explicit typed state to the existing group owner:
 `applyView()` resolves membership and routes once, then explicitly builds and
 publishes each operation's typed plan. The finite list is intentionally visible
 instead of hidden behind a virtual builder registry. `CollectiveRuntime`,
-resource pools, collective monitoring, and transport code remain unchanged.
+collective monitoring, and transport code remain shared. Each operation owns
+the preparation of any algorithm-specific transfer memory it needs.
 
 Ranks agree on algorithm and participant order. They do not need identical
 physical transports for a directed edge: `DevP2p`, `DevRdma`, and `Host` all
@@ -124,8 +129,9 @@ launch.
 The Coordinator publishes `AllReducePolicy`; `buildAllReducePlan()` combines it
 with the resolved local view and returns the executable `AllReducePlan`.
 `DevicePlan<T>` owns only its stable device-visible value; it has no GroupView,
-invocation state, or operation-building responsibilities. Physical lanes own
-the invocation sequence shared by every collective operation on that lane, so
+invocation state, or operation-building responsibilities. Physical channels
+own the invocation sequence shared by every collective operation on that
+channel, so
 adding an operation cannot create an overlapping wire-token domain.
 
 ```text
@@ -159,52 +165,58 @@ this PR.
 
 ## Submission and resource lifetime
 
-The runtime is collective-neutral because the following responsibilities are
-shared by AllReduce, AllGather, Broadcast, and future operations:
+The operation owns resource requirements. Current bulk AllReduce chooses its
+registered staging/protocol layout and acquires a buffer from the process-level
+pool. This keeps a future low-latency protocol free to use communicator-fixed
+memory without adding branches to the common runtime.
 
-- choose an invocation lane;
-- acquire the resource bundle;
-- retain graph resources by capture id;
+The runtime retains only responsibilities shared by submitted operations:
+
+- serialize host admission;
+- ask operation code to prepare a submission only when one is needed;
+- retain graph submissions by capture id;
 - record eager completion;
 - observe and acknowledge device failure reports.
 
-Operation code supplies only a typed request, plan pointer, and launch callback.
-There is no virtual `CollectiveInvocation` hierarchy.
+There is no virtual `CollectiveInvocation`, resource registry, or common
+allocator hierarchy.
 
 ```text
  GroupCollectiveEngine::allReduce
           |
-          v
- CollectiveRuntime::submit(launch)
-          |
-          +--> CollectiveResourcePool
-          |    ├── lane
-          |    ├── registered device buffer
-          |    ├── mapped status block
-          |    └── Host transfer command
-          |
-          +--> launchAllReduce
-          |
-          `--> CollectiveMonitor
-               ├── eager completion retirement
+          +--> prepareAllReduceSubmission
+          |    ├── acquire exact communicator channel
+          |    └── lease bulk transfer buffer
+          |              |
+          |              v
+          |      CollectiveSubmission
+          |      prepared kernel ABI + lifetime
+          |              |
+          v              v
+ CollectiveRuntime::submit(prepare, launch)
+          ├── launchAllReduce
+          └── CollectiveMonitor
+               ├── eager event retirement
+               ├── graph user-object retirement
                └── failure claim / report / acknowledge
 ```
 
-Eager and graph execution use the same resource and device protocol. Eager
-resources are temporary and return after completion. A graph capture pins one
-bundle until communicator teardown.
+Eager and graph execution use the same prepared submission and device protocol.
+Only retention differs: eager uses a completion event, while graph capture
+attaches a GPU user object and keeps the submission until no graph or executable
+can reference it. Communicator teardown remains terminal: callers must not
+replay or destroy a communicator while its graph execution is in flight.
 
-Pool entries have explicit lifecycle states:
+The pooled bulk buffer and its exact channel are retired together:
 
 ```text
- Free -> Acquired -> Free
-                 `-> Abandoned
+ prepared --launch--> submitted --completion proven--> returned
+     |                       `--safety unproven--------> quarantined
+     `--launch rejected-------------------------------> returned
 ```
 
-`release()` means asynchronous use is proven complete and permits reuse.
-`abandon()` means reuse safety is unknown; that entry and its backing arena are
-retained for process lifetime. There is no ownerless `in_use/reusable` boolean
-combination and no reuse-safety boolean propagated between pools.
+Only the large buffer returns to the process pool for cross-group reuse. A
+quarantined buffer range and channel are never silently selected again.
 
 ## Failure boundary
 
@@ -229,14 +241,16 @@ Implemented on the planned path:
 - per-peer `DevP2p`, `DevRdma`, or `Host` routes;
 - device API and Host transfer execution paths;
 - one eager/CUDA Graph execution protocol;
+- communicator-fixed control channels and cross-group bulk-buffer reuse;
 - failure publication and sync-after-failure.
 
 Deferred:
 
 - Hierarchical AllReduce and topology/performance policy;
 - AllGather, Broadcast, and general hybrid dependency scheduling;
+- low-latency communicator-fixed data paths and receiver-driven bulk paths;
 - the control-plane quiescing phase and device replay gate;
-- graph destruction callbacks and independently pinned concurrent graph lanes;
+- independently pinned concurrent multi-stream graph submissions;
 - device-RDMA reconnect semantics after uncertain in-flight work;
 - cross-rank concurrent lane admission;
 - collective-wide success/failure rendezvous.
@@ -250,9 +264,9 @@ Deferred:
    `collective/transport/peer_route.h`.
 3. Typed AllReduce request and plan:
    `collective/allreduce/allreduce.*` and `collective/plan/device_plan.h`.
-4. Common submission resources and monitoring:
-   `collective/runtime/runtime.*`, `resource_pool.*`, and
-   `collective_monitor.*`.
+4. Submission lifetime and monitoring:
+   `collective/runtime/runtime.*`, `collective_submission.*`,
+   `collective_channels.*`, and `collective_monitor.*`.
 5. Device execution:
    `collective/device_context.cuh`, `collective/allreduce/flat_ring.cuh`, then
    `collective/transport/`.

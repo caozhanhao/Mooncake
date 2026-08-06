@@ -16,7 +16,7 @@
 
 #include <cuda_alike.h>
 
-#include "collective/runtime/resource_pool.h"
+#include "collective/runtime/collective_submission.h"
 #include "error_types.h"
 #include "gpu_runtime.h"
 
@@ -31,23 +31,23 @@ struct CollectiveFailureTarget {
     size_t failed_ranks_hint_count = 0;
 };
 
-// Stream-ordered evidence that one eager use of the resources has completed.
-// The monitor owns this value until the event permits resource retirement.
+// Stream-ordered evidence that one eager submission has completed. The monitor
+// owns this value until the event permits submission retirement.
 struct StreamCompletion {
-    explicit StreamCompletion(std::shared_ptr<CollectiveResourceLease> value)
-        : resources(std::move(value)) {}
+    explicit StreamCompletion(std::shared_ptr<CollectiveSubmission> value)
+        : submission(std::move(value)) {}
     ~StreamCompletion() noexcept;
 
     StreamCompletion(const StreamCompletion&) = delete;
     StreamCompletion& operator=(const StreamCompletion&) = delete;
 
-    std::shared_ptr<CollectiveResourceLease> resources;
+    std::shared_ptr<CollectiveSubmission> submission;
     cudaEvent_t completion = nullptr;
 };
 
 // Communicator-scoped host loop. It observes device failure reports and owns
-// resource retirement for both stream completions and captured CUDA Graphs. It
-// does not progress collective data.
+// submission retirement for both stream completions and captured GPU Graphs.
+// It does not progress collective data.
 class CollectiveMonitor {
    public:
     static PGResult<std::unique_ptr<CollectiveMonitor>> create(
@@ -55,16 +55,16 @@ class CollectiveMonitor {
     ~CollectiveMonitor() noexcept;
 
     void registerFailureTarget(
-        std::shared_ptr<CollectiveResourceLease> resources,
+        std::shared_ptr<CollectiveSubmission> submission,
         CollectiveFailureTarget target);
     void unregisterFailureTarget(
-        const std::shared_ptr<CollectiveResourceLease>& resources,
+        const std::shared_ptr<CollectiveSubmission>& submission,
         uint64_t failure_target_id);
-    PGResult<std::shared_ptr<CollectiveResourceLease>> findGraphResources(
+    PGResult<std::shared_ptr<CollectiveSubmission>> findGraphSubmission(
         uint64_t graph_id, cudaStream_t capture_stream) const;
-    PGResult<void> retainGraphResources(
+    PGResult<void> retainGraphSubmission(
         const GraphCaptureState& capture, cudaStream_t capture_stream,
-        std::shared_ptr<CollectiveResourceLease> resources);
+        std::shared_ptr<CollectiveSubmission> submission);
     void markCompletionUnproven();
     void retainStreamCompletion(std::unique_ptr<StreamCompletion> completion);
 
@@ -76,21 +76,21 @@ class CollectiveMonitor {
 
    private:
     struct FailureSource {
-        std::shared_ptr<CollectiveResourceLease> resources;
+        std::shared_ptr<CollectiveSubmission> submission;
         std::vector<CollectiveFailureTarget> targets;
     };
 
     struct FailureClaim {
-        std::shared_ptr<CollectiveResourceLease> resources;
+        std::shared_ptr<CollectiveSubmission> submission;
         CollectiveFailureTarget target;
         InGroupRank failed_peer = -1;
     };
 
-    struct CapturedResources {
-        // Reusing one resource set is safe only while captured nodes remain
+    struct GraphSubmission {
+        // Reusing one submission is safe only while captured nodes remain
         // ordered by this stream. Multi-stream capture is deferred.
         cudaStream_t capture_stream = nullptr;
-        std::shared_ptr<CollectiveResourceLease> resources;
+        std::shared_ptr<CollectiveSubmission> submission;
     };
 
     struct GraphReleaseQueue;
@@ -100,19 +100,19 @@ class CollectiveMonitor {
                       CollectiveFailureReportCallback report_failure)
         : device_(device), report_failure_(std::move(report_failure)) {}
 
-    static void CUDART_CB graphResourcesReleased(void* payload);
+    static void CUDART_CB graphSubmissionReleased(void* payload);
     bool retireCompletedStream();
     bool retireReleasedGraph();
-    void retireResources(
-        const std::shared_ptr<CollectiveResourceLease>& resources);
-    void retireGraphResourcesAtShutdown() noexcept;
+    void retireSubmission(
+        const std::shared_ptr<CollectiveSubmission>& submission);
+    void retireGraphSubmissionsAtShutdown() noexcept;
     static std::optional<FailureClaim> claimFailure(
         const FailureSource& source);
     void handleFailure(const FailureClaim& failure);
     bool handleOneFailure();
     void monitorLoop() noexcept;
     void removeFailureSourceLocked(
-        const std::shared_ptr<CollectiveResourceLease>& resources);
+        const std::shared_ptr<CollectiveSubmission>& submission);
 
     DeviceId device_ = kInvalidDeviceId;
     CollectiveFailureReportCallback report_failure_;
@@ -120,7 +120,7 @@ class CollectiveMonitor {
     mutable std::mutex mutex_;
     std::vector<FailureSource> failure_sources_;
     std::vector<std::unique_ptr<StreamCompletion>> stream_completions_;
-    std::unordered_map<uint64_t, CapturedResources> graph_resources_;
+    std::unordered_map<uint64_t, GraphSubmission> graph_submissions_;
     std::shared_ptr<GraphReleaseQueue> graph_release_queue_;
     bool has_unproven_completion_ = false;
     std::thread thread_;

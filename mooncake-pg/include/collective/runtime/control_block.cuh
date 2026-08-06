@@ -37,7 +37,7 @@ struct CollectiveFailureReport {
 };
 
 // Common host-visible state for device and host transports. It is not owned by
-// HostTransferExecutor; every invocation gets the same control ABI regardless
+// HostTransferExecutor; every channel exposes the same control ABI regardless
 // of the route selected by its current plan.
 struct alignas(64) CollectiveControlBlock {
     int32_t first_error_code = 0;

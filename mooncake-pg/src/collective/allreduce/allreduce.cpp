@@ -1,11 +1,30 @@
 #include "collective/allreduce/allreduce.h"
 
 #include <limits>
+#include <utility>
 
+#include "collective/buffer/collective_buffer_pool.h"
+#include "collective/runtime/collective_channels.h"
+#include "collective/runtime/collective_submission.h"
 #include "collective/runtime/control_block.cuh"
 
 namespace mooncake {
 namespace {
+
+constexpr uint64_t kStagingBytes = 8 * kCollectiveMiB;
+constexpr uint64_t kProtocolBytes = 4096;
+constexpr uint64_t kBufferAlignment = 2 * kCollectiveMiB;
+constexpr uint64_t kLayoutAlignment = 64;
+
+constexpr uint64_t alignUp(uint64_t value, uint64_t alignment) {
+    const auto remainder = value % alignment;
+    return remainder == 0 ? value : value + alignment - remainder;
+}
+
+constexpr uint64_t kProtocolOffset =
+    alignUp(kStagingBytes, kLayoutAlignment);
+constexpr uint64_t kAllReduceBufferBytes =
+    alignUp(kProtocolOffset + kProtocolBytes, kLayoutAlignment);
 
 PGResult<FlatRingPlan> buildFlatRingPlan(const ResolvedCollectiveView& view) {
     FlatRingPlan ring;
@@ -96,6 +115,41 @@ PGResult<AllReducePlan> buildAllReducePlan(const CollectivePlanSet& plans,
         bucket.flat_ring = ring;
     }
     return plan;
+}
+
+PGResult<std::shared_ptr<CollectiveSubmission>> prepareAllReduceSubmission(
+    CollectiveBufferPool& buffer_pool, CollectiveChannels& channels,
+    uint32_t channel_index, DeviceId device, const std::string& te_location,
+    TransferEngine* engine, uint64_t timeout_device_ticks) {
+    PG_TRY(auto channel, channels.acquire(channel_index));
+    auto acquired = buffer_pool.acquire(device, kAllReduceBufferBytes,
+                                        kBufferAlignment, te_location, engine);
+    if (!acquired.has_value()) {
+        channels.release(channel);
+        return makePGError(std::move(acquired).error());
+    }
+    auto buffer = std::move(acquired).value();
+    const auto kernel_resources = CollectiveKernelResources{
+        .buffer =
+            CollectiveKernelBuffer{
+                .base = buffer->base(),
+                .arena_offset = buffer->offset(),
+                .staging_offset = 0,
+                .staging_bytes = kStagingBytes,
+                .protocol_offset = kProtocolOffset,
+                .protocol_bytes = kProtocolBytes,
+            },
+        .peer_signals =
+            CollectivePeerSignals{
+                .base = channel.peer_signals_base,
+                .offset = channel.peer_signals_offset,
+            },
+        .control = channel.device_control,
+        .host_command = channel.device_command,
+        .timeout_device_ticks = timeout_device_ticks,
+    };
+    return std::make_shared<CollectiveSubmission>(
+        buffer_pool, channels, channel, std::move(buffer), kernel_resources);
 }
 
 void launchAllReduce(const AllReduceRequest& request, const AllReducePlan* plan,

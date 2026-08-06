@@ -28,7 +28,8 @@ PGResult<std::unique_ptr<GroupCollectiveEngine>> GroupCollectiveEngine::create(
 
     auto result =
         std::unique_ptr<GroupCollectiveEngine>(new GroupCollectiveEngine(
-            device_links, host_links, device, self_in_group_rank));
+            buffer_pool, device_links, host_links, transfer_engine, device,
+            self_in_group_rank, te_location));
     PG_TRY(result->channels_,
            CollectiveChannels::create(&buffer_pool, &host_transfer_executor,
                                       device, te_location, transfer_engine));
@@ -37,10 +38,8 @@ PGResult<std::unique_ptr<GroupCollectiveEngine>> GroupCollectiveEngine::create(
     device_links.bindCollectiveArena(arena);
     PG_TRY(result->allreduce_plan_, DevicePlan<AllReducePlan>::create(device));
     PG_TRY(result->runtime_,
-           CollectiveRuntime::create(
-               &buffer_pool, result->channels_.get(), te_location,
-               transfer_engine, device,
-               collective_timeout_us, std::move(report_failure)));
+           CollectiveRuntime::create(device, collective_timeout_us,
+                                     std::move(report_failure)));
 
     result->endpoint_ = GroupEndpointV2{
         .device = arena.device,
@@ -77,7 +76,7 @@ PGResult<void> GroupCollectiveEngine::applyView(const GroupView& view) {
     auto built = buildAllReducePlan(view.collective_plans, resolved);
 
     allreduce_protocol_ = view.collective_plans.allreduce_protocol;
-    view_epoch_ = view.epoch;
+    next_channel_index_ = 0;
     if (!built.has_value()) {
         AllReducePlan invalid;
         invalid.view_epoch = view.epoch;
@@ -97,11 +96,22 @@ PGResult<void> GroupCollectiveEngine::allReduce(
     PG_VALIDATE_STATE(allreduce_protocol_ == AllReduceProtocol::Planned,
                       "planned AllReduce is not enabled for this group");
     PG_TRY(auto plan, allreduce_plan_->devicePlan());
-    return runtime_->submit(view_epoch_, stream, failed_ranks_hint,
-                            failed_ranks_hint_count,
-                            [&](const CollectiveKernelArgs& common) {
-                                launchAllReduce(request, plan, common, stream);
-                            });
+    return runtime_->submit(
+        stream, failed_ranks_hint, failed_ranks_hint_count,
+        [this]() -> PGResult<std::shared_ptr<CollectiveSubmission>> {
+            const auto channel_index = next_channel_index_;
+            PG_TRY(auto submission,
+                   prepareAllReduceSubmission(
+                       buffer_pool_, *channels_, channel_index, device_,
+                       te_location_, transfer_engine_,
+                       runtime_->timeoutDeviceTicks()));
+            next_channel_index_ =
+                (channel_index + 1) % channels_->layout().channel_count;
+            return submission;
+        },
+        [&request, plan, stream](const CollectiveKernelArgs& common) {
+            launchAllReduce(request, plan, common, stream);
+        });
 }
 
 bool GroupCollectiveEngine::stop(std::chrono::milliseconds timeout) {

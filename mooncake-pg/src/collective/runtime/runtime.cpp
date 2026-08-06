@@ -1,6 +1,5 @@
 #include "collective/runtime/runtime.h"
 
-#include <atomic>
 #include <limits>
 #include <memory>
 #include <string>
@@ -20,9 +19,7 @@ PGResult<void> cudaFailure(cudaError_t error, const char* operation) {
 }  // namespace
 
 PGResult<std::unique_ptr<CollectiveRuntime>> CollectiveRuntime::create(
-    CollectiveBufferPool* buffer_pool, CollectiveChannels* channels,
-    std::string te_location, TransferEngine* engine, DeviceId device,
-    size_t collective_timeout_us,
+    DeviceId device, size_t collective_timeout_us,
     CollectiveFailureReportCallback failure_report_callback) {
     const GpuDeviceGuard guard(device);
     int clock_rate_khz = 0;
@@ -35,9 +32,8 @@ PGResult<std::unique_ptr<CollectiveRuntime>> CollectiveRuntime::create(
             ? std::numeric_limits<uint64_t>::max()
             : collective_timeout_us * clock_rate / 1000ULL;
 
-    auto runtime = std::unique_ptr<CollectiveRuntime>(new CollectiveRuntime(
-        buffer_pool, channels, std::move(te_location), engine, device,
-        timeout_ticks));
+    auto runtime = std::unique_ptr<CollectiveRuntime>(
+        new CollectiveRuntime(device, timeout_ticks));
     PG_TRY(runtime->monitor_, CollectiveMonitor::create(
                                   device, std::move(failure_report_callback)));
     return runtime;
@@ -51,39 +47,11 @@ CollectiveRuntime::~CollectiveRuntime() noexcept {
     }
 }
 
-CollectiveKernelArgs CollectiveRuntime::makeKernelArgs(
-    const CollectiveResourceLease& resources,
-    uint64_t failure_target_id) const {
-    const auto& layout = CollectiveResourcePool::bufferLayout();
-    return CollectiveKernelArgs{
-        .resources =
-            CollectiveKernelResources{
-                .buffer =
-                    CollectiveKernelBuffer{
-                        .base = resources.buffer->base(),
-                        .arena_offset = resources.buffer->offset(),
-                        .staging_offset = layout.staging.offset,
-                        .staging_bytes = layout.staging.bytes,
-                        .protocol_offset = layout.protocol.offset,
-                        .protocol_bytes = layout.protocol.bytes,
-                    },
-                .peer_signals =
-                    CollectivePeerSignals{
-                        .base = resources.channel.peer_signals_base,
-                        .offset = resources.channel.peer_signals_offset,
-                    },
-                .control = resources.channel.device_control,
-                .host_command = resources.channel.device_command,
-                .timeout_device_ticks = timeout_device_ticks_,
-            },
-        .invocation_sequence = resources.channel.invocation_sequence,
-        .failure_target_id = failure_target_id,
-    };
-}
-
 PGResult<void> CollectiveRuntime::submit(
-    uint64_t view_epoch, cudaStream_t stream, int32_t* failed_ranks_hint,
+    cudaStream_t stream, int32_t* failed_ranks_hint,
     size_t failed_ranks_hint_count,
+    const std::function<PGResult<std::shared_ptr<CollectiveSubmission>>()>&
+        prepare,
     const std::function<void(const CollectiveKernelArgs&)>& launch) {
     PG_VALIDATE_STATE(accepting_.load(std::memory_order_acquire),
                       "collective runtime is stopping");
@@ -94,57 +62,52 @@ PGResult<void> CollectiveRuntime::submit(
     std::lock_guard<std::mutex> admission(admission_mutex_);
     PG_VALIDATE_STATE(accepting_.load(std::memory_order_acquire),
                       "collective runtime is stopping");
-    if (!channel_view_epoch_ || *channel_view_epoch_ != view_epoch) {
-        channel_view_epoch_ = view_epoch;
-        next_channel_ = 0;
-    }
 
-    std::shared_ptr<CollectiveResourceLease> resources;
+    std::shared_ptr<CollectiveSubmission> submission;
     if (capture.active) {
-        PG_TRY(resources, monitor_->findGraphResources(capture.id, stream));
+        PG_TRY(submission,
+               monitor_->findGraphSubmission(capture.id, stream));
     }
-    if (!resources) {
-        PG_TRY(auto lease, resource_pool_.acquire(next_channel_));
-        next_channel_ =
-            (lease.channel.index + 1) % channels_->layout().channel_count;
-        resources = std::make_shared<CollectiveResourceLease>(std::move(lease));
+    if (!submission) {
+        PG_TRY(submission, prepare());
         if (capture.active) {
-            PG_TRY(monitor_->retainGraphResources(capture, stream, resources));
+            PG_TRY(
+                monitor_->retainGraphSubmission(capture, stream, submission));
         }
     }
 
     std::unique_ptr<StreamCompletion> stream_completion;
     if (!capture.active) {
-        stream_completion = std::make_unique<StreamCompletion>(resources);
+        stream_completion = std::make_unique<StreamCompletion>(submission);
         PG_TRY_CUDA(cudaEventCreateWithFlags(&stream_completion->completion,
                                              cudaEventDisableTiming));
     }
 
     const uint64_t failure_target_id = next_failure_target_id_++;
     monitor_->registerFailureTarget(
-        resources, CollectiveFailureTarget{
-                       .failure_target_id = failure_target_id,
-                       .failed_ranks_hint = failed_ranks_hint,
-                       .failed_ranks_hint_count = failed_ranks_hint_count,
-                   });
+        submission, CollectiveFailureTarget{
+                        .failure_target_id = failure_target_id,
+                        .failed_ranks_hint = failed_ranks_hint,
+                        .failed_ranks_hint_count = failed_ranks_hint_count,
+                    });
 
-    const auto common = makeKernelArgs(*resources, failure_target_id);
+    const auto common = submission->kernelArgs(failure_target_id);
     (void)cudaGetLastError();
     launch(common);
     const auto launch_error = cudaGetLastError();
     if (launch_error != cudaSuccess) {
-        monitor_->unregisterFailureTarget(resources, failure_target_id);
+        monitor_->unregisterFailureTarget(submission, failure_target_id);
         return cudaFailure(launch_error, "collective kernel launch");
     }
-    resources->markSubmitted();
+    submission->markSubmitted();
 
     if (stream_completion) {
         const auto record_error =
             cudaEventRecord(stream_completion->completion, stream);
         if (record_error != cudaSuccess) {
             // The monitor continues to observe a possible device failure. With
-            // no completion evidence, the submitted resources are retained and
-            // will be quarantined when the runtime is destroyed.
+            // no completion evidence, the submission is retained and will be
+            // quarantined when the runtime is destroyed.
             monitor_->markCompletionUnproven();
             return cudaFailure(record_error,
                                "collective completion event record");

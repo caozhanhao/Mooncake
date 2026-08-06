@@ -22,7 +22,8 @@ struct CollectivePeerSignals {
     uint64_t offset = 0;
 };
 
-// Invocation-local device resources. This value contains no GroupView,
+// Device resources bound to a submission. Their addresses may have either
+// communicator or submission lifetime. This value contains no GroupView,
 // global rank, participant set or algorithm policy.
 struct CollectiveKernelResources {
     CollectiveKernelBuffer buffer;
@@ -35,7 +36,7 @@ struct CollectiveKernelResources {
 // Common runtime-to-kernel ABI embedded by each collective operation.
 struct CollectiveKernelArgs {
     CollectiveKernelResources resources;
-    // All collective operations sharing a physical lane increment the same
+    // All collective operations sharing a physical channel increment the same
     // sequence. This keeps their wire-token domains disjoint without making
     // invocation state part of an operation plan.
     uint64_t* invocation_sequence = nullptr;

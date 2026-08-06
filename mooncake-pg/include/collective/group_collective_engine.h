@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include <cuda_alike.h>
 
@@ -61,25 +62,34 @@ class GroupCollectiveEngine {
     GroupCollectiveEngine& operator=(const GroupCollectiveEngine&) = delete;
 
    private:
-    GroupCollectiveEngine(DeviceLinkManager& device_links,
-                          LinkManager& host_links, DeviceId device,
-                          InGroupRank self_in_group_rank)
-        : device_links_(device_links),
+    GroupCollectiveEngine(CollectiveBufferPool& buffer_pool,
+                          DeviceLinkManager& device_links,
+                          LinkManager& host_links,
+                          TransferEngine* transfer_engine, DeviceId device,
+                          InGroupRank self_in_group_rank,
+                          std::string te_location)
+        : buffer_pool_(buffer_pool),
+          device_links_(device_links),
           host_links_(host_links),
+          transfer_engine_(transfer_engine),
           device_(device),
-          self_in_group_rank_(self_in_group_rank) {}
+          self_in_group_rank_(self_in_group_rank),
+          te_location_(std::move(te_location)) {}
 
+    CollectiveBufferPool& buffer_pool_;
     DeviceLinkManager& device_links_;
     LinkManager& host_links_;
+    TransferEngine* transfer_engine_ = nullptr;
     DeviceId device_ = kInvalidDeviceId;
     InGroupRank self_in_group_rank_ = -1;
+    std::string te_location_;
 
     std::unique_ptr<CollectiveChannels> channels_;
     std::unique_ptr<DevicePlan<AllReducePlan>> allreduce_plan_;
     std::unique_ptr<CollectiveRuntime> runtime_;
     GroupEndpointV2 endpoint_;
     AllReduceProtocol allreduce_protocol_ = AllReduceProtocol::Legacy;
-    uint64_t view_epoch_ = 0;
+    uint32_t next_channel_index_ = 0;
     bool closed_ = false;
 };
 

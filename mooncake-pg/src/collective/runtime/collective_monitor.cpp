@@ -46,41 +46,43 @@ PGResult<std::unique_ptr<CollectiveMonitor>> CollectiveMonitor::create(
 CollectiveMonitor::~CollectiveMonitor() noexcept { stop(); }
 
 void CollectiveMonitor::registerFailureTarget(
-    std::shared_ptr<CollectiveResourceLease> resources,
+    std::shared_ptr<CollectiveSubmission> submission,
     CollectiveFailureTarget target) {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto source =
         std::find_if(failure_sources_.begin(), failure_sources_.end(),
                      [&](const auto& candidate) {
-                         return candidate.resources == resources;
+                         return candidate.submission == submission;
                      });
     if (source != failure_sources_.end()) {
         source->targets.push_back(target);
         return;
     }
     failure_sources_.push_back(FailureSource{
-        .resources = std::move(resources),
+        .submission = std::move(submission),
         .targets = {target},
     });
 }
 
 void CollectiveMonitor::removeFailureSourceLocked(
-    const std::shared_ptr<CollectiveResourceLease>& resources) {
+    const std::shared_ptr<CollectiveSubmission>& submission) {
     failure_sources_.erase(
         std::remove_if(
             failure_sources_.begin(), failure_sources_.end(),
-            [&](const auto& source) { return source.resources == resources; }),
+            [&](const auto& source) {
+                return source.submission == submission;
+            }),
         failure_sources_.end());
 }
 
 void CollectiveMonitor::unregisterFailureTarget(
-    const std::shared_ptr<CollectiveResourceLease>& resources,
+    const std::shared_ptr<CollectiveSubmission>& submission,
     uint64_t failure_target_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto source =
         std::find_if(failure_sources_.begin(), failure_sources_.end(),
                      [&](const auto& candidate) {
-                         return candidate.resources == resources;
+                         return candidate.submission == submission;
                      });
     if (source == failure_sources_.end()) return;
     source->targets.erase(
@@ -92,24 +94,24 @@ void CollectiveMonitor::unregisterFailureTarget(
     if (source->targets.empty()) failure_sources_.erase(source);
 }
 
-PGResult<std::shared_ptr<CollectiveResourceLease>>
-CollectiveMonitor::findGraphResources(uint64_t graph_id,
-                                      cudaStream_t capture_stream) const {
+PGResult<std::shared_ptr<CollectiveSubmission>>
+CollectiveMonitor::findGraphSubmission(uint64_t graph_id,
+                                       cudaStream_t capture_stream) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto found = graph_resources_.find(graph_id);
-    if (found == graph_resources_.end()) {
-        return std::shared_ptr<CollectiveResourceLease>{};
+    const auto found = graph_submissions_.find(graph_id);
+    if (found == graph_submissions_.end()) {
+        return std::shared_ptr<CollectiveSubmission>{};
     }
     PG_VALIDATE_STATE(
         found->second.capture_stream == capture_stream,
         "multi-stream collective CUDA Graph capture is unsupported");
-    return found->second.resources;
+    return found->second.submission;
 }
 
-PGResult<void> CollectiveMonitor::retainGraphResources(
+PGResult<void> CollectiveMonitor::retainGraphSubmission(
     const GraphCaptureState& capture, cudaStream_t capture_stream,
-    std::shared_ptr<CollectiveResourceLease> resources) {
-    // This callback proves that no graph or executable can use the resources
+    std::shared_ptr<CollectiveSubmission> submission) {
+    // This callback proves that no graph or executable can use the submission
     // again. It does not represent completion of any individual replay.
     auto payload = std::make_unique<GraphReleasePayload>(GraphReleasePayload{
         .queue = graph_release_queue_,
@@ -117,15 +119,15 @@ PGResult<void> CollectiveMonitor::retainGraphResources(
     });
     auto* payload_ptr = payload.get();
     PG_TRY(auto user_object,
-           GpuGraphUserObject::create(payload_ptr, graphResourcesReleased));
+           GpuGraphUserObject::create(payload_ptr, graphSubmissionReleased));
     (void)payload.release();
     PG_TRY(user_object.moveTo(capture.graph));
     payload_ptr->notify = true;
 
     std::lock_guard<std::mutex> lock(mutex_);
-    graph_resources_.emplace(
-        capture.id, CapturedResources{.capture_stream = capture_stream,
-                                      .resources = std::move(resources)});
+    graph_submissions_.emplace(
+        capture.id, GraphSubmission{.capture_stream = capture_stream,
+                                    .submission = std::move(submission)});
     return {};
 }
 
@@ -140,7 +142,7 @@ void CollectiveMonitor::retainStreamCompletion(
     stream_completions_.push_back(std::move(completion));
 }
 
-void CUDART_CB CollectiveMonitor::graphResourcesReleased(void* opaque) {
+void CUDART_CB CollectiveMonitor::graphSubmissionReleased(void* opaque) {
     auto payload = std::unique_ptr<GraphReleasePayload>(
         static_cast<GraphReleasePayload*>(opaque));
     if (!payload->notify) return;
@@ -151,14 +153,14 @@ void CUDART_CB CollectiveMonitor::graphResourcesReleased(void* opaque) {
     queue->released.push_back(payload->graph_id);
 }
 
-void CollectiveMonitor::retireResources(
-    const std::shared_ptr<CollectiveResourceLease>& resources) {
+void CollectiveMonitor::retireSubmission(
+    const std::shared_ptr<CollectiveSubmission>& submission) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        removeFailureSourceLocked(resources);
+        removeFailureSourceLocked(submission);
     }
-    if (!resources->retire()) {
-        LOG(WARNING) << "Retained collective resources after retirement";
+    if (!submission->retire()) {
+        LOG(WARNING) << "Quarantined an active collective submission";
     }
 }
 
@@ -183,13 +185,13 @@ bool CollectiveMonitor::retireCompletedStream() {
 
     if (query != cudaSuccess) {
         // Completion is unproven. Keep observing failure reports and retain
-        // the submitted lease until shutdown rather than releasing memory
+        // the submission until shutdown rather than releasing memory
         // that the device may still reference.
         LOG(WARNING) << "Collective completion query failed: "
                      << cudaGetErrorString(query);
         return true;
     }
-    retireResources(completed->resources);
+    retireSubmission(completed->submission);
     return true;
 }
 
@@ -202,21 +204,21 @@ bool CollectiveMonitor::retireReleasedGraph() {
         graph_release_queue_->released.pop_back();
     }
 
-    std::shared_ptr<CollectiveResourceLease> resources;
+    std::shared_ptr<CollectiveSubmission> submission;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto found = graph_resources_.find(graph_id);
-        if (found == graph_resources_.end()) return true;
-        resources = std::move(found->second.resources);
-        graph_resources_.erase(found);
+        const auto found = graph_submissions_.find(graph_id);
+        if (found == graph_submissions_.end()) return true;
+        submission = std::move(found->second.submission);
+        graph_submissions_.erase(found);
     }
-    retireResources(resources);
+    retireSubmission(submission);
     return true;
 }
 
 std::optional<CollectiveMonitor::FailureClaim> CollectiveMonitor::claimFailure(
     const FailureSource& source) {
-    auto& failure = source.resources->control.host->failure;
+    auto& failure = source.submission->hostControl().failure;
     auto state = std::atomic_ref<uint32_t>(failure.state);
     uint32_t expected = static_cast<uint32_t>(CollectiveFailureState::Pending);
     if (!state.compare_exchange_strong(
@@ -232,7 +234,7 @@ std::optional<CollectiveMonitor::FailureClaim> CollectiveMonitor::claimFailure(
     PG_ASSERT(target != source.targets.end(),
               "collective failure report has no tracked target");
     return FailureClaim{
-        .resources = source.resources,
+        .submission = source.submission,
         .target = *target,
         .failed_peer = failure.failed_peer,
     };
@@ -254,7 +256,7 @@ void CollectiveMonitor::handleFailure(const FailureClaim& failure) {
         }
     }
 
-    auto& report = failure.resources->control.host->failure;
+    auto& report = failure.submission->hostControl().failure;
     std::atomic_ref<uint32_t>(report.state)
         .store(static_cast<uint32_t>(CollectiveFailureState::Acknowledged),
                std::memory_order_release);
@@ -304,7 +306,7 @@ bool CollectiveMonitor::drain(std::chrono::milliseconds timeout) {
     }
 }
 
-void CollectiveMonitor::retireGraphResourcesAtShutdown() noexcept {
+void CollectiveMonitor::retireGraphSubmissionsAtShutdown() noexcept {
     {
         std::lock_guard<std::mutex> lock(graph_release_queue_->mutex);
         graph_release_queue_->closed = true;
@@ -312,22 +314,22 @@ void CollectiveMonitor::retireGraphResourcesAtShutdown() noexcept {
     }
 
     while (true) {
-        std::shared_ptr<CollectiveResourceLease> resources;
+        std::shared_ptr<CollectiveSubmission> submission;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (graph_resources_.empty()) return;
-            auto graph = graph_resources_.begin();
-            resources = std::move(graph->second.resources);
-            graph_resources_.erase(graph);
+            if (graph_submissions_.empty()) return;
+            auto graph = graph_submissions_.begin();
+            submission = std::move(graph->second.submission);
+            graph_submissions_.erase(graph);
         }
-        retireResources(resources);
+        retireSubmission(submission);
     }
 }
 
 void CollectiveMonitor::stop() noexcept {
     if (stopping_.exchange(true, std::memory_order_acq_rel)) return;
     if (thread_.joinable()) thread_.join();
-    retireGraphResourcesAtShutdown();
+    retireGraphSubmissionsAtShutdown();
 }
 
 }  // namespace mooncake

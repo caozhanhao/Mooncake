@@ -8,35 +8,33 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <optional>
-#include <string>
-#include <utility>
 
 #include <cuda_alike.h>
 
-#include "collective/runtime/collective_channels.h"
 #include "collective/runtime/collective_monitor.h"
-#include "collective/runtime/resource_pool.h"
+#include "collective/runtime/collective_submission.h"
 #include "error_types.h"
 
 namespace mooncake {
 
-// Communicator-scoped submission runtime. It owns invocation resources,
-// graph retention, eager completion and failure monitoring; operation code owns
-// validation, its typed plan and its kernel launcher.
+// Communicator-scoped submission runtime. Operation code prepares resources;
+// this class serializes admission and gives the same submission to launch,
+// eager completion, graph retention and failure monitoring.
 class CollectiveRuntime {
    public:
     static PGResult<std::unique_ptr<CollectiveRuntime>> create(
-        CollectiveBufferPool* buffer_pool, CollectiveChannels* channels,
-        std::string te_location, TransferEngine* engine, DeviceId device,
-        size_t collective_timeout_us,
+        DeviceId device, size_t collective_timeout_us,
         CollectiveFailureReportCallback failure_report_callback);
     ~CollectiveRuntime() noexcept;
 
     PGResult<void> submit(
-        uint64_t view_epoch, cudaStream_t stream, int32_t* failed_ranks_hint,
+        cudaStream_t stream, int32_t* failed_ranks_hint,
         size_t failed_ranks_hint_count,
+        const std::function<PGResult<std::shared_ptr<CollectiveSubmission>>()>&
+            prepare,
         const std::function<void(const CollectiveKernelArgs&)>& launch);
+
+    uint64_t timeoutDeviceTicks() const { return timeout_device_ticks_; }
 
     void stopAccepting();
     bool drain(std::chrono::milliseconds timeout);
@@ -45,30 +43,15 @@ class CollectiveRuntime {
     CollectiveRuntime& operator=(const CollectiveRuntime&) = delete;
 
    private:
-    CollectiveRuntime(CollectiveBufferPool* buffer_pool,
-                      CollectiveChannels* channels, std::string te_location,
-                      TransferEngine* engine, DeviceId device,
-                      uint64_t timeout_device_ticks)
-        : channels_(channels),
-          resource_pool_(buffer_pool, channels_, device,
-                         std::move(te_location), engine),
-          device_(device),
+    CollectiveRuntime(DeviceId device, uint64_t timeout_device_ticks)
+        : device_(device),
           timeout_device_ticks_(timeout_device_ticks) {}
 
-    CollectiveKernelArgs makeKernelArgs(
-        const CollectiveResourceLease& resources,
-        uint64_t failure_target_id) const;
-
-    // GroupCollectiveEngine owns the runtime and destroys it before channels_.
-    CollectiveChannels* channels_ = nullptr;
-    CollectiveResourcePool resource_pool_;
     std::unique_ptr<CollectiveMonitor> monitor_;
     DeviceId device_ = kInvalidDeviceId;
     uint64_t timeout_device_ticks_ = 0;
 
     std::mutex admission_mutex_;
-    uint32_t next_channel_ = 0;
-    std::optional<uint64_t> channel_view_epoch_;
     uint64_t next_failure_target_id_ = 1;
     std::atomic<bool> accepting_{true};
 };

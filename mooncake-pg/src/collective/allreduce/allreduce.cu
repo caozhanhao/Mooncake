@@ -33,8 +33,8 @@ __global__ void allReduceExecutorKernel(AllReduceKernelArgs args) {
     if (threadIdx.x == 0) {
         const auto& published = *args.plan;
         view_epoch = published.view_epoch;
-        // Sequence identifies this invocation on its physical lane. The
-        // counter is shared by every collective operation using that lane.
+        // Sequence identifies this invocation on its physical channel. The
+        // counter is shared by every collective operation using that channel.
         collective_sequence = atomicAdd(
             reinterpret_cast<unsigned long long*>(common.invocation_sequence),
             1ULL);

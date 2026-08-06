@@ -3,6 +3,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <string>
 
 #include <cuda_alike.h>
 
@@ -14,6 +16,11 @@
 #include "error_types.h"
 
 namespace mooncake {
+
+class CollectiveBufferPool;
+class CollectiveChannels;
+class CollectiveSubmission;
+class TransferEngine;
 
 struct FlatRingPlan {
     uint32_t participant_count = 0;
@@ -56,6 +63,14 @@ PGResult<AllReduceRequest> makeAllReduceRequest(const void* input, void* output,
 
 PGResult<AllReducePlan> buildAllReducePlan(const CollectivePlanSet& plans,
                                            const ResolvedCollectiveView& view);
+
+// The current bulk AllReduce protocol chooses and lays out its own registered
+// transfer buffer. Runtime receives only the finished submission and remains
+// independent of operation-specific memory requirements.
+PGResult<std::shared_ptr<CollectiveSubmission>> prepareAllReduceSubmission(
+    CollectiveBufferPool& buffer_pool, CollectiveChannels& channels,
+    uint32_t channel_index, DeviceId device, const std::string& te_location,
+    TransferEngine* engine, uint64_t timeout_device_ticks);
 
 struct AllReduceKernelArgs {
     const void* input = nullptr;

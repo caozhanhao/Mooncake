@@ -1,6 +1,7 @@
 #include "collective/runtime/collective_channels.h"
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <utility>
 
@@ -54,6 +55,21 @@ PGResult<void> cudaError(cudaError_t error, const char* operation) {
     return makePGError(PGErrorCode::SystemError,
                        std::string(operation) + " failed: " +
                            cudaGetErrorString(error));
+}
+
+void resetHostCommand(HostTransferCommand& command) {
+    command.kind =
+        static_cast<uint32_t>(HostTransferCommandKind::PutAndSignal);
+    command.peer_host_link = kInvalidHostLinkHandle;
+    command.peer_in_group_rank = -1;
+    command.source_address = 0;
+    command.target_address = 0;
+    command.bytes = 0;
+    command.signal_source_address = 0;
+    command.signal_target_address = 0;
+    std::atomic_ref<uint32_t>(command.state)
+        .store(static_cast<uint32_t>(HostTransferCommandState::Idle),
+               std::memory_order_release);
 }
 
 }  // namespace
@@ -133,7 +149,7 @@ PGResult<CollectiveChannel> CollectiveChannels::acquire(
     }
     state = ChannelState::Acquired;
     host_controls_[channel_index] = CollectiveControlBlock{};
-    host_commands_[channel_index] = HostTransferCommand{};
+    resetHostCommand(host_commands_[channel_index]);
     return CollectiveChannel{
         .index = channel_index,
         .invocation_sequence =
@@ -179,9 +195,8 @@ bool CollectiveChannels::close(bool resources_safe) {
             return state == ChannelState::Free;
         });
     bool released = resources_safe && channels_idle;
-    if (released && commands_registered_) {
+    if (released) {
         released = host_executor_->unregisterCommands(host_commands_);
-        if (released) commands_registered_ = false;
     }
 
     if (released) {

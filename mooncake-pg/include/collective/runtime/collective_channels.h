@@ -91,7 +91,6 @@ class CollectiveChannels {
 
     std::mutex mutex_;
     std::vector<ChannelState> states_;
-    bool commands_registered_ = true;
     bool closed_ = false;
 };
 
