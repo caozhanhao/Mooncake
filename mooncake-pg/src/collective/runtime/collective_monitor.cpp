@@ -13,14 +13,13 @@ namespace mooncake {
 
 struct CollectiveMonitor::GraphReleaseQueue {
     std::mutex mutex;
-    std::vector<uint64_t> released;
+    std::vector<std::shared_ptr<CollectiveSubmission>> submissions;
     bool closed = false;
 };
 
 struct CollectiveMonitor::GraphReleasePayload {
     std::shared_ptr<GraphReleaseQueue> queue;
-    uint64_t graph_id = 0;
-    bool notify = false;
+    std::shared_ptr<CollectiveSubmission> submission;
 };
 
 StreamCompletion::~StreamCompletion() noexcept {
@@ -94,43 +93,24 @@ void CollectiveMonitor::unregisterFailureTarget(
     if (source->targets.empty()) failure_sources_.erase(source);
 }
 
-PGResult<std::shared_ptr<CollectiveSubmission>>
-CollectiveMonitor::acquireSubmission(
-    const GraphCaptureState& capture, cudaStream_t capture_stream,
-    const std::function<PGResult<std::shared_ptr<CollectiveSubmission>>()>&
-        prepare) {
-    if (!capture.active) return prepare();
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto found = graph_submissions_.find(capture.id);
-        if (found != graph_submissions_.end()) {
-            PG_VALIDATE_STATE(
-                found->second.capture_stream == capture_stream,
-                "multi-stream collective CUDA Graph capture is unsupported");
-            return found->second.submission;
-        }
-    }
-
-    PG_TRY(auto submission, prepare());
+PGResult<void> CollectiveMonitor::retainGraphSubmission(
+    const GraphCaptureState& capture,
+    std::shared_ptr<CollectiveSubmission> submission) {
     // This callback proves that no graph or executable can use the submission
     // again. It does not represent completion of any individual replay.
     auto payload = std::make_unique<GraphReleasePayload>(GraphReleasePayload{
         .queue = graph_release_queue_,
-        .graph_id = capture.id,
+        .submission = submission,
     });
     auto* payload_ptr = payload.get();
     PG_TRY(auto user_object,
            GpuGraphUserObject::create(payload_ptr, graphSubmissionReleased));
     (void)payload.release();
     PG_TRY(user_object.moveTo(capture.graph));
-    payload_ptr->notify = true;
 
     std::lock_guard<std::mutex> lock(mutex_);
-    graph_submissions_.emplace(
-        capture.id, GraphSubmission{.capture_stream = capture_stream,
-                                    .submission = submission});
-    return submission;
+    graph_shutdown_refs_.emplace(submission.get(), submission);
+    return {};
 }
 
 void CollectiveMonitor::markCompletionUnproven() {
@@ -147,12 +127,10 @@ void CollectiveMonitor::retainStreamCompletion(
 void CUDART_CB CollectiveMonitor::graphSubmissionReleased(void* opaque) {
     auto payload = std::unique_ptr<GraphReleasePayload>(
         static_cast<GraphReleasePayload*>(opaque));
-    if (!payload->notify) return;
-
     const auto queue = payload->queue;
     std::lock_guard<std::mutex> lock(queue->mutex);
     if (queue->closed) return;
-    queue->released.push_back(payload->graph_id);
+    queue->submissions.push_back(std::move(payload->submission));
 }
 
 void CollectiveMonitor::retireSubmission(
@@ -160,6 +138,7 @@ void CollectiveMonitor::retireSubmission(
     {
         std::lock_guard<std::mutex> lock(mutex_);
         removeFailureSourceLocked(submission);
+        graph_shutdown_refs_.erase(submission.get());
     }
     if (!submission->retire()) {
         LOG(WARNING) << "Quarantined an active collective submission";
@@ -197,22 +176,13 @@ bool CollectiveMonitor::retireCompletedStream() {
     return true;
 }
 
-bool CollectiveMonitor::retireReleasedGraph() {
-    uint64_t graph_id = 0;
-    {
-        std::lock_guard<std::mutex> lock(graph_release_queue_->mutex);
-        if (graph_release_queue_->released.empty()) return false;
-        graph_id = graph_release_queue_->released.back();
-        graph_release_queue_->released.pop_back();
-    }
-
+bool CollectiveMonitor::retireReleasedGraphSubmission() {
     std::shared_ptr<CollectiveSubmission> submission;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto found = graph_submissions_.find(graph_id);
-        if (found == graph_submissions_.end()) return true;
-        submission = std::move(found->second.submission);
-        graph_submissions_.erase(found);
+        std::lock_guard<std::mutex> lock(graph_release_queue_->mutex);
+        if (graph_release_queue_->submissions.empty()) return false;
+        submission = std::move(graph_release_queue_->submissions.back());
+        graph_release_queue_->submissions.pop_back();
     }
     retireSubmission(submission);
     return true;
@@ -287,7 +257,7 @@ void CollectiveMonitor::monitorLoop() noexcept {
     }
     while (!stopping_.load(std::memory_order_acquire)) {
         bool progressed = handleOneFailure();
-        progressed |= retireReleasedGraph();
+        progressed |= retireReleasedGraphSubmission();
         progressed |= retireCompletedStream();
         if (!progressed) {
             std::this_thread::sleep_for(std::chrono::microseconds(10));
@@ -309,21 +279,24 @@ bool CollectiveMonitor::drain(std::chrono::milliseconds timeout) {
 }
 
 void CollectiveMonitor::retireGraphSubmissionsAtShutdown() noexcept {
+    std::vector<std::shared_ptr<CollectiveSubmission>> submissions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        submissions.reserve(graph_shutdown_refs_.size());
+        for (const auto& entry : graph_shutdown_refs_) {
+            if (auto retained = entry.second.lock()) {
+                submissions.push_back(std::move(retained));
+            }
+        }
+        graph_shutdown_refs_.clear();
+    }
     {
         std::lock_guard<std::mutex> lock(graph_release_queue_->mutex);
         graph_release_queue_->closed = true;
-        graph_release_queue_->released.clear();
+        graph_release_queue_->submissions.clear();
     }
 
-    while (true) {
-        std::shared_ptr<CollectiveSubmission> submission;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (graph_submissions_.empty()) return;
-            auto graph = graph_submissions_.begin();
-            submission = std::move(graph->second.submission);
-            graph_submissions_.erase(graph);
-        }
+    for (const auto& submission : submissions) {
         retireSubmission(submission);
     }
 }

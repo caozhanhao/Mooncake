@@ -176,7 +176,7 @@ The runtime retains only responsibilities shared by submitted operations:
 
 - serialize host admission;
 - ask operation code to prepare a submission only when one is needed;
-- retain graph submissions by capture id;
+- reuse a weak capture-time submission binding while graph nodes are recorded;
 - record eager completion;
 - observe and acknowledge device failure reports.
 
@@ -211,6 +211,14 @@ Only retention differs: eager uses a completion event, while graph capture
 attaches a GPU user object and keeps the submission until no graph or executable
 can reference it. Communicator teardown remains terminal: callers must not
 replay or destroy a communicator while its graph execution is in flight.
+
+`CollectiveRuntime::submit()` runs while an operation is eagerly enqueued or
+recorded during capture. Replay launches the recorded kernels directly and
+does not re-enter the runtime. During graph lifetime the user-object payload,
+not `CollectiveMonitor`, owns the submission. Its destructor callback queues
+the released submission for the monitor to retire outside the CUDA callback.
+The monitor keeps only weak shutdown references so communicator-owned pools
+can be cleared before they disappear.
 
 The pooled bulk buffer and its exact channel are retired together:
 

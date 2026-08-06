@@ -47,6 +47,35 @@ CollectiveRuntime::~CollectiveRuntime() noexcept {
     }
 }
 
+PGResult<std::shared_ptr<CollectiveSubmission>>
+CollectiveRuntime::acquireSubmission(
+    const GraphCaptureState& capture, cudaStream_t stream,
+    const std::function<PGResult<std::shared_ptr<CollectiveSubmission>>()>&
+        prepare) {
+    if (!capture.active) return prepare();
+
+    const auto captured = captured_submissions_.find(capture.id);
+    if (captured != captured_submissions_.end()) {
+        if (auto submission = captured->second.submission.lock()) {
+            PG_VALIDATE_STATE(
+                captured->second.capture_stream == stream,
+                "multi-stream collective CUDA Graph capture is unsupported");
+            return submission;
+        }
+        captured_submissions_.erase(captured);
+    }
+    std::erase_if(captured_submissions_, [](const auto& entry) {
+        return entry.second.submission.expired();
+    });
+
+    PG_TRY(auto submission, prepare());
+    PG_TRY(monitor_->retainGraphSubmission(capture, submission));
+    captured_submissions_.emplace(
+        capture.id, CapturedSubmission{.capture_stream = stream,
+                                       .submission = submission});
+    return submission;
+}
+
 PGResult<void> CollectiveRuntime::submit(
     cudaStream_t stream, int32_t* failed_ranks_hint,
     size_t failed_ranks_hint_count,
@@ -63,8 +92,7 @@ PGResult<void> CollectiveRuntime::submit(
     PG_VALIDATE_STATE(accepting_.load(std::memory_order_acquire),
                       "collective runtime is stopping");
 
-    PG_TRY(auto submission,
-           monitor_->acquireSubmission(capture, stream, prepare));
+    PG_TRY(auto submission, acquireSubmission(capture, stream, prepare));
 
     std::unique_ptr<StreamCompletion> stream_completion;
     if (!capture.active) {

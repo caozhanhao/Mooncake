@@ -60,13 +60,11 @@ class CollectiveMonitor {
     void unregisterFailureTarget(
         const std::shared_ptr<CollectiveSubmission>& submission,
         uint64_t failure_target_id);
-    // Eager execution prepares a fresh submission. Graph capture reuses its
-    // retained submission, or prepares and attaches it on first use. Runtime
-    // admission serializes creation for one communicator.
-    PGResult<std::shared_ptr<CollectiveSubmission>> acquireSubmission(
-        const GraphCaptureState& capture, cudaStream_t capture_stream,
-        const std::function<
-            PGResult<std::shared_ptr<CollectiveSubmission>>()>& prepare);
+    // Attach submission ownership to the captured graph. The user-object
+    // callback only queues retirement; it never runs collective work.
+    PGResult<void> retainGraphSubmission(
+        const GraphCaptureState& capture,
+        std::shared_ptr<CollectiveSubmission> submission);
     void markCompletionUnproven();
     void retainStreamCompletion(std::unique_ptr<StreamCompletion> completion);
 
@@ -88,13 +86,6 @@ class CollectiveMonitor {
         InGroupRank failed_peer = -1;
     };
 
-    struct GraphSubmission {
-        // Reusing one submission is safe only while captured nodes remain
-        // ordered by this stream. Multi-stream capture is deferred.
-        cudaStream_t capture_stream = nullptr;
-        std::shared_ptr<CollectiveSubmission> submission;
-    };
-
     struct GraphReleaseQueue;
     struct GraphReleasePayload;
 
@@ -104,7 +95,7 @@ class CollectiveMonitor {
 
     static void CUDART_CB graphSubmissionReleased(void* payload);
     bool retireCompletedStream();
-    bool retireReleasedGraph();
+    bool retireReleasedGraphSubmission();
     void retireSubmission(
         const std::shared_ptr<CollectiveSubmission>& submission);
     void retireGraphSubmissionsAtShutdown() noexcept;
@@ -122,7 +113,12 @@ class CollectiveMonitor {
     mutable std::mutex mutex_;
     std::vector<FailureSource> failure_sources_;
     std::vector<std::unique_ptr<StreamCompletion>> stream_completions_;
-    std::unordered_map<uint64_t, GraphSubmission> graph_submissions_;
+    // Graph user objects, not the monitor, own captured submissions. These
+    // weak references only let stop() clear leases before communicator-owned
+    // resource pools disappear.
+    std::unordered_map<CollectiveSubmission*,
+                       std::weak_ptr<CollectiveSubmission>>
+        graph_shutdown_refs_;
     std::shared_ptr<GraphReleaseQueue> graph_release_queue_;
     bool has_unproven_completion_ = false;
     std::thread thread_;
