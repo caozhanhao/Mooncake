@@ -347,7 +347,6 @@ PGResult<void> MooncakePGContext::shutdown() {
 
     if (agent_host) agent_host->shutdown();
     host_transfer_executor.shutdown();
-    collective_control_pool.shutdown();
     // Device transport/QP state references the process collective arena and
     // must be destroyed before CollectiveBufferPool releases that arena.
     device_link_manager.shutdown();
@@ -402,8 +401,8 @@ PGResult<void> MooncakeCommunicator::initializePlannedCollectives(
     PG_TRY(
         planned_collectives_,
         GroupCollectiveEngine::create(
-            context_.collective_buffer_pool, context_.collective_control_pool,
-            context_.host_transfer_executor, context_.device_link_manager,
+            context_.collective_buffer_pool, context_.host_transfer_executor,
+            context_.device_link_manager,
             context_.link_manager, context_.engine, device_index_, rank_,
             device_location, context_.collective_timeout_us,
             std::move(report_failure)));

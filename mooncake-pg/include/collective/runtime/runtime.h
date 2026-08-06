@@ -14,7 +14,7 @@
 
 #include <cuda_alike.h>
 
-#include "collective/runtime/collective_lane_pool.h"
+#include "collective/runtime/collective_channels.h"
 #include "collective/runtime/collective_monitor.h"
 #include "collective/runtime/resource_pool.h"
 #include "error_types.h"
@@ -27,8 +27,7 @@ namespace mooncake {
 class CollectiveRuntime {
    public:
     static PGResult<std::unique_ptr<CollectiveRuntime>> create(
-        CollectiveBufferPool* buffer_pool, CollectiveControlPool* control_pool,
-        HostTransferExecutor* host_transfer_executor, CollectiveLanePool* lanes,
+        CollectiveBufferPool* buffer_pool, CollectiveChannels* channels,
         std::string te_location, TransferEngine* engine, DeviceId device,
         size_t collective_timeout_us,
         CollectiveFailureReportCallback failure_report_callback);
@@ -47,15 +46,12 @@ class CollectiveRuntime {
 
    private:
     CollectiveRuntime(CollectiveBufferPool* buffer_pool,
-                      CollectiveControlPool* control_pool,
-                      HostTransferExecutor* host_transfer_executor,
-                      CollectiveLanePool* lanes, std::string te_location,
+                      CollectiveChannels* channels, std::string te_location,
                       TransferEngine* engine, DeviceId device,
                       uint64_t timeout_device_ticks)
-        : lanes_(lanes),
-          resource_pool_(buffer_pool, control_pool, lanes_,
-                         host_transfer_executor, device, std::move(te_location),
-                         engine),
+        : channels_(channels),
+          resource_pool_(buffer_pool, channels_, device,
+                         std::move(te_location), engine),
           device_(device),
           timeout_device_ticks_(timeout_device_ticks) {}
 
@@ -63,16 +59,16 @@ class CollectiveRuntime {
         const CollectiveResourceLease& resources,
         uint64_t failure_target_id) const;
 
-    // GroupCollectiveEngine owns the runtime and destroys it before lanes_.
-    CollectiveLanePool* lanes_ = nullptr;
+    // GroupCollectiveEngine owns the runtime and destroys it before channels_.
+    CollectiveChannels* channels_ = nullptr;
     CollectiveResourcePool resource_pool_;
     std::unique_ptr<CollectiveMonitor> monitor_;
     DeviceId device_ = kInvalidDeviceId;
     uint64_t timeout_device_ticks_ = 0;
 
     std::mutex admission_mutex_;
-    uint32_t next_lane_ = 0;
-    std::optional<uint64_t> lane_view_epoch_;
+    uint32_t next_channel_ = 0;
+    std::optional<uint64_t> channel_view_epoch_;
     uint64_t next_failure_target_id_ = 1;
     std::atomic<bool> accepting_{true};
 };

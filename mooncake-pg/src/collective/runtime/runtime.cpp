@@ -20,8 +20,7 @@ PGResult<void> cudaFailure(cudaError_t error, const char* operation) {
 }  // namespace
 
 PGResult<std::unique_ptr<CollectiveRuntime>> CollectiveRuntime::create(
-    CollectiveBufferPool* buffer_pool, CollectiveControlPool* control_pool,
-    HostTransferExecutor* host_transfer_executor, CollectiveLanePool* lanes,
+    CollectiveBufferPool* buffer_pool, CollectiveChannels* channels,
     std::string te_location, TransferEngine* engine, DeviceId device,
     size_t collective_timeout_us,
     CollectiveFailureReportCallback failure_report_callback) {
@@ -37,8 +36,8 @@ PGResult<std::unique_ptr<CollectiveRuntime>> CollectiveRuntime::create(
             : collective_timeout_us * clock_rate / 1000ULL;
 
     auto runtime = std::unique_ptr<CollectiveRuntime>(new CollectiveRuntime(
-        buffer_pool, control_pool, host_transfer_executor, lanes,
-        std::move(te_location), engine, device, timeout_ticks));
+        buffer_pool, channels, std::move(te_location), engine, device,
+        timeout_ticks));
     PG_TRY(runtime->monitor_, CollectiveMonitor::create(
                                   device, std::move(failure_report_callback)));
     return runtime;
@@ -56,7 +55,6 @@ CollectiveKernelArgs CollectiveRuntime::makeKernelArgs(
     const CollectiveResourceLease& resources,
     uint64_t failure_target_id) const {
     const auto& layout = CollectiveResourcePool::bufferLayout();
-    const auto& control_layout = lanes_->layout().lanes[resources.lane.index];
     return CollectiveKernelArgs{
         .resources =
             CollectiveKernelResources{
@@ -71,14 +69,14 @@ CollectiveKernelArgs CollectiveRuntime::makeKernelArgs(
                     },
                 .peer_signals =
                     CollectivePeerSignals{
-                        .base = lanes_->controlBase(),
-                        .offset = control_layout.signals.offset,
+                        .base = resources.channel.peer_signals_base,
+                        .offset = resources.channel.peer_signals_offset,
                     },
-                .control = resources.control.device,
-                .host_command = resources.host_command.device,
+                .control = resources.channel.device_control,
+                .host_command = resources.channel.device_command,
                 .timeout_device_ticks = timeout_device_ticks_,
             },
-        .invocation_sequence = lanes_->invocationSequence(resources.lane),
+        .invocation_sequence = resources.channel.invocation_sequence,
         .failure_target_id = failure_target_id,
     };
 }
@@ -96,9 +94,9 @@ PGResult<void> CollectiveRuntime::submit(
     std::lock_guard<std::mutex> admission(admission_mutex_);
     PG_VALIDATE_STATE(accepting_.load(std::memory_order_acquire),
                       "collective runtime is stopping");
-    if (!lane_view_epoch_ || *lane_view_epoch_ != view_epoch) {
-        lane_view_epoch_ = view_epoch;
-        next_lane_ = 0;
+    if (!channel_view_epoch_ || *channel_view_epoch_ != view_epoch) {
+        channel_view_epoch_ = view_epoch;
+        next_channel_ = 0;
     }
 
     std::shared_ptr<CollectiveResourceLease> resources;
@@ -106,8 +104,9 @@ PGResult<void> CollectiveRuntime::submit(
         PG_TRY(resources, monitor_->findGraphResources(capture.id, stream));
     }
     if (!resources) {
-        PG_TRY(auto lease, resource_pool_.acquire(next_lane_));
-        next_lane_ = (lease.lane.index + 1) % lanes_->layout().lane_count;
+        PG_TRY(auto lease, resource_pool_.acquire(next_channel_));
+        next_channel_ =
+            (lease.channel.index + 1) % channels_->layout().channel_count;
         resources = std::make_shared<CollectiveResourceLease>(std::move(lease));
         if (capture.active) {
             PG_TRY(monitor_->retainGraphResources(capture, stream, resources));

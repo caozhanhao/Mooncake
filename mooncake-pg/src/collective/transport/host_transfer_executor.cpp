@@ -1,9 +1,8 @@
 #include "collective/transport/host_transfer_executor.h"
 
+#include <algorithm>
 #include <chrono>
-#include <cstring>
 #include <exception>
-#include <memory>
 
 #include <glog/logging.h>
 
@@ -26,12 +25,6 @@ void storeState(HostTransferCommand& command, HostTransferCommandState state) {
         .store(static_cast<uint32_t>(state), std::memory_order_release);
 }
 
-struct CudaHostMemoryDeleter {
-    void operator()(void* memory) const noexcept { (void)cudaFreeHost(memory); }
-};
-
-using CudaHostMemory = std::unique_ptr<void, CudaHostMemoryDeleter>;
-
 }  // namespace
 
 HostTransferExecutor::~HostTransferExecutor() noexcept {
@@ -46,112 +39,88 @@ HostTransferExecutor::~HostTransferExecutor() noexcept {
 }
 
 PGResult<void> HostTransferExecutor::initialize(TransferEngine* engine,
-                                                LinkManager* links,
-                                                uint32_t command_count) {
+                                                LinkManager* links) {
     std::lock_guard<std::mutex> lock(command_mutex_);
     if (initialized()) return {};
 
-    const auto bytes = command_count * sizeof(HostTransferCommand);
-    void* host = nullptr;
-    PG_TRY_CUDA(cudaHostAlloc(&host, bytes,
-                              cudaHostAllocMapped | cudaHostAllocPortable));
-    CudaHostMemory host_memory(host);
-    void* device = nullptr;
-    PG_TRY_CUDA(cudaHostGetDevicePointer(&device, host_memory.get(), 0));
-
     try {
-        commands_.resize(command_count);
-        active_transfers_.reserve(command_count);
-        std::memset(host_memory.get(), 0, bytes);
         engine_ = engine;
         links_ = links;
-        host_commands_ = static_cast<HostTransferCommand*>(host_memory.get());
-        device_commands_ = static_cast<HostTransferCommand*>(device);
-        command_count_ = command_count;
         stopping_.store(false, std::memory_order_release);
         thread_ = std::thread(&HostTransferExecutor::runLoop, this);
         initialized_.store(true, std::memory_order_release);
     } catch (const std::exception& exception) {
-        commands_.clear();
-        active_transfers_.clear();
         engine_ = nullptr;
         links_ = nullptr;
-        host_commands_ = nullptr;
-        device_commands_ = nullptr;
-        command_count_ = 0;
         return makePGError(
             PGErrorCode::SystemError,
             std::string("failed to start host transfer executor: ") +
                 exception.what());
     }
-    (void)host_memory.release();
     return {};
 }
 
-PGResult<HostTransferCommandLease> HostTransferExecutor::acquireCommand(
-    CollectiveControlBlock* control) {
+PGResult<void> HostTransferExecutor::registerCommands(
+    HostTransferCommand* commands, CollectiveControlBlock* controls,
+    uint32_t command_count) {
     if (!initialized() || stopping_.load(std::memory_order_acquire)) {
         return makePGError(PGErrorCode::InvalidState,
                            "host transfer executor is not running");
     }
     std::lock_guard<std::mutex> lock(command_mutex_);
-    for (uint32_t index = 0; index < command_count_; ++index) {
-        auto& slot = commands_[index];
-        if (slot.state != SlotState::Free) continue;
-        slot.state = SlotState::Acquired;
-        slot.control = control;
-        host_commands_[index] = HostTransferCommand{};
-        return HostTransferCommandLease{index, host_commands_ + index,
-                                        device_commands_ + index};
+    const auto duplicate =
+        std::find_if(command_regions_.begin(), command_regions_.end(),
+                     [&](const auto& region) {
+                         return region.commands == commands;
+                     });
+    if (duplicate != command_regions_.end()) {
+        return makePGError(PGErrorCode::InvalidState,
+                           "host transfer commands are already registered");
     }
-    return makePGError(PGErrorCode::ResourceBusy,
-                       "collective host commands are exhausted");
+    command_regions_.push_back({commands, controls, command_count});
+    return {};
 }
 
-bool HostTransferExecutor::releaseCommand(
-    const HostTransferCommandLease& command) {
+bool HostTransferExecutor::unregisterCommands(HostTransferCommand* commands) {
     std::lock_guard<std::mutex> lock(command_mutex_);
-    PG_ASSERT(command.index < commands_.size() &&
-                  commands_[command.index].state == SlotState::Acquired &&
-                  command.host == host_commands_ + command.index &&
-                  command.device == device_commands_ + command.index,
-              "collective host command lease is invalid");
-    auto& slot = commands_[command.index];
-    auto command_state =
-        static_cast<HostTransferCommandState>(loadState(*command.host));
-    if (command_state == HostTransferCommandState::Completed ||
-        command_state == HostTransferCommandState::Failed) {
-        storeState(*command.host, HostTransferCommandState::Idle);
-        command_state = HostTransferCommandState::Idle;
+    const auto region =
+        std::find_if(command_regions_.begin(), command_regions_.end(),
+                     [&](const auto& candidate) {
+                         return candidate.commands == commands;
+                     });
+    if (region == command_regions_.end()) return false;
+    const auto active =
+        std::find_if(active_transfers_.begin(), active_transfers_.end(),
+                     [&](const auto& transfer) {
+                         for (uint32_t index = 0;
+                              index < region->command_count; ++index) {
+                             if (transfer.command == region->commands + index) {
+                                 return true;
+                             }
+                         }
+                         return false;
+                     });
+    if (active != active_transfers_.end()) return false;
+    for (uint32_t index = 0; index < region->command_count; ++index) {
+        const auto state = static_cast<HostTransferCommandState>(
+            loadState(region->commands[index]));
+        if (state == HostTransferCommandState::Ready ||
+            state == HostTransferCommandState::RunningData ||
+            state == HostTransferCommandState::RunningSignal) {
+            return false;
+        }
     }
-    if (command_state != HostTransferCommandState::Idle) {
-        slot.state = SlotState::Abandoned;
-        return false;
-    }
-    slot.state = SlotState::Free;
-    slot.control = nullptr;
+    command_regions_.erase(region);
     return true;
 }
 
-void HostTransferExecutor::abandonCommand(
-    const HostTransferCommandLease& command) {
-    std::lock_guard<std::mutex> lock(command_mutex_);
-    PG_ASSERT(command.index < commands_.size() &&
-                  commands_[command.index].state == SlotState::Acquired &&
-                  command.host == host_commands_ + command.index &&
-                  command.device == device_commands_ + command.index,
-              "collective host command lease is invalid");
-    commands_[command.index].state = SlotState::Abandoned;
-}
-
-bool HostTransferExecutor::submitPhase(uint32_t command_index,
+bool HostTransferExecutor::submitPhase(HostTransferCommand& command,
+                                       CollectiveControlBlock& control,
                                        ActiveTransfer::Phase phase,
                                        ActiveTransfer& active) {
-    auto& command = host_commands_[command_index];
-    auto& control = *commands_[command_index].control;
     const auto segment = links_->resolvePeer(command.peer_host_link);
     if (!segment.has_value()) {
-        failCommand(command_index, CollectiveProtocolError::InvalidRoute);
+        failCommand(command, control, CollectiveProtocolError::InvalidRoute);
         return false;
     }
 
@@ -168,13 +137,13 @@ bool HostTransferExecutor::submitPhase(uint32_t command_index,
         bytes = sizeof(uint64_t);
     }
     if (!source || target == 0 || bytes == 0) {
-        failCommand(command_index, CollectiveProtocolError::InvalidRoute);
+        failCommand(command, control, CollectiveProtocolError::InvalidRoute);
         return false;
     }
 
     const auto batch = engine_->allocateBatchID(1);
     if (batch == INVALID_BATCH_ID) {
-        failCommand(command_index, CollectiveProtocolError::Transport);
+        failCommand(command, control, CollectiveProtocolError::Transport);
         return false;
     }
     std::atomic_ref<uint32_t>(control.transport_idle)
@@ -191,19 +160,20 @@ bool HostTransferExecutor::submitPhase(uint32_t command_index,
             std::atomic_ref<uint32_t>(control.transport_idle)
                 .store(1, std::memory_order_release);
         }
-        failCommand(command_index, CollectiveProtocolError::Transport);
+        failCommand(command, control, CollectiveProtocolError::Transport);
         return false;
     }
 
-    active = ActiveTransfer{command_index, phase, static_cast<uint64_t>(batch)};
+    active = ActiveTransfer{&command, &control, phase,
+                            static_cast<uint64_t>(batch)};
     storeState(command, phase == ActiveTransfer::Phase::Data
                             ? HostTransferCommandState::RunningData
                             : HostTransferCommandState::RunningSignal);
     return true;
 }
 
-bool HostTransferExecutor::beginCommand(uint32_t command_index) {
-    auto& command = host_commands_[command_index];
+bool HostTransferExecutor::beginCommand(HostTransferCommand& command,
+                                        CollectiveControlBlock& control) {
     uint32_t expected = static_cast<uint32_t>(HostTransferCommandState::Ready);
     if (!std::atomic_ref<uint32_t>(command.state)
              .compare_exchange_strong(
@@ -216,27 +186,29 @@ bool HostTransferExecutor::beginCommand(uint32_t command_index) {
     ActiveTransfer active;
     const auto kind = static_cast<HostTransferCommandKind>(command.kind);
     if (kind == HostTransferCommandKind::PutAndSignal && command.bytes != 0) {
-        if (submitPhase(command_index, ActiveTransfer::Phase::Data, active)) {
+        if (submitPhase(command, control, ActiveTransfer::Phase::Data,
+                        active)) {
             active_transfers_.push_back(active);
         }
     } else if (kind == HostTransferCommandKind::PutAndSignal ||
                kind == HostTransferCommandKind::Signal) {
-        if (submitPhase(command_index, ActiveTransfer::Phase::Signal, active)) {
+        if (submitPhase(command, control, ActiveTransfer::Phase::Signal,
+                        active)) {
             active_transfers_.push_back(active);
         }
     } else {
-        failCommand(command_index, CollectiveProtocolError::InvalidRoute);
+        failCommand(command, control, CollectiveProtocolError::InvalidRoute);
     }
     return true;
 }
 
 bool HostTransferExecutor::advanceTransfer(ActiveTransfer& active) {
-    auto& command = host_commands_[active.command_index];
-    auto& control = *commands_[active.command_index].control;
+    auto& command = *active.command;
+    auto& control = *active.control;
     TransferStatus status{};
     const auto query = engine_->getTransferStatus(active.batch_id, 0, status);
     if (!query.ok()) {
-        failCommand(active.command_index, CollectiveProtocolError::Transport);
+        failCommand(command, control, CollectiveProtocolError::Transport);
         return true;
     }
     if (status.s == TransferStatusEnum::WAITING ||
@@ -244,7 +216,7 @@ bool HostTransferExecutor::advanceTransfer(ActiveTransfer& active) {
         return false;
     }
     if (status.s != TransferStatusEnum::COMPLETED) {
-        failCommand(active.command_index,
+        failCommand(command, control,
                     status.s == TransferStatusEnum::TIMEOUT
                         ? CollectiveProtocolError::Timeout
                         : CollectiveProtocolError::Transport);
@@ -252,24 +224,23 @@ bool HostTransferExecutor::advanceTransfer(ActiveTransfer& active) {
     }
     const auto released = engine_->freeBatchID(active.batch_id);
     if (!released.ok()) {
-        failCommand(active.command_index, CollectiveProtocolError::Transport);
+        failCommand(command, control, CollectiveProtocolError::Transport);
         return true;
     }
     std::atomic_ref<uint32_t>(control.transport_idle)
         .store(1, std::memory_order_release);
 
     if (active.phase == ActiveTransfer::Phase::Data) {
-        return !submitPhase(active.command_index, ActiveTransfer::Phase::Signal,
+        return !submitPhase(command, control, ActiveTransfer::Phase::Signal,
                             active);
     }
     storeState(command, HostTransferCommandState::Completed);
     return true;
 }
 
-void HostTransferExecutor::failCommand(uint32_t command_index,
+void HostTransferExecutor::failCommand(HostTransferCommand& command,
+                                       CollectiveControlBlock& control,
                                        CollectiveProtocolError error) {
-    auto& command = host_commands_[command_index];
-    auto& control = *commands_[command_index].control;
     std::atomic_ref<int32_t> first_error(control.first_error_code);
     int32_t expected = 0;
     first_error.compare_exchange_strong(expected, static_cast<int32_t>(error),
@@ -283,19 +254,25 @@ void HostTransferExecutor::failCommand(uint32_t command_index,
 void HostTransferExecutor::runLoop() {
     while (!stopping_.load(std::memory_order_acquire)) {
         bool progressed = false;
-        for (uint32_t index = 0; index < command_count_; ++index) {
-            if (loadState(host_commands_[index]) ==
-                static_cast<uint32_t>(HostTransferCommandState::Ready)) {
-                progressed |= beginCommand(index);
+        {
+            std::lock_guard<std::mutex> lock(command_mutex_);
+            for (auto& region : command_regions_) {
+                for (uint32_t index = 0; index < region.command_count; ++index) {
+                    if (loadState(region.commands[index]) ==
+                        static_cast<uint32_t>(HostTransferCommandState::Ready)) {
+                        progressed |= beginCommand(region.commands[index],
+                                                   region.controls[index]);
+                    }
+                }
             }
-        }
-        for (size_t index = 0; index < active_transfers_.size();) {
-            if (advanceTransfer(active_transfers_[index])) {
-                active_transfers_[index] = active_transfers_.back();
-                active_transfers_.pop_back();
-                progressed = true;
-            } else {
-                ++index;
+            for (size_t index = 0; index < active_transfers_.size();) {
+                if (advanceTransfer(active_transfers_[index])) {
+                    active_transfers_[index] = active_transfers_.back();
+                    active_transfers_.pop_back();
+                    progressed = true;
+                } else {
+                    ++index;
+                }
             }
         }
         if (!progressed) {
@@ -312,23 +289,11 @@ void HostTransferExecutor::shutdown() {
     }
     if (thread_.joinable()) thread_.join();
 
-    bool safe_to_free = active_transfers_.empty();
-    {
-        std::lock_guard<std::mutex> lock(command_mutex_);
-        for (const auto& command : commands_) {
-            safe_to_free &= command.state == SlotState::Free;
-        }
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    if (!active_transfers_.empty()) {
+        LOG(WARNING) << "Host transfer executor stopped with active transfers";
     }
-    if (safe_to_free && host_commands_) {
-        (void)cudaFreeHost(host_commands_);
-    } else if (host_commands_) {
-        LOG(WARNING) << "Retaining collective host commands because "
-                        "resource-idle is unproven";
-    }
-    host_commands_ = nullptr;
-    device_commands_ = nullptr;
-    command_count_ = 0;
-    commands_.clear();
+    command_regions_.clear();
     active_transfers_.clear();
     engine_ = nullptr;
     links_ = nullptr;

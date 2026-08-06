@@ -17,9 +17,8 @@
 namespace mooncake {
 
 class CollectiveBufferPool;
-class CollectiveControlPool;
 class HostTransferExecutor;
-class CollectiveLanePool;
+class CollectiveChannels;
 class DeviceLinkManager;
 class CollectiveRuntime;
 class LinkManager;
@@ -35,7 +34,7 @@ class DevicePlan;
 class GroupCollectiveEngine {
    public:
     static PGResult<std::unique_ptr<GroupCollectiveEngine>> create(
-        CollectiveBufferPool& buffer_pool, CollectiveControlPool& control_pool,
+        CollectiveBufferPool& buffer_pool,
         HostTransferExecutor& host_transfer_executor,
         DeviceLinkManager& device_links, LinkManager& host_links,
         TransferEngine* transfer_engine, DeviceId device,
@@ -75,7 +74,7 @@ class GroupCollectiveEngine {
     DeviceId device_ = kInvalidDeviceId;
     InGroupRank self_in_group_rank_ = -1;
 
-    std::unique_ptr<CollectiveLanePool> lanes_;
+    std::unique_ptr<CollectiveChannels> channels_;
     std::unique_ptr<DevicePlan<AllReducePlan>> allreduce_plan_;
     std::unique_ptr<CollectiveRuntime> runtime_;
     GroupEndpointV2 endpoint_;

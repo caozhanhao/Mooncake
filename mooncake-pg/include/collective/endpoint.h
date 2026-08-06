@@ -9,18 +9,18 @@
 
 namespace mooncake {
 
-struct CollectiveControlLaneLayout {
+struct CollectiveControlChannelLayout {
     BufferSpan signals;
 
-    bool operator==(const CollectiveControlLaneLayout&) const = default;
+    bool operator==(const CollectiveControlChannelLayout&) const = default;
 };
 
 struct CollectiveControlLayout {
     uint64_t version = 0;
     uint64_t total_bytes = 0;
     uint64_t alignment = 0;
-    uint32_t lane_count = 0;
-    std::vector<CollectiveControlLaneLayout> lanes;
+    uint32_t channel_count = 0;
+    std::vector<CollectiveControlChannelLayout> channels;
 
     bool operator==(const CollectiveControlLayout&) const = default;
 };

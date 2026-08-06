@@ -72,7 +72,7 @@ void CollectiveResourceLease::abandon() noexcept {
 bool CollectiveResourceLease::retire() noexcept {
     if (!pool_) return true;
     const bool resources_idle =
-        std::atomic_ref<uint32_t>(control.host->transport_idle)
+        std::atomic_ref<uint32_t>(channel.host_control->transport_idle)
             .load(std::memory_order_acquire) != 0;
     if (resources_idle) return release();
     abandon();
@@ -81,29 +81,22 @@ bool CollectiveResourceLease::retire() noexcept {
 
 void CollectiveResourceLease::moveFrom(
     CollectiveResourceLease&& other) noexcept {
-    lane = other.lane;
+    channel = other.channel;
     buffer = std::move(other.buffer);
-    control = other.control;
-    host_command = other.host_command;
     pool_ = std::exchange(other.pool_, nullptr);
     submitted_ = std::exchange(other.submitted_, false);
-    has_lane_ = std::exchange(other.has_lane_, false);
+    has_channel_ = std::exchange(other.has_channel_, false);
 }
 
 PGResult<CollectiveResourceLease> CollectiveResourcePool::acquire(
-    uint32_t preferred_lane) {
+    uint32_t channel_index) {
     CollectiveResourceLease resources(this);
-    PG_TRY(resources.lane, lanes_->acquire(preferred_lane));
-    resources.has_lane_ = true;
-
-    PG_TRY(resources.control, control_pool_->acquire());
+    PG_TRY(resources.channel, channels_->acquire(channel_index));
+    resources.has_channel_ = true;
 
     PG_TRY(resources.buffer,
            buffer_pool_->acquire(device_, collectiveBufferBytes(),
                                  kBufferAlignment, te_location_, engine_));
-
-    PG_TRY(resources.host_command,
-           host_executor_->acquireCommand(resources.control.host));
     return resources;
 }
 
@@ -113,25 +106,13 @@ const CollectiveBufferLayout& CollectiveResourcePool::bufferLayout() {
 
 bool CollectiveResourcePool::release(
     CollectiveResourceLease& resources) noexcept {
-    if (resources.host_command.host) {
-        if (!host_executor_->releaseCommand(resources.host_command)) {
-            resources.host_command = {};
-            abandon(resources);
-            return false;
-        }
-        resources.host_command = {};
-    }
     if (resources.buffer) {
         buffer_pool_->release(*resources.buffer);
         resources.buffer.reset();
     }
-    if (resources.has_lane_) {
-        lanes_->release(resources.lane);
-        resources.has_lane_ = false;
-    }
-    if (resources.control.host) {
-        control_pool_->release(resources.control);
-        resources.control = {};
+    if (resources.has_channel_) {
+        channels_->release(resources.channel);
+        resources.has_channel_ = false;
     }
     resources.submitted_ = false;
     return true;
@@ -139,21 +120,13 @@ bool CollectiveResourcePool::release(
 
 void CollectiveResourcePool::abandon(
     CollectiveResourceLease& resources) noexcept {
-    if (resources.host_command.host) {
-        host_executor_->abandonCommand(resources.host_command);
-        resources.host_command = {};
-    }
     if (resources.buffer) {
         buffer_pool_->abandon(*resources.buffer);
         resources.buffer.reset();
     }
-    if (resources.has_lane_) {
-        lanes_->abandon(resources.lane);
-        resources.has_lane_ = false;
-    }
-    if (resources.control.host) {
-        control_pool_->abandon(resources.control);
-        resources.control = {};
+    if (resources.has_channel_) {
+        channels_->abandon(resources.channel);
+        resources.has_channel_ = false;
     }
     resources.submitted_ = false;
 }

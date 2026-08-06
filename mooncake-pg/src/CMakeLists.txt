@@ -135,9 +135,8 @@ add_library(mooncake_pg SHARED
     collective/allreduce/allreduce.cpp
     collective/resolved_collective_view.cpp
     collective/buffer/collective_buffer_pool.cpp
-    collective/runtime/collective_lane_pool.cpp
+    collective/runtime/collective_channels.cpp
     collective/runtime/runtime.cpp
-    collective/runtime/control_pool.cpp
     collective/runtime/collective_monitor.cpp
     collective/runtime/resource_pool.cpp
     collective/transport/host_transfer_executor.cpp

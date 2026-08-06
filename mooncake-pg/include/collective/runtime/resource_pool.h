@@ -7,9 +7,7 @@
 #include <utility>
 
 #include "collective/buffer/collective_buffer_pool.h"
-#include "collective/runtime/control_pool.h"
-#include "collective/runtime/collective_lane_pool.h"
-#include "collective/transport/host_transfer_executor.h"
+#include "collective/runtime/collective_channels.h"
 #include "error_types.h"
 
 namespace mooncake {
@@ -24,13 +22,12 @@ struct CollectiveBufferLayout {
     BufferSpan protocol;
 };
 
-// MooncakePGContext (process/device lifetime)
-//   |- CollectiveBufferPool       shared registered arena
-//   |- CollectiveControlPool        shared failure/resource controls
-//   `- HostTransferExecutor        optional host-transfer commands
+// MooncakePGContext owns the shared registered buffer arena. The communicator
+// owns its fixed control channels; only the large transfer buffer is leased per
+// invocation.
 //
-// GroupCollectiveEngine (communicator lifetime)
-//   |- CollectiveLanePool         stable wire-control addresses + lane owners
+// GroupCollectiveEngine
+//   |- CollectiveChannels         stable wire/Host control addresses
 //   `- CollectiveRuntime
 //       |- eager invocation       temporary CollectiveResourceLease
 //       `- captured graph         same lease, retired by its CUDA User Object
@@ -54,10 +51,8 @@ class CollectiveResourceLease {
     // otherwise every component is explicitly abandoned.
     bool retire() noexcept;
 
-    CollectiveLaneLease lane;
+    CollectiveChannel channel;
     std::unique_ptr<CollectiveBufferLease> buffer;
-    CollectiveControlLease control;
-    HostTransferCommandLease host_command;
 
    private:
     friend class CollectiveResourcePool;
@@ -70,29 +65,24 @@ class CollectiveResourceLease {
 
     CollectiveResourcePool* pool_ = nullptr;
     bool submitted_ = false;
-    bool has_lane_ = false;
+    bool has_channel_ = false;
 };
 
-// Eager calls lease and graphs pin the same data-plane resource. Every lease
-// includes a host command because a later authoritative plan may move a
-// captured collective between device and host routes. Device-only attempts do
-// not touch that command.
+// Temporary bridge until operation code owns its bulk-buffer preparation.
+// Channels are communicator-owned; this pool leases only the current bulk
+// transfer buffer and composes it with an exact channel.
 class CollectiveResourcePool {
    public:
     CollectiveResourcePool(CollectiveBufferPool* buffer_pool,
-                           CollectiveControlPool* control_pool,
-                           CollectiveLanePool* lanes,
-                           HostTransferExecutor* host_executor, DeviceId device,
+                           CollectiveChannels* channels, DeviceId device,
                            std::string te_location, TransferEngine* engine)
         : buffer_pool_(buffer_pool),
-          control_pool_(control_pool),
-          lanes_(lanes),
-          host_executor_(host_executor),
+          channels_(channels),
           device_(device),
           te_location_(std::move(te_location)),
           engine_(engine) {}
 
-    PGResult<CollectiveResourceLease> acquire(uint32_t preferred_lane);
+    PGResult<CollectiveResourceLease> acquire(uint32_t channel_index);
     static const CollectiveBufferLayout& bufferLayout();
 
    private:
@@ -102,9 +92,7 @@ class CollectiveResourcePool {
     void abandon(CollectiveResourceLease& resources) noexcept;
 
     CollectiveBufferPool* buffer_pool_ = nullptr;
-    CollectiveControlPool* control_pool_ = nullptr;
-    CollectiveLanePool* lanes_ = nullptr;
-    HostTransferExecutor* host_executor_ = nullptr;
+    CollectiveChannels* channels_ = nullptr;
     DeviceId device_ = kInvalidDeviceId;
     std::string te_location_;
     TransferEngine* engine_ = nullptr;

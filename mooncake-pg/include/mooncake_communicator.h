@@ -14,7 +14,6 @@
 #include <transfer_engine.h>
 
 #include "collective/buffer/collective_buffer_pool.h"
-#include "collective/runtime/control_pool.h"
 #include "collective/transport/host_transfer_executor.h"
 #include "control_plane/agent_host.h"
 #include "control_plane/coordinator_host.h"
@@ -57,7 +56,6 @@ struct MooncakePGContext {
     LinkManager link_manager;
     CollectiveBufferPool collective_buffer_pool;
     DeviceLinkManager device_link_manager;
-    CollectiveControlPool collective_control_pool;
     HostTransferExecutor host_transfer_executor;
     MooncakeWorkerManager worker_manager;
     P2PDeviceWorkerManager p2p_device_worker_manager;
