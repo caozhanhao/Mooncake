@@ -1361,10 +1361,12 @@ PGResult<void> MooncakeCommunicator::shutdown() {
     if (planned_collectives_) {
         const auto recovery_window = std::chrono::microseconds(
             std::max<int64_t>(0, context_.fault_reconciliation_window_us));
-        const auto drain_timeout = std::chrono::ceil<std::chrono::milliseconds>(
-            std::chrono::microseconds(context_.collective_timeout_us) +
-            2 * recovery_window);
-        has_unsafe_collective = !planned_collectives_->stop(drain_timeout);
+        const auto eager_drain_timeout =
+            std::chrono::ceil<std::chrono::milliseconds>(
+                std::chrono::microseconds(context_.collective_timeout_us) +
+                2 * recovery_window);
+        has_unsafe_collective =
+            !planned_collectives_->stop(eager_drain_timeout);
     }
 
     if (isValidGroup()) agent_.detachCommunicator(meta_->group_id);

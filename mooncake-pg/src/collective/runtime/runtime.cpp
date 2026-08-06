@@ -41,10 +41,7 @@ PGResult<std::unique_ptr<CollectiveRuntime>> CollectiveRuntime::create(
 
 CollectiveRuntime::~CollectiveRuntime() noexcept {
     stopAccepting();
-    if (monitor_) {
-        (void)monitor_->drain(std::chrono::milliseconds(100));
-        monitor_->stop();
-    }
+    if (monitor_) monitor_->stop();
 }
 
 PGResult<std::shared_ptr<CollectiveSubmission>>
@@ -139,10 +136,10 @@ void CollectiveRuntime::stopAccepting() {
     accepting_.store(false, std::memory_order_release);
 }
 
-bool CollectiveRuntime::drain(std::chrono::milliseconds timeout) {
+bool CollectiveRuntime::drain(std::chrono::milliseconds eager_timeout) {
     stopAccepting();
     std::lock_guard<std::mutex> admission(admission_mutex_);
-    return !monitor_ || monitor_->drain(timeout);
+    return !monitor_ || monitor_->drain(eager_timeout);
 }
 
 }  // namespace mooncake

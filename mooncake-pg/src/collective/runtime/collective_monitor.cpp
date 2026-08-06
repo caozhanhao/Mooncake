@@ -14,7 +14,6 @@ namespace mooncake {
 struct CollectiveMonitor::GraphReleaseQueue {
     std::mutex mutex;
     std::vector<std::shared_ptr<CollectiveSubmission>> submissions;
-    bool closed = false;
 };
 
 struct CollectiveMonitor::GraphReleasePayload {
@@ -106,16 +105,21 @@ PGResult<void> CollectiveMonitor::adoptGraphSubmission(
     PG_TRY(auto user_object,
            GpuGraphUserObject::create(payload_ptr, graphSubmissionReleased));
     (void)payload.release();
-    PG_TRY(user_object.moveTo(capture.graph));
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    graph_shutdown_refs_.emplace(submission.get(), submission);
-    return {};
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Count the wrapper before transfer. If the transfer fails, releasing
+        // the wrapper still runs the same asynchronous destructor callback.
+        ++graph_submission_count_;
+    }
+    return user_object.moveTo(capture.graph);
 }
 
 void CollectiveMonitor::markCompletionUnproven() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    has_unproven_completion_ = true;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        has_unproven_completion_ = true;
+    }
+    drain_cv_.notify_all();
 }
 
 void CollectiveMonitor::adoptStreamCompletion(
@@ -129,7 +133,6 @@ void CUDART_CB CollectiveMonitor::graphSubmissionReleased(void* opaque) {
         static_cast<GraphReleasePayload*>(opaque));
     const auto queue = payload->queue;
     std::lock_guard<std::mutex> lock(queue->mutex);
-    if (queue->closed) return;
     queue->submissions.push_back(std::move(payload->submission));
 }
 
@@ -138,7 +141,6 @@ void CollectiveMonitor::retireSubmission(
     {
         std::lock_guard<std::mutex> lock(mutex_);
         removeFailureSourceLocked(submission);
-        graph_shutdown_refs_.erase(submission.get());
     }
     if (!submission->retire()) {
         LOG(WARNING) << "Quarantined an active collective submission";
@@ -164,6 +166,8 @@ bool CollectiveMonitor::retireCompletedStream() {
     }
     if (!completed) return false;
 
+    drain_cv_.notify_all();
+
     if (query != cudaSuccess) {
         // Completion is unproven. Keep observing failure reports and retain
         // the submission until shutdown rather than releasing memory
@@ -185,6 +189,11 @@ bool CollectiveMonitor::retireReleasedGraphSubmission() {
         graph_release_queue_->submissions.pop_back();
     }
     retireSubmission(submission);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        --graph_submission_count_;
+    }
+    drain_cv_.notify_all();
     return true;
 }
 
@@ -265,46 +274,30 @@ void CollectiveMonitor::monitorLoop() noexcept {
     }
 }
 
-bool CollectiveMonitor::drain(std::chrono::milliseconds timeout) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (true) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (has_unproven_completion_) return false;
-            if (stream_completions_.empty()) return true;
-        }
-        if (std::chrono::steady_clock::now() >= deadline) return false;
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-    }
-}
+bool CollectiveMonitor::drain(std::chrono::milliseconds eager_timeout) {
+    const auto eager_deadline =
+        std::chrono::steady_clock::now() + eager_timeout;
+    std::unique_lock<std::mutex> lock(mutex_);
+    (void)drain_cv_.wait_until(lock, eager_deadline, [&]() {
+        return has_unproven_completion_ || stream_completions_.empty();
+    });
 
-void CollectiveMonitor::retireGraphSubmissionsAtShutdown() noexcept {
-    std::vector<std::shared_ptr<CollectiveSubmission>> submissions;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        submissions.reserve(graph_shutdown_refs_.size());
-        for (const auto& entry : graph_shutdown_refs_) {
-            if (auto retained = entry.second.lock()) {
-                submissions.push_back(std::move(retained));
-            }
-        }
-        graph_shutdown_refs_.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(graph_release_queue_->mutex);
-        graph_release_queue_->closed = true;
-        graph_release_queue_->submissions.clear();
-    }
-
-    for (const auto& submission : submissions) {
-        retireSubmission(submission);
-    }
+    // CUDA invokes the user-object destructor only after the captured graph
+    // and every executable derived from it have released the submission. As
+    // in NCCL, communicator destruction waits here instead of invalidating a
+    // graph that can still replay.
+    drain_cv_.wait(lock, [&]() { return graph_submission_count_ == 0; });
+    return !has_unproven_completion_ && stream_completions_.empty();
 }
 
 void CollectiveMonitor::stop() noexcept {
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        drain_cv_.wait(lock,
+                       [&]() { return graph_submission_count_ == 0; });
+    }
     if (stopping_.exchange(true, std::memory_order_acq_rel)) return;
     if (thread_.joinable()) thread_.join();
-    retireGraphSubmissionsAtShutdown();
 }
 
 }  // namespace mooncake

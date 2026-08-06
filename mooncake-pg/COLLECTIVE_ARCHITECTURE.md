@@ -209,16 +209,21 @@ allocator hierarchy.
 Eager and graph execution use the same prepared submission and device protocol.
 Only retention differs: eager uses a completion event, while graph capture
 attaches a GPU user object and keeps the submission until no graph or executable
-can reference it. Communicator teardown remains terminal: callers must not
-replay or destroy a communicator while its graph execution is in flight.
+can reference it.
 
 `CollectiveRuntime::submit()` runs while an operation is eagerly enqueued or
 recorded during capture. Replay launches the recorded kernels directly and
 does not re-enter the runtime. During graph lifetime the user-object payload,
 not `CollectiveMonitor`, owns the submission. Its destructor callback queues
 the released submission for the monitor to retire outside the CUDA callback.
-The monitor keeps only weak shutdown references so communicator-owned pools
-can be cleared before they disappear.
+
+Communicator teardown first stops host admission and drains eager submissions.
+It then waits without a timeout for every graph-held submission, matching
+NCCL's persistent-reference lifetime: plans, links, channels, buffers, host
+transfer execution, and failure observation remain alive while a Graph or
+GraphExec can still replay. Applications should destroy GraphExec/Graph before
+destroying the communicator; otherwise communicator destruction blocks until
+those objects are released. Teardown never retires a captured submission early.
 
 The pooled bulk buffer and its exact channel are retired together:
 

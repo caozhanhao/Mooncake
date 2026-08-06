@@ -82,10 +82,13 @@ PGResult<void> GroupCollectiveEngine::allReduce(
                               failed_ranks_hint_count);
 }
 
-bool GroupCollectiveEngine::stop(std::chrono::milliseconds timeout) {
+bool GroupCollectiveEngine::stop(std::chrono::milliseconds eager_timeout) {
     if (!runtime_) return true;
     runtime_->stopAccepting();
-    const bool resources_safe = runtime_->drain(timeout);
+    // The timeout applies to eager completion. Graph-held submissions wait
+    // until every Graph/GraphExec releases them so their stable plan, links,
+    // channels, and buffers remain valid for replay.
+    const bool resources_safe = runtime_->drain(eager_timeout);
     if (!resources_safe) {
         allreduce_->retainPlanForProcessLifetime();
         device_links_.retainForProcessLifetime();

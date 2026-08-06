@@ -38,7 +38,7 @@ class CollectiveRuntime {
     uint64_t timeoutDeviceTicks() const { return timeout_device_ticks_; }
 
     void stopAccepting();
-    bool drain(std::chrono::milliseconds timeout);
+    bool drain(std::chrono::milliseconds eager_timeout);
 
     CollectiveRuntime(const CollectiveRuntime&) = delete;
     CollectiveRuntime& operator=(const CollectiveRuntime&) = delete;

@@ -49,10 +49,11 @@ class GroupCollectiveEngine {
                              cudaStream_t stream, int32_t* failed_ranks_hint,
                              size_t failed_ranks_hint_count);
 
-    // Terminal execution shutdown. It drains eager work, stops monitoring,
-    // and leaves endpoint/peer-signal storage alive until close() follows the
+    // Terminal execution shutdown. It drains eager work up to the given
+    // timeout, waits for captured graph references, stops monitoring, and
+    // leaves endpoint/peer-signal storage alive until close() follows the
     // control-plane group unregister.
-    bool stop(std::chrono::milliseconds timeout);
+    bool stop(std::chrono::milliseconds eager_timeout);
     bool close(bool resources_safe);
 
     GroupCollectiveEngine(const GroupCollectiveEngine&) = delete;

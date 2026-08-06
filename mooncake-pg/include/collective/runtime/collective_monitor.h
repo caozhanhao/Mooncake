@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -10,7 +11,6 @@
 #include <mutex>
 #include <optional>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -68,7 +68,9 @@ class CollectiveMonitor {
     void markCompletionUnproven();
     void adoptStreamCompletion(std::unique_ptr<StreamCompletion> completion);
 
-    bool drain(std::chrono::milliseconds timeout);
+    // The timeout bounds eager completion only. Captured submissions keep the
+    // communicator alive until every graph and executable releases them.
+    bool drain(std::chrono::milliseconds eager_timeout);
     void stop() noexcept;
 
     CollectiveMonitor(const CollectiveMonitor&) = delete;
@@ -98,7 +100,6 @@ class CollectiveMonitor {
     bool retireReleasedGraphSubmission();
     void retireSubmission(
         const std::shared_ptr<CollectiveSubmission>& submission);
-    void retireGraphSubmissionsAtShutdown() noexcept;
     static std::optional<FailureClaim> claimFailure(
         const FailureSource& source);
     void handleFailure(const FailureClaim& failure);
@@ -111,14 +112,10 @@ class CollectiveMonitor {
     CollectiveFailureReportCallback report_failure_;
 
     mutable std::mutex mutex_;
+    std::condition_variable drain_cv_;
     std::vector<FailureSource> failure_sources_;
     std::vector<std::unique_ptr<StreamCompletion>> stream_completions_;
-    // Graph user objects, not the monitor, own captured submissions. These
-    // weak references only let stop() clear leases before communicator-owned
-    // resource pools disappear.
-    std::unordered_map<CollectiveSubmission*,
-                       std::weak_ptr<CollectiveSubmission>>
-        graph_shutdown_refs_;
+    size_t graph_submission_count_ = 0;
     std::shared_ptr<GraphReleaseQueue> graph_release_queue_;
     bool has_unproven_completion_ = false;
     std::thread thread_;
