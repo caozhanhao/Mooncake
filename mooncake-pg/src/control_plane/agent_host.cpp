@@ -52,9 +52,10 @@ void AgentRpcServiceImpl::onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
 
 AgentHost::AgentHost(std::string coordinator_addr, const std::string& host_ip,
                      GlobalRank rank, int max_world_size,
+                     DeviceTransferEndpoint transfer_service_endpoint,
                      LinkManager& link_manager,
                      int64_t fault_reconciliation_window_us)
-    : agent_(rank, max_world_size),
+    : agent_(rank, max_world_size, std::move(transfer_service_endpoint)),
       executor_("AgentHost"),
       link_manager_(link_manager),
       host_ip_(host_ip),
@@ -284,7 +285,11 @@ PGResult<GroupId> AgentHost::registerGroup(
 
             const auto& group_id = resp.view.group_id;
             communicators_.insert_or_assign(group_id, communicator);
-            runEffects(agent_.registerGroup(resp.view));
+            auto applied = applyGroupView(resp.view);
+            if (!applied.has_value()) {
+                communicators_.erase(group_id);
+                return makePGError(std::move(applied).error());
+            }
             return group_id;
         });
 }
@@ -383,7 +388,7 @@ PGResult<ProposeViewUpdateResponse> AgentHost::proposeDeactivate(
 
 void AgentHost::pushLinkEvent(const LinkEvent& event) {
     executor_.post(
-        [this, event]() { runEffects(agent_.pushLinkEvent(event)); });
+        [this, event]() { (void)runEffects(agent_.pushLinkEvent(event)); });
 }
 
 PGResult<SyncAfterFailureResponse> AgentHost::syncAfterFailure(
@@ -421,8 +426,7 @@ PGResult<SyncAfterFailureResponse> AgentHost::syncAfterFailure(
         }
 
         if (response.status != SyncAfterFailureStatus::Rejected) {
-            PG_TRY(auto effects, agent_.applyGroupView(response.view));
-            runEffects(effects);
+            PG_TRY(applyGroupView(response.view));
         }
         return {};
     }));
@@ -431,13 +435,13 @@ PGResult<SyncAfterFailureResponse> AgentHost::syncAfterFailure(
 
 void AgentHost::postPeerJoined(PeerJoinedPush push) {
     executor_.post([this, push = std::move(push)]() {
-        runEffects(agent_.handlePeerJoined(push));
+        (void)runEffects(agent_.handlePeerJoined(push));
     });
 }
 
 void AgentHost::postRankStateUpdate(RankStatePush push) {
     executor_.post([this, push = std::move(push)]() {
-        runEffects(agent_.handleRankStateUpdate(push));
+        (void)runEffects(agent_.handleRankStateUpdate(push));
     });
 }
 
@@ -448,14 +452,13 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
 
     executor_.post([this, ctx = std::move(ctx), push = std::move(push),
                     group_id, epoch]() mutable {
-        auto apply_result = agent_.handleViewUpdate(push);
+        auto apply_result = applyGroupView(push.view);
         ViewUpdateAck ack{.rank = rank_,
                           .group_id = group_id,
                           .epoch = epoch,
                           .applied = false,
                           .error_msg = ""};
         if (apply_result.has_value()) {
-            runEffects(std::move(apply_result).value());
             ack.applied = true;
         } else {
             ack.error_msg = std::move(apply_result).error().message;
@@ -480,7 +483,7 @@ void AgentHost::startAgentRegistration(bool start_new_session) {
         agent_session_initialized_ = false;
     }
     if (!agent_session_initialized_) {
-        runEffects(agent_.reset(agent_session_id_));
+        (void)runEffects(agent_.reset(agent_session_id_));
         agent_session_initialized_ = true;
     }
 
@@ -491,6 +494,7 @@ void AgentHost::startAgentRegistration(bool start_new_session) {
     req.rank = rank_;
     req.agent_addr = rpc_server_->getListenAddr(host_ip_);
     req.te_server_name = link_manager_.localServerName();
+    req.transfer_service_endpoint = agent_.localTransferEndpoint();
     req.warmup_recv_addr = link_manager_.getWarmupRecvAddr();
     req.agent_session_id = agent_session_id_;
     const uint64_t request_session_id = req.agent_session_id;
@@ -528,10 +532,21 @@ void AgentHost::startAgentRegistration(bool start_new_session) {
                 }
 
                 auto effects = agent_.applyRegisterAgentResponse(resp);
-                runEffects(effects);
+                (void)runEffects(effects);
                 if (agent_.getCoordinatorConnection() !=
                     AgentStateMachine::CoordinatorConnection::Connected)
                     return;
+
+                for (const auto& view : resp.groups) {
+                    if (!communicators_.contains(view.group_id)) continue;
+                    auto applied = applyGroupView(view);
+                    if (!applied.has_value()) {
+                        LOG(ERROR) << "AgentHost: failed to apply restored "
+                                      "GroupView for group="
+                                   << view.group_id << " epoch=" << view.epoch
+                                   << ": " << applied.error().message;
+                    }
+                }
 
                 link_manager_.start(agent_.getRankEpoch());
 
@@ -618,7 +633,30 @@ void AgentHost::tick() {
         });
 }
 
-void AgentHost::runEffects(const AgentApplyResult& effects) {
+PGResult<void> AgentHost::applyGroupView(const GroupView& view) {
+    PG_VALIDATE_STATE(
+        communicators_.contains(view.group_id),
+        "cannot apply GroupView without a communicator: " + view.group_id);
+
+    // AgentHost's executor serializes this whole sequence, so no other view
+    // can change groups_ between prepare and install.
+    PG_TRY(auto apply_effects, agent_.prepareGroupView(view));
+    if (apply_effects.empty()) return {};
+
+    auto applied = runEffects(apply_effects);
+    if (!applied.has_value()) {
+        // The candidate is not committed. If device collective materialization
+        // started, its runtime remains Blocked until a later complete
+        // ViewUpdate.
+        return makePGError(std::move(applied).error());
+    }
+
+    auto install_effects = agent_.installGroupView(view);
+    return runEffects(install_effects);
+}
+
+PGResult<void> AgentHost::runEffects(const AgentApplyResult& effects) {
+    std::optional<PGError> first_apply_error;
     for (const auto& effect : effects) {
         std::visit(
             overloaded{
@@ -682,12 +720,18 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                         }
                     }
                 },
-                [this](const ApplyViewToCommunicator& e) {
-                    withCommunicator(e.view.group_id, [&](auto communicator) {
-                        communicator->applyViewUpdate(e.view, e.rank_states,
-                                                      e.rank_epochs,
-                                                      e.activatable);
-                    });
+                [this, &first_apply_error](const ApplyViewToCommunicator& e) {
+                    auto it = communicators_.find(e.view.group_id);
+                    if (it == communicators_.end()) return;
+                    auto result = it->second->applyViewUpdate(
+                        e.view, e.rank_states, e.rank_epochs,
+                        e.transfer_service_endpoints, e.activatable,
+                        e.materialize_device_collective_view);
+                    if (!result.has_value()) {
+                        if (!first_apply_error) {
+                            first_apply_error = std::move(result).error();
+                        }
+                    }
                 },
                 [this](const NotifyGroupReady& e) {
                     auto it = group_ready_promises_.find(e.group_id);
@@ -711,6 +755,10 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
             },
             effect);
     }
+    if (first_apply_error) {
+        return makePGError(std::move(*first_apply_error));
+    }
+    return {};
 }
 
 }  // namespace mooncake

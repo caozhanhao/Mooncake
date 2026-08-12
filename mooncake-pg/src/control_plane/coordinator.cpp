@@ -53,6 +53,13 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
             result.response.require_new_session = true;
             return result;
         }
+        if (info.transfer_service_endpoint != req.transfer_service_endpoint) {
+            result.response.success = false;
+            result.response.reject_reason =
+                "transfer-service endpoint changed within one agent session";
+            result.response.require_new_session = true;
+            return result;
+        }
         info.last_heartbeat = std::chrono::steady_clock::now();
         populateRegisterAgentResponse(result.response, req.rank);
         return result;
@@ -78,6 +85,7 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     ++info.rank_epoch;
     info.agent_addr = req.agent_addr;
     info.te_server_name = req.te_server_name;
+    info.transfer_service_endpoint = req.transfer_service_endpoint;
     info.agent_session_id = req.agent_session_id;
     info.warmup_recv_addr = req.warmup_recv_addr;
     info.last_heartbeat = std::chrono::steady_clock::now();
@@ -119,9 +127,13 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     info.state = RankState::Synced;
     ++info.rank_state_version;
 
-    result.effects.push_back(BroadcastPeerJoined{
-        PeerJoinedPush{req.rank, info.rank_epoch, info.te_server_name,
-                       info.warmup_recv_addr}});
+    result.effects.push_back(BroadcastPeerJoined{PeerJoinedPush{
+        .rank = req.rank,
+        .rank_epoch = info.rank_epoch,
+        .te_server_name = info.te_server_name,
+        .transfer_service_endpoint = info.transfer_service_endpoint,
+        .warmup_recv_addr = info.warmup_recv_addr,
+    }});
     result.effects.push_back(makeRankStateEffect(req.rank));
 
     populateRegisterAgentResponse(result.response, req.rank);
@@ -167,6 +179,8 @@ void CentralizedCoordinatorStateMachine::populateRegisterAgentResponse(
         connection.rank_epoch = ranks_[i].rank_epoch;
         connection.agent_addr = ranks_[i].agent_addr;
         connection.te_server_name = ranks_[i].te_server_name;
+        connection.transfer_service_endpoint =
+            ranks_[i].transfer_service_endpoint;
         connection.warmup_recv_addr = ranks_[i].warmup_recv_addr;
         response.rank_connections.push_back(std::move(connection));
     }

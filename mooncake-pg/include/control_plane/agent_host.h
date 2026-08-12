@@ -33,7 +33,7 @@ class MooncakeCommunicator;
 //   MooncakeCommunicator                      AgentHost
 //   +-----------------+              +---------------------------+
 //   | proposeActivate |-> (sync) --->| call Coordinator RPC      |
-//   | registerGroup   |-> post() --->| agent_.registerGroup()    |
+//   | registerGroup   |-> post() --->| apply GroupView           |
 //   | pushLinkEvent   |-> post() --->| agent_.pushLinkEvent()      |
 //   +-----------------+              +---------------------------+
 //                                            |
@@ -124,7 +124,9 @@ class AgentHost : public AgentInterface {
     static constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
 
     AgentHost(std::string coordinator_addr, const std::string& host_ip,
-              GlobalRank rank, int max_world_size, LinkManager& link_manager,
+              GlobalRank rank, int max_world_size,
+              DeviceTransferEndpoint transfer_service_endpoint,
+              LinkManager& link_manager,
               int64_t fault_reconciliation_window_us);
 
     ~AgentHost() override;
@@ -230,7 +232,8 @@ class AgentHost : public AgentInterface {
         GroupId group_id, const std::vector<InGroupRank>& ranks,
         bool is_activation);
 
-    void runEffects(const AgentApplyResult& effects);
+    PGResult<void> applyGroupView(const GroupView& view);
+    PGResult<void> runEffects(const AgentApplyResult& effects);
     template <typename F>
     void forEachCommunicator(F&& func) {
         for (auto& [group_id, communicator] : communicators_) {

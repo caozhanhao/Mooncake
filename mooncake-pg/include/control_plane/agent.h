@@ -15,15 +15,18 @@ namespace mooncake {
 // AgentStateMachine - Pure state machine for the control-plane client.
 class AgentStateMachine {
    public:
-    AgentStateMachine(GlobalRank rank, int max_world_size);
+    AgentStateMachine(GlobalRank rank, int max_world_size,
+                      DeviceTransferEndpoint local_transfer_endpoint);
 
-    AgentApplyResult registerGroup(const GroupView& group);
     void unregisterGroup(GroupId group_id);
 
     AgentApplyResult handlePeerJoined(const PeerJoinedPush& push);
     AgentApplyResult handleRankStateUpdate(const RankStatePush& push);
-    PGResult<AgentApplyResult> applyGroupView(const GroupView& view);
-    PGResult<AgentApplyResult> handleViewUpdate(const ViewUpdatePush& push);
+
+    // Preparing a view does not change groups_. AgentHost installs it only
+    // after the communicator has materialized the complete data-plane state.
+    PGResult<AgentApplyResult> prepareGroupView(const GroupView& view) const;
+    AgentApplyResult installGroupView(const GroupView& view);
 
     HeartbeatRequest buildHeartbeat() const;
 
@@ -57,9 +60,14 @@ class AgentStateMachine {
         return self_rank_epoch_.load(std::memory_order_acquire);
     }
 
+    const DeviceTransferEndpoint& localTransferEndpoint() const noexcept {
+        return local_transfer_endpoint_;
+    }
+
    private:
     GlobalRank rank_;
     int max_world_size_;
+    DeviceTransferEndpoint local_transfer_endpoint_;
 
     std::atomic<uint64_t> agent_session_id_{0};
     std::atomic<uint64_t> self_rank_epoch_{0};
@@ -83,10 +91,12 @@ class AgentStateMachine {
         return 0 <= rank && rank < max_world_size_;
     }
 
-    void appendApplyViewEffect(const GroupView& view,
-                               AgentApplyResult& effects) const;
-    void appendApplyViewEffectsForRank(GlobalRank rank,
-                                       AgentApplyResult& effects) const;
+    void appendApplyViewToCommunicator(
+        const GroupView& view, AgentApplyResult& effects,
+        bool materialize_device_collective_view) const;
+    void appendApplyViewEffectsForRank(
+        GlobalRank rank, AgentApplyResult& effects,
+        bool materialize_device_collective_view) const;
     void resetRankForNewEpoch(GlobalRank rank, uint64_t rank_epoch,
                               AgentApplyResult& effects);
     bool recordLinkEvent(GlobalRank peer, uint64_t target_rank_epoch,

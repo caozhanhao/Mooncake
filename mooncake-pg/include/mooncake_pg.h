@@ -168,6 +168,8 @@ MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgContextSetTransferEngine(
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgContextSetDeviceFilter(
     mooncakePgContext_t context, const char* const* filters,
     size_t filterCount);
+MOONCAKE_PG_EXPORT mooncakePgResult_t
+mooncakePgContextSetDeviceArenaSize(mooncakePgContext_t context, size_t size);
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgContextSetCollectiveTimeout(
     mooncakePgContext_t context, size_t timeoutUs);
 MOONCAKE_PG_EXPORT mooncakePgResult_t
@@ -181,6 +183,10 @@ mooncakePgContextDestroy(mooncakePgContext_t context);
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgCommCreate(
     mooncakePgContext_t context, const mooncakePgCommConfig_t* config,
     mooncakePgComm_t* comm);
+// Returns mooncakePgResourceBusy without consuming `comm` while a CUDA
+// Graph/GraphExec still references captured collective work. Destroy those
+// objects (and let any outstanding replay finish), then retry with the same
+// communicator handle.
 MOONCAKE_PG_EXPORT mooncakePgResult_t
 mooncakePgCommDestroy(mooncakePgComm_t comm);
 MOONCAKE_PG_EXPORT mooncakePgResult_t

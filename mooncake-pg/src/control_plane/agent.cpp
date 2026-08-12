@@ -8,8 +8,12 @@
 
 namespace mooncake {
 
-AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
-    : rank_(rank), max_world_size_(max_world_size) {
+AgentStateMachine::AgentStateMachine(
+    GlobalRank rank, int max_world_size,
+    DeviceTransferEndpoint local_transfer_endpoint)
+    : rank_(rank),
+      max_world_size_(max_world_size),
+      local_transfer_endpoint_(std::move(local_transfer_endpoint)) {
     PG_ASSERT(max_world_size_ > 0 && max_world_size_ <= kMaxNumRanks,
               "invalid max_world_size: ", max_world_size_);
     global_rank_states_ = std::vector<RankState>(max_world_size_);
@@ -20,8 +24,20 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     observed_target_rank_epochs_.assign(max_world_size_, 0);
 }
 
-void AgentStateMachine::appendApplyViewEffect(const GroupView& view,
-                                              AgentApplyResult& effects) const {
+void AgentStateMachine::appendApplyViewToCommunicator(
+    const GroupView& view, AgentApplyResult& effects,
+    bool materialize_device_collective_view) const {
+    std::vector<std::optional<DeviceTransferEndpoint>> transfer_endpoints(
+        max_world_size_);
+    transfer_endpoints[rank_] = local_transfer_endpoint_;
+    for (int rank = 0; rank < max_world_size_; ++rank) {
+        if (rank == rank_) continue;
+        const auto& connection = rank_connections_[rank];
+        if (connection && connection->rank_epoch == global_rank_epochs_[rank]) {
+            transfer_endpoints[rank] = connection->transfer_service_endpoint;
+        }
+    }
+
     std::vector<bool> activatable(view.rank_order.size());
     for (size_t i = 0; i < view.rank_order.size(); ++i) {
         GlobalRank gr = view.rank_order[i];
@@ -31,16 +47,15 @@ void AgentStateMachine::appendApplyViewEffect(const GroupView& view,
                          (member.isActive() || member.isAwaitingActivation()) &&
                          member.hasEndpoint();
     }
-    effects.push_back(ApplyViewToCommunicator{view, global_rank_states_,
-                                              global_rank_epochs_,
-                                              std::move(activatable)});
-}
-
-AgentApplyResult AgentStateMachine::registerGroup(const GroupView& group) {
-    AgentApplyResult effects;
-    groups_.insert_or_assign(group.group_id, group);
-    appendApplyViewEffect(group, effects);
-    return effects;
+    effects.push_back(ApplyViewToCommunicator{
+        .view = view,
+        .rank_states = global_rank_states_,
+        .rank_epochs = global_rank_epochs_,
+        .transfer_service_endpoints = std::move(transfer_endpoints),
+        .activatable = std::move(activatable),
+        .materialize_device_collective_view =
+            materialize_device_collective_view,
+    });
 }
 
 void AgentStateMachine::unregisterGroup(GroupId group_id) {
@@ -56,11 +71,13 @@ GroupView AgentStateMachine::getGroupView(GroupId group_id) const {
 }
 
 void AgentStateMachine::appendApplyViewEffectsForRank(
-    GlobalRank rank, AgentApplyResult& effects) const {
+    GlobalRank rank, AgentApplyResult& effects,
+    bool materialize_device_collective_view) const {
     for (const auto& [group_id, view] : groups_) {
         if (std::find(view.rank_order.begin(), view.rank_order.end(), rank) !=
             view.rank_order.end()) {
-            appendApplyViewEffect(view, effects);
+            appendApplyViewToCommunicator(view, effects,
+                                          materialize_device_collective_view);
         }
     }
 }
@@ -96,7 +113,6 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
         push.rank_epoch > global_rank_epochs_[push.rank];
     if (new_rank_epoch) {
         resetRankForNewEpoch(push.rank, push.rank_epoch, effects);
-        appendApplyViewEffectsForRank(push.rank, effects);
     } else if (global_rank_states_[push.rank] == RankState::Offline) {
         // Offline is terminal within a rank epoch. A delayed PeerJoined for
         // that epoch must not restart the old connection.
@@ -110,6 +126,7 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
         .rank_epoch = push.rank_epoch,
         .agent_addr = "",
         .te_server_name = push.te_server_name,
+        .transfer_service_endpoint = push.transfer_service_endpoint,
         .warmup_recv_addr = push.warmup_recv_addr,
     };
     effects.push_back(EnablePeerProbe{push.rank, push.rank_epoch,
@@ -140,7 +157,8 @@ AgentApplyResult AgentStateMachine::handleRankStateUpdate(
 
     global_rank_states_[push.rank] = push.new_state;
     global_rank_state_versions_[push.rank] = push.rank_state_version;
-    appendApplyViewEffectsForRank(push.rank, effects);
+    appendApplyViewEffectsForRank(push.rank, effects,
+                                  /*materialize_device_collective_view=*/false);
 
     // Remote Offline: tear down TE link AND stop candidate probe.
     if (push.rank != rank_ && push.new_state == RankState::Offline) {
@@ -155,30 +173,18 @@ AgentApplyResult AgentStateMachine::handleRankStateUpdate(
     return effects;
 }
 
-PGResult<AgentApplyResult> AgentStateMachine::applyGroupView(
-    const GroupView& view) {
+PGResult<AgentApplyResult> AgentStateMachine::prepareGroupView(
+    const GroupView& view) const {
     AgentApplyResult effects;
     const auto& group_id = view.group_id;
     auto it = groups_.find(group_id);
-    if (it == groups_.end()) {
-        LOG(WARNING) << "[AGENT] applyGroupView group=" << group_id
-                     << " NOT FOUND in groups_ (epoch=" << view.epoch << ")";
-        return makePGError(
-            PGErrorCode::InvalidState,
-            "group not found while applying GroupView: " + group_id);
-    }
-
-    const auto& old_view = it->second;
-
-    // View application is idempotent. A sync response may race with the
-    // regular ViewUpdate push for the same decision, or even arrive after a
-    // newer view has already been installed.
-    if (view.epoch < old_view.epoch) {
+    if (it != groups_.end() && view.epoch < it->second.epoch) {
         LOG(WARNING) << "[AGENT] Ignored stale GroupView for group=" << group_id
                      << " epoch=" << view.epoch;
         return effects;
-    } else if (view.epoch == old_view.epoch) {
-        if (view == old_view) return effects;
+    }
+    if (it != groups_.end() && view.epoch == it->second.epoch &&
+        view != it->second) {
         LOG(ERROR) << "[AGENT] Ignored conflicting GroupView for group="
                    << group_id << " epoch=" << view.epoch;
         return makePGError(PGErrorCode::InternalError,
@@ -186,68 +192,79 @@ PGResult<AgentApplyResult> AgentStateMachine::applyGroupView(
                                " at epoch " + std::to_string(view.epoch));
     }
 
-    // Collect peers whose segment caches must be refreshed.
-    std::vector<GlobalRank> need_segment_refresh;
-
-    // Detect endpoint updates.
-    for (size_t r = 0; r < view.members.size(); ++r) {
-        if (r == static_cast<size_t>(rank_)) continue;
-        if (!view.members[r].isMember()) continue;
-        uint64_t old_epoch = 0;
-        uint64_t new_epoch = 0;
-        if (old_view.members[r].hasEndpoint()) {
-            old_epoch = old_view.members[r].endpoint->endpoint_epoch;
-        }
-        if (view.members[r].hasEndpoint()) {
-            new_epoch = view.members[r].endpoint->endpoint_epoch;
-        }
-        if (new_epoch != 0 && new_epoch != old_epoch) {
-            effects.push_back(RefreshPeerLink{static_cast<GlobalRank>(r)});
-            need_segment_refresh.push_back(static_cast<GlobalRank>(r));
-        }
-    }
-
-    // Applying the view must happen-before waking group/rank waiters: callers
-    // may submit a collective as soon as waitUntilGroupReady()/joinGroup()
-    // returns, and that collective must observe the new data-plane metadata.
-    appendApplyViewEffect(view, effects);
-
-    // Detect rank activation transitions.
-    if (!old_view.members.empty()) {
-        std::vector<GlobalRank> newly_activated;
-        for (size_t igr = 0; igr < view.rank_order.size(); ++igr) {
-            GlobalRank gr = view.rank_order[igr];
-            if (!old_view.members[gr].isActive() &&
-                view.members[gr].isActive()) {
-                newly_activated.push_back(gr);
-            }
-        }
-        if (!newly_activated.empty()) {
-            effects.push_back(
-                NotifyRanksActivated{group_id, std::move(newly_activated)});
-        }
-    }
-
-    // Detect Ready transition.
-    if (old_view.status != GroupStatus::Ready &&
-        view.status == GroupStatus::Ready) {
-        effects.push_back(NotifyGroupReady{group_id});
-    }
-
-    it->second = view;
-
-    // Must come AFTER ApplyViewToCommunicator: refreshSegmentID requires
-    // latest meta_->rank_order.
-    for (auto gr : need_segment_refresh) {
-        effects.push_back(NotifyLinkRefreshed{gr});
-    }
-
+    // Equal views are deliberately applied again. Recovery can return the
+    // current Coordinator view and still needs to rebuild routes and reset the
+    // fixed device protocol state. Since only a successful apply is committed,
+    // this requires no failed-epoch bookkeeping.
+    appendApplyViewToCommunicator(view, effects,
+                                  /*materialize_device_collective_view=*/true);
     return effects;
 }
 
-PGResult<AgentApplyResult> AgentStateMachine::handleViewUpdate(
-    const ViewUpdatePush& push) {
-    return applyGroupView(push.view);
+AgentApplyResult AgentStateMachine::installGroupView(const GroupView& view) {
+    AgentApplyResult effects;
+    auto old = groups_.find(view.group_id);
+    if (old != groups_.end() && view.epoch < old->second.epoch) return effects;
+
+    PG_ASSERT(old == groups_.end() || view.epoch != old->second.epoch ||
+                  view == old->second,
+              "conflicting GroupView install for group ", view.group_id,
+              " at epoch ", view.epoch);
+
+    std::vector<GlobalRank> endpoints_to_refresh;
+    for (size_t rank = 0; rank < view.members.size(); ++rank) {
+        if (rank == static_cast<size_t>(rank_) ||
+            !view.members[rank].isMember()) {
+            continue;
+        }
+
+        uint64_t old_endpoint_epoch = 0;
+        if (old != groups_.end() && rank < old->second.members.size() &&
+            old->second.members[rank].hasEndpoint()) {
+            old_endpoint_epoch =
+                old->second.members[rank].endpoint->endpoint_epoch;
+        }
+        const uint64_t new_endpoint_epoch =
+            view.members[rank].hasEndpoint()
+                ? view.members[rank].endpoint->endpoint_epoch
+                : 0;
+        if (new_endpoint_epoch != 0 &&
+            new_endpoint_epoch != old_endpoint_epoch) {
+            endpoints_to_refresh.push_back(static_cast<GlobalRank>(rank));
+        }
+    }
+
+    std::vector<GlobalRank> newly_activated;
+    for (const auto rank : view.rank_order) {
+        const bool was_active =
+            old != groups_.end() &&
+            static_cast<size_t>(rank) < old->second.members.size() &&
+            old->second.members[rank].isActive();
+        if (!was_active && view.members[rank].isActive()) {
+            newly_activated.push_back(rank);
+        }
+    }
+    const bool became_ready =
+        view.status == GroupStatus::Ready &&
+        (old == groups_.end() || old->second.status != GroupStatus::Ready);
+
+    groups_.insert_or_assign(view.group_id, view);
+
+    // LinkManager and communicator segment caches are updated before waiters
+    // are released. A waiter may submit a collective as soon as it wakes.
+    for (const auto rank : endpoints_to_refresh) {
+        effects.push_back(RefreshPeerLink{rank});
+        effects.push_back(NotifyLinkRefreshed{rank});
+    }
+
+    if (!newly_activated.empty()) {
+        effects.push_back(
+            NotifyRanksActivated{view.group_id, std::move(newly_activated)});
+    }
+    if (became_ready) {
+        effects.push_back(NotifyGroupReady{view.group_id});
+    }
+    return effects;
 }
 
 HeartbeatRequest AgentStateMachine::buildHeartbeat() const {
@@ -290,14 +307,15 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
         global_rank_state_versions_[rank] = response_version;
     }
 
-    for (const auto& gv : resp.groups) {
-        groups_[gv.group_id] = gv;
-        appendApplyViewEffect(gv, effects);
-    }
-
     // The connection list belongs to the same snapshot. Do not install an
-    // entry invalidated by above.
+    // entry invalidated by the rank-state merge above. AgentHost applies the
+    // response's GroupViews only after these endpoints are installed.
     for (const auto& connection : resp.rank_connections) {
+        if (!rankInRange(connection.rank)) {
+            LOG(ERROR) << "AgentStateMachine: malformed rank connection";
+            coordinator_connection_ = CoordinatorConnection::Disconnected;
+            return {};
+        }
         if (connection.rank_epoch != global_rank_epochs_[connection.rank] ||
             global_rank_states_[connection.rank] == RankState::Offline)
             continue;
@@ -335,7 +353,6 @@ AgentApplyResult AgentStateMachine::reset(uint64_t new_session_id) {
 
     effects.push_back(DisconnectAllLinks{});
     effects.push_back(ClearAllPeerMetadata{});
-
     return effects;
 }
 

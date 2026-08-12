@@ -15,6 +15,8 @@
 #include "error_types.h"
 #include "gpu_runtime.h"
 #include "memory_location.h"
+#include "device_comm/device_collective/device_collective.h"
+#include "device_comm/device_collective/strong_stream.h"
 
 namespace mooncake {
 namespace {
@@ -122,6 +124,8 @@ PGResult<void> checkReduction(DataType datatype, ReduceOp op, bool is_cpu) {
 
 }  // namespace
 
+MooncakePGContext::MooncakePGContext() = default;
+
 MooncakePGContext::~MooncakePGContext() {
     try {
         auto result = shutdown();
@@ -159,10 +163,9 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
         return {};
     }
 
-    // Ordering constraint: AgentHost::start() sends registerAgent immediately,
-    // which includes LinkManager's localServerName() and getWarmupRecvAddr().
-    // These must be non-empty, so the engine and LinkManager must be
-    // initialized before connectCoordinator starts the AgentHost.
+    // AgentHost::start() publishes the transfer-service endpoint in
+    // RegisterAgentRequest. Build the fixed current-device service and its
+    // non-owning arena view before AgentHost can start.
     if (!engine_initialized) {
 #ifdef USE_MACA
         PG_VALIDATE_ARG(std::getenv("MC_MACA_HOST_TRANSPORT") != nullptr,
@@ -174,9 +177,41 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
     if (!link_manager.isInitialized()) {
         PG_TRY(link_manager.init(rank, world_size, engine));
     }
+    int service_device_index = -1;
+    PG_TRY_CUDA(cudaGetDevice(&service_device_index));
+
+    auto transfer_service = std::make_unique<DeviceTransferService>();
+    PG_TRY(transfer_service->initialize(
+        static_cast<uint32_t>(rank), static_cast<uint32_t>(world_size),
+        service_device_index, *engine, device_arena_size));
+
+    PG_TRY(auto arena, DeviceArena::create(service_device_index,
+                                           transfer_service->regionAddr(),
+                                           transfer_service->regionSize()));
+    PG_TRY(auto workspace,
+           arena->allocate(kDeviceCollectiveWorkspaceSize, 256));
+
+    PG_TRY(auto eager_order_stream,
+           GpuStream::createNonBlocking(service_device_index));
+    PG_TRY(auto serial_event, GpuEvent::create(service_device_index));
+    auto strong_stream = std::make_unique<StrongStream>(
+        service_device_index, std::move(eager_order_stream),
+        std::move(serial_event));
+
+    auto recovery_worker = std::make_unique<DeviceCollectiveRecoveryWorker>();
+    PG_TRY(recovery_worker->start());
+
+    // Preserve the ownership chain explicitly: the Service owns the region,
+    // DeviceArena borrows it, and the workspace borrows one Arena slice.
+    device_transfer_service = std::move(transfer_service);
+    device_arena = std::move(arena);
+    device_collective_workspace = std::move(workspace);
+    device_collective_strong_stream = std::move(strong_stream);
+    device_collective_recovery_worker = std::move(recovery_worker);
 
     global_rank = rank;
     max_world_size = world_size;
+    device_transfer_device_index = service_device_index;
     initialized_ = true;
     return {};
 }
@@ -217,7 +252,8 @@ PGResult<void> MooncakePGContext::connectCoordinator(
     if (!agent_host) {
         auto candidate = std::make_unique<AgentHost>(
             coordinator_address, host_ip, global_rank, max_world_size,
-            link_manager, fault_reconciliation_window_us);
+            device_transfer_service->localEndpoint(), link_manager,
+            fault_reconciliation_window_us);
         PG_TRY(candidate->start());
         agent_host = std::move(candidate);
     }
@@ -272,6 +308,18 @@ PGResult<void> MooncakePGContext::setDeviceFilter(
         device_filters_ = filters;
         engine->setWhitelistFilters(std::move(filters));
     }
+    return {};
+}
+
+PGResult<void> MooncakePGContext::setDeviceArenaSize(size_t size) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    PG_TRY(checkRunning());
+    PG_VALIDATE_ARG(size >= kDeviceCollectiveWorkspaceSize + (64ull << 10),
+                    "device arena is too small for the shared buffers");
+    PG_VALIDATE_STATE(!initialized_ || device_arena_size == size,
+                      "device arena size cannot be changed after context "
+                      "initialization");
+    if (!initialized_) device_arena_size = size;
     return {};
 }
 
@@ -333,21 +381,54 @@ void MooncakePGContext::decrementCommUseCount() noexcept {
 PGResult<void> MooncakePGContext::shutdown() {
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        if (shutdown_requested_) return {};
-        if (comm_use_count_ != 0) {
-            return makePGError(
-                PGErrorCode::ResourceBusy,
-                "Mooncake PG context still has active communicators");
+        if (shutdown_complete_) return {};
+        if (!shutdown_requested_) {
+            if (comm_use_count_ != 0) {
+                return makePGError(
+                    PGErrorCode::ResourceBusy,
+                    "Mooncake PG context still has active communicators");
+            }
+            shutdown_requested_ = true;
         }
-        shutdown_requested_ = true;
     }
 
+    if (device_collective_recovery_worker) {
+        auto result = device_collective_recovery_worker->shutdown();
+        if (!result.has_value()) {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            shutdown_requested_ = false;
+            return makePGError(std::move(result).error());
+        }
+        device_collective_recovery_worker.reset();
+    }
+    // Stop registration retries before invalidating the service endpoint that
+    // this Agent published in RegisterAgentRequest.
     if (agent_host) agent_host->shutdown();
+    device_collective_strong_stream.reset();
+    device_collective_workspace.reset();
+    if (device_arena) {
+        auto result = device_arena->close();
+        if (!result.has_value()) {
+            return makePGError(std::move(result).error());
+        }
+        device_arena.reset();
+    }
+    if (device_transfer_service) {
+        auto result = device_transfer_service->shutdown();
+        if (!result.has_value()) {
+            return makePGError(std::move(result).error());
+        }
+        device_transfer_service.reset();
+    }
     link_manager.shutdown();
     agent_host.reset();
     if (coordinator_host) coordinator_host->shutdown();
     coordinator_host.reset();
     engine = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        shutdown_complete_ = true;
+    }
     return {};
 }
 
@@ -424,19 +505,41 @@ PGResult<void> MooncakeCommunicator::initialize(
 
     // Memory location for device-specific buffers. Always kWildcardLocation for
     // a CPU communicator.
-    std::unique_ptr<GpuDeviceGuard> device_guard;
+    std::optional<GpuDeviceGuard> device_guard;
     std::string location = kWildcardLocation;
     if (!is_cpu_) {
         if (device_index_ < 0) {
             PG_TRY_CUDA(cudaGetDevice(&device_index_));
         }
-        device_guard = std::make_unique<GpuDeviceGuard>(device_index_);
+        PG_TRY(auto selected_device, GpuDeviceGuard::create(device_index_));
+        device_guard.emplace(std::move(selected_device));
         location = GPU_PREFIX + std::to_string(device_index_);
     }
     if (active_ranks_mirror_ && active_ranks_mirror_is_device_) {
-        active_ranks_mirror_stream_ =
-            GpuStream::createNonBlocking(active_ranks_mirror_device_index_);
+        PG_TRY(active_ranks_mirror_stream_,
+               GpuStream::createNonBlocking(active_ranks_mirror_device_index_));
     }
+#ifdef USE_CUDA
+    if (!is_cpu_) {
+        PG_VALIDATE_STATE(context_.device_transfer_service,
+                          "device transfer service is unavailable");
+        PG_VALIDATE_STATE(context_.device_arena &&
+                              context_.device_collective_workspace.valid() &&
+                              context_.device_collective_strong_stream,
+                          "device collective device resources are unavailable");
+        PG_VALIDATE_ARG(
+            device_index_ == context_.device_transfer_device_index,
+            "GPU communicator device differs from the device selected when "
+            "the PG context registered its transfer service");
+        PG_TRY(device_collective_,
+               DeviceCollectiveRuntime::create(
+                   *context_.device_transfer_service, *context_.device_arena,
+                   context_.device_collective_workspace,
+                   *context_.device_collective_strong_stream, device_index_,
+                   context_.global_rank, max_group_size_,
+                   context_.collective_timeout_us));
+    }
+#endif
 
     // Register collective buffers.
     for (size_t index = 0; index < 2; ++index) {
@@ -522,7 +625,9 @@ PGResult<void> MooncakeCommunicator::initialize(
         std::fill_n(meta_->activeRanks, max_group_size_, false);
     }
 
-    // Initial local endpoint info.
+    // Initial local group endpoint. DeviceTransferEndpoint was already
+    // published by AgentHost during agent registration; this publication only
+    // adds this communicator's private control slice.
     meta_->segmentInfos[rank_] = GroupEndpointInfo{
         .send_buffer = {reinterpret_cast<uint64_t>(send_buffer_[0]),
                         reinterpret_cast<uint64_t>(send_buffer_[1])},
@@ -535,7 +640,49 @@ PGResult<void> MooncakeCommunicator::initialize(
         .p2p_credit_region =
             reinterpret_cast<uint64_t>(p2p_proxy_->credit_region()),
         .p2p_ack_region = reinterpret_cast<uint64_t>(p2p_proxy_->ack_region()),
+        .device_collective = device_collective_
+                                 ? std::optional<DeviceCollectiveEndpoint>(
+                                       device_collective_->localEndpoint())
+                                 : std::nullopt,
     };
+
+    if (device_collective_) {
+        PG_VALIDATE_STATE(context_.device_collective_recovery_worker,
+                          "device collective recovery worker is unavailable");
+        PG_TRY(device_collective_->enableRecovery(
+            *context_.device_collective_recovery_worker,
+            [this](const DeviceCollectiveFailure& failure) -> PGResult<void> {
+                PG_VALIDATE_STATE(meta_,
+                                  "device collective group metadata is "
+                                  "unavailable during recovery");
+                if (!failure.peer_still_reachable) {
+                    const auto failed_global_rank =
+                        meta_->rank_order[failure.failed_rank];
+                    PG_VALIDATE_STATE(
+                        failed_global_rank >= 0 &&
+                            failed_global_rank < context_.max_world_size,
+                        "device collective failure has no global-rank "
+                        "mapping");
+
+                    LinkEvent event;
+                    event.events.assign(kMaxNumRanks,
+                                        LinkEvent::EventType::None);
+                    event.target_rank_epochs.assign(kMaxNumRanks, 0);
+                    event.events[failed_global_rank] =
+                        LinkEvent::EventType::Failure;
+                    event.target_rank_epochs[failed_global_rank] =
+                        meta_->rankEpochs[failed_global_rank];
+                    agent_.pushLinkEvent(event);
+                }
+
+                PG_TRY(auto response, syncAfterFailure());
+                PG_VALIDATE_STATE(
+                    response.status != SyncAfterFailureStatus::Rejected,
+                    "device collective recovery was rejected: " +
+                        response.reject_reason);
+                return {};
+            }));
+    }
 
     // Control Plane Initialization
 
@@ -566,7 +713,11 @@ PGResult<void> MooncakeCommunicator::initialize(
         std::fill_n(meta_->activeRanks, max_group_size_, false);
         meta_->activeRanks[rank_] = true;
         meta_->autoSyncOnFailure = false;
-        syncActiveRanksMirror();
+        if (device_collective_) {
+            PG_TRY(device_collective_->useLocalOnly(
+                meta_->epoch.load(std::memory_order_acquire), rank_));
+        }
+        PG_TRY(syncActiveRanksMirror());
         refreshSegmentID(rank_);
         LOG(WARNING) << "Mooncake communicator rank=" << meta_->globalRank
                      << " is using local-only execution because group "
@@ -590,11 +741,21 @@ MooncakeCommunicator::~MooncakeCommunicator() {
     try {
         auto result = shutdown();
         if (!result.has_value()) {
-            LOG(ERROR) << "Mooncake communicator shutdown failed: "
+            // mooncakePgCommDestroy() does not delete its handle when shutdown
+            // is retryable. Reaching the C++ destructor here would otherwise
+            // free only part of the communicator and leave Agent callbacks or
+            // captured kernels referring to destroyed state.
+            LOG(FATAL) << "Mooncake communicator destroyed before shutdown "
+                          "could complete: "
                        << result.error().message;
         }
     } catch (const std::exception& error) {
-        LOG(ERROR) << "Mooncake communicator shutdown failed: " << error.what();
+        LOG(FATAL) << "Mooncake communicator shutdown threw during "
+                      "destruction: "
+                   << error.what();
+    } catch (...) {
+        LOG(FATAL) << "Mooncake communicator shutdown threw during "
+                      "destruction";
     }
 }
 
@@ -739,7 +900,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::broadcastCpu(
     PG_TRY(checkBuffer(recv_buffer, bytes, "receive buffer"));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
-    return worker_->putTaskCpu(
+    auto completion_future = worker_->putTaskCpu(
         OpType::Broadcast, bytes, root, meta_, failed_ranks_hint,
         [=](void* dst, size_t pos, size_t size) {
             if (is_root) {
@@ -750,6 +911,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::broadcastCpu(
         [=](void* src, size_t pos, size_t size) {
             std::memcpy(static_cast<char*>(recv_buffer) + pos, src, size);
         });
+    return std::make_unique<WorkCompletion>(std::move(completion_future));
 }
 
 PGResult<void> MooncakeCommunicator::broadcastGpu(
@@ -795,7 +957,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::allReduceCpu(
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
     const int active_size = getSize();
-    return worker_->putTaskCpu(
+    auto completion_future = worker_->putTaskCpu(
         OpType::AllReduce, bytes, 0, meta_, failed_ranks_hint,
         [=](void* dst, size_t pos, size_t size) {
             std::memcpy(dst, static_cast<const char*>(send_buffer) + pos, size);
@@ -805,6 +967,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::allReduceCpu(
             launchReduceCpu(recv_buffer, datatype, pos, size, src, active_size,
                             op, meta_->activeRanks);
         });
+    return std::make_unique<WorkCompletion>(std::move(completion_future));
 }
 
 PGResult<void> MooncakeCommunicator::allReduceGpu(
@@ -816,9 +979,14 @@ PGResult<void> MooncakeCommunicator::allReduceGpu(
     PG_TRY(auto bytes, getByteCount(count, datatype));
     PG_TRY(checkBuffer(send_buffer, bytes, "send buffer"));
     PG_TRY(checkBuffer(recv_buffer, bytes, "receive buffer"));
-    PG_TRY(checkReduction(datatype, op, false));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+    if (device_collective_) {
+        return device_collective_->enqueueAllReduce(
+            send_buffer, recv_buffer, count, datatype, op, stream,
+            failed_ranks_hint, failed_ranks_hint_count);
+    }
+    PG_TRY(checkReduction(datatype, op, false));
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::AllReduce, bytes, 0, meta_, stream, failed_ranks_hint,
@@ -849,7 +1017,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::allGatherCpu(
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
     const int active_size = getSize();
-    return worker_->putTaskCpu(
+    auto completion_future = worker_->putTaskCpu(
         OpType::AllGather, send_bytes, 0, meta_, failed_ranks_hint,
         [=](void* dst, size_t pos, size_t size) {
             std::memcpy(dst, static_cast<const char*>(send_buffer) + pos, size);
@@ -862,6 +1030,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::allGatherCpu(
                     static_cast<char*>(src) + peer * size, size);
             }
         });
+    return std::make_unique<WorkCompletion>(std::move(completion_future));
 }
 
 PGResult<void> MooncakeCommunicator::allGatherGpu(
@@ -910,7 +1079,7 @@ MooncakeCommunicator::reduceScatterCpu(const void* send_buffer,
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
     const int active_size = getSize();
-    return worker_->putTaskCpu(
+    auto completion_future = worker_->putTaskCpu(
         OpType::ReduceScatter, recv_bytes, 0, meta_, failed_ranks_hint,
         [=, this](void* dst, size_t pos, size_t size) {
             for (int peer = 0; peer < active_size; ++peer) {
@@ -926,6 +1095,7 @@ MooncakeCommunicator::reduceScatterCpu(const void* send_buffer,
             launchReduceCpu(recv_buffer, datatype, pos, size, src, active_size,
                             op, meta_->activeRanks);
         });
+    return std::make_unique<WorkCompletion>(std::move(completion_future));
 }
 
 PGResult<void> MooncakeCommunicator::reduceScatterGpu(
@@ -976,7 +1146,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::allToAllCpu(
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
     const int active_size = getSize();
-    return worker_->putTaskCpu(
+    auto completion_future = worker_->putTaskCpu(
         OpType::AllToAll, peer_bytes, 0, meta_, failed_ranks_hint,
         [=, this](void* dst, size_t pos, size_t size) {
             for (int peer = 0; peer < active_size; ++peer) {
@@ -993,6 +1163,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::allToAllCpu(
                     static_cast<char*>(src) + peer * size, size);
             }
         });
+    return std::make_unique<WorkCompletion>(std::move(completion_future));
 }
 
 PGResult<void> MooncakeCommunicator::allToAllGpu(
@@ -1036,9 +1207,10 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::barrierCpu(
     PG_TRY(checkOpState(OpType::Barrier));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
-    return worker_->putTaskCpu(
+    auto completion_future = worker_->putTaskCpu(
         OpType::Barrier, kBarrierDummySize, 0, meta_, failed_ranks_hint,
         [](void*, size_t, size_t) {}, [](void*, size_t, size_t) {});
+    return std::make_unique<WorkCompletion>(std::move(completion_future));
 }
 
 PGResult<void> MooncakeCommunicator::barrierGpu(
@@ -1072,7 +1244,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::reduceCpu(
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
     const int active_size = getSize();
-    return worker_->putTaskCpu(
+    auto completion_future = worker_->putTaskCpu(
         OpType::Reduce, bytes, root, meta_, failed_ranks_hint,
         [=](void* dst, size_t pos, size_t size) {
             std::memcpy(dst, static_cast<const char*>(send_buffer) + pos, size);
@@ -1083,6 +1255,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::reduceCpu(
             launchReduceCpu(recv_buffer, datatype, pos, size, src, active_size,
                             op, meta_->activeRanks);
         });
+    return std::make_unique<WorkCompletion>(std::move(completion_future));
 }
 
 PGResult<void> MooncakeCommunicator::reduceGpu(const void* send_buffer,
@@ -1138,7 +1311,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::gatherCpu(
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
     const int active_size = getSize();
-    return worker_->putTaskCpu(
+    auto completion_future = worker_->putTaskCpu(
         OpType::Gather, send_bytes, root, meta_, failed_ranks_hint,
         [=](void* dst, size_t pos, size_t size) {
             std::memcpy(dst, static_cast<const char*>(send_buffer) + pos, size);
@@ -1151,6 +1324,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::gatherCpu(
                     static_cast<char*>(src) + peer * size, size);
             }
         });
+    return std::make_unique<WorkCompletion>(std::move(completion_future));
 }
 
 PGResult<void> MooncakeCommunicator::gatherGpu(const void* send_buffer,
@@ -1205,7 +1379,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::scatterCpu(
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
     const int active_size = getSize();
-    return worker_->putTaskCpu(
+    auto completion_future = worker_->putTaskCpu(
         OpType::Scatter, recv_bytes, root, meta_, failed_ranks_hint,
         [=, this](void* dst, size_t pos, size_t size) {
             if (!is_root) return;
@@ -1219,6 +1393,7 @@ PGResult<std::unique_ptr<WorkCompletion>> MooncakeCommunicator::scatterCpu(
         [=](void* src, size_t pos, size_t size) {
             std::memcpy(static_cast<char*>(recv_buffer) + pos, src, size);
         });
+    return std::make_unique<WorkCompletion>(std::move(completion_future));
 }
 
 PGResult<void> MooncakeCommunicator::scatterGpu(
@@ -1258,13 +1433,18 @@ PGResult<void> MooncakeCommunicator::scatterGpu(
 
 PGResult<void> MooncakeCommunicator::shutdown() {
     if (is_shutdown_) return {};
-    std::unique_ptr<GpuDeviceGuard> device_guard;
+    std::optional<GpuDeviceGuard> device_guard;
     const bool has_device_state =
         !is_cpu_ &&
-        (active_ranks_mirror_stream_.has_value() || send_buffer_[0] ||
-         recv_buffer_[0] || worker_ || p2p_proxy_ || meta_);
+        (active_ranks_mirror_stream_.has_value() || device_collective_ ||
+         send_buffer_[0] || recv_buffer_[0] || worker_ || p2p_proxy_ || meta_);
     if (has_device_state) {
-        device_guard = std::make_unique<GpuDeviceGuard>(device_index_);
+        PG_TRY(auto selected_device, GpuDeviceGuard::create(device_index_));
+        device_guard.emplace(std::move(selected_device));
+    }
+    if (device_collective_) {
+        PG_TRY(device_collective_->shutdown(std::chrono::seconds(5)));
+        device_collective_.reset();
     }
     is_shutdown_ = true;
     // Remove this communicator from AgentHost's callback lookup before teardown
@@ -1343,20 +1523,22 @@ std::vector<int32_t> MooncakeCommunicator::getActiveRanks() const {
     return result;
 }
 
-void MooncakeCommunicator::syncActiveRanksMirror() const {
-    if (!active_ranks_mirror_) return;
+PGResult<void> MooncakeCommunicator::syncActiveRanksMirror() const {
+    if (!active_ranks_mirror_) return {};
     // The mirror is InGroupRank-indexed, in the same order as the caller-owned
     // storage.
     auto active_ranks = getActiveRanks();
     const size_t bytes = max_group_size_ * sizeof(int32_t);
     if (active_ranks_mirror_is_device_) {
-        const GpuDeviceGuard device_guard(active_ranks_mirror_device_index_);
-        PG_ASSERT_CUDA(cudaMemcpyAsync(
-            active_ranks_mirror_, active_ranks.data(), bytes,
-            cudaMemcpyHostToDevice, active_ranks_mirror_stream_.value().get()));
+        PG_TRY(auto device_guard,
+               GpuDeviceGuard::create(active_ranks_mirror_device_index_));
+        PG_TRY_CUDA(cudaMemcpyAsync(active_ranks_mirror_, active_ranks.data(),
+                                    bytes, cudaMemcpyHostToDevice,
+                                    active_ranks_mirror_stream_.value().get()));
     } else {
         std::memcpy(active_ranks_mirror_, active_ranks.data(), bytes);
     }
+    return {};
 }
 
 int MooncakeCommunicator::getNumSyncedRanks() const {
@@ -1480,19 +1662,45 @@ uint64_t MooncakeCommunicator::getCurrentEpoch() const {
 
 PGResult<SyncAfterFailureResponse> MooncakeCommunicator::syncAfterFailure() {
     PG_TRY(checkValidGroup("syncAfterFailure"));
-    return agent_.syncAfterFailure(meta_->group_id);
+    PG_TRY(auto response, agent_.syncAfterFailure(meta_->group_id));
+    return response;
 }
 
-void MooncakeCommunicator::applyViewUpdate(
+PGResult<void> MooncakeCommunicator::applyViewUpdate(
     const GroupView& view, const std::vector<RankState>& rank_states,
     const std::vector<uint64_t>& rank_epochs,
-    const std::vector<bool>& activatable) {
-    if (!meta_) return;
+    const std::vector<std::optional<DeviceTransferEndpoint>>&
+        transfer_service_endpoints,
+    const std::vector<bool>& activatable,
+    bool materialize_device_collective_view) {
+    if (!meta_) return {};
+    PG_VALIDATE_ARG(
+        view.members.size() >= static_cast<size_t>(context_.max_world_size),
+        "GroupView member table is too small");
+    PG_VALIDATE_ARG(
+        view.rank_order.size() <= static_cast<size_t>(meta_->maxGroupSize),
+        "GroupView exceeds communicator capacity");
+    PG_VALIDATE_ARG(
+        rank_states.size() == static_cast<size_t>(context_.max_world_size),
+        "rank state table has the wrong size");
+    PG_VALIDATE_ARG(
+        rank_epochs.size() == static_cast<size_t>(context_.max_world_size),
+        "rank epoch table has the wrong size");
+    PG_VALIDATE_ARG(transfer_service_endpoints.size() ==
+                        static_cast<size_t>(context_.max_world_size),
+                    "transfer-service endpoint table has the wrong size");
+    PG_VALIDATE_ARG(activatable.size() == view.rank_order.size(),
+                    "activatable table has the wrong size");
+    for (const auto global_rank : view.rank_order) {
+        PG_VALIDATE_ARG(
+            global_rank >= 0 && global_rank < context_.max_world_size,
+            "GroupView contains an invalid global rank");
+    }
 
     // Ignore stale views that arrive out of order
     auto current_epoch = meta_->epoch.load(std::memory_order_acquire);
     if (view.epoch < current_epoch) {
-        return;
+        return {};
     }
 
     bool epoch_changed = current_epoch != view.epoch;
@@ -1527,6 +1735,38 @@ void MooncakeCommunicator::applyViewUpdate(
         const auto global_rank = view.rank_order[local_rank];
         if (view.members[global_rank].isActive()) {
             active_size = static_cast<int>(local_rank) + 1;
+        }
+    }
+
+    // Materialize the failure-prone device collective data plane before
+    // publishing the legacy host mirrors and epoch below.
+    // DeviceCollectiveRuntime publishes Blocked first, so an error cannot leave
+    // a kernel using a partial view.
+    if (device_collective_ && materialize_device_collective_view) {
+        PG_TRY(context_.device_transfer_service->installPeerEndpoints(
+            device_index_, transfer_service_endpoints));
+        PGResult<void> device_collective_result;
+        if (next_mode == CollectiveExtensionState::Isolated) {
+            InGroupRank self_rank = kInvalidInGroupRank;
+            for (size_t group_rank = 0; group_rank < view.rank_order.size();
+                 ++group_rank) {
+                if (view.rank_order[group_rank] == meta_->globalRank) {
+                    self_rank = static_cast<InGroupRank>(group_rank);
+                    break;
+                }
+            }
+            device_collective_result = device_collective_->useLocalOnly(
+                view.epoch,
+                self_rank >= 0 ? self_rank : static_cast<InGroupRank>(rank_));
+        } else {
+            device_collective_result =
+                device_collective_->materializeGroupView(view);
+        }
+        if (!device_collective_result.has_value()) {
+            LOG(ERROR) << "Failed to materialize device collective view "
+                       << view.epoch << ": "
+                       << device_collective_result.error().message;
+            return makePGError(std::move(device_collective_result).error());
         }
     }
 
@@ -1598,22 +1838,24 @@ void MooncakeCommunicator::applyViewUpdate(
 
     // Keep the caller-visible active-ranks mirror in sync with the view.
     // FIXME: potential deadlock?
-    syncActiveRanksMirror();
+    PG_TRY(syncActiveRanksMirror());
 
     // Publish the rank-space extent after the corresponding data-plane state.
     // getSize() reads this from the application thread.
     meta_->activeSize.store(active_size, std::memory_order_release);
 
-    // Publish epoch AFTER all data-plane state (activeRanks, segmentInfos,
-    // etc.) is updated.  This ensures that a thread observing the new epoch via
-    // getCurrentEpoch() (acquire) sees the complete membership state.
-    if (epoch_changed) {
-        meta_->epoch.store(view.epoch, std::memory_order_release);
-    }
-
     if (next_mode != mode) {
         meta_->extensionMode.store(next_mode, std::memory_order_release);
     }
+
+    // Publish epoch AFTER all data-plane state (activeRanks, segmentInfos,
+    // extensionMode, and the device collective Plan) is updated. This ensures
+    // that a thread observing the new epoch via getCurrentEpoch() (acquire)
+    // sees the complete view.
+    if (epoch_changed) {
+        meta_->epoch.store(view.epoch, std::memory_order_release);
+    }
+    return {};
 }
 
 void MooncakeCommunicator::onPeerLinkReset(InGroupRank peer) {

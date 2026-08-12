@@ -3,13 +3,14 @@
 
 #include <atomic>
 #include <functional>
+#include <future>
 
+#include "common_types.h"
 #include "control_plane/control_types.h"
 #include "gpu_runtime.h"
 
 #include <transfer_engine.h>
 #include <mooncake_worker_kernels.cuh>
-#include "comm_types.h"
 
 #include <memory>
 #include <mutex>
@@ -91,7 +92,7 @@ class MooncakeWorker {
     explicit MooncakeWorker(int cuda_device_index = -1);
     ~MooncakeWorker();
 
-    std::unique_ptr<WorkCompletion> putTaskCpu(
+    std::shared_future<void> putTaskCpu(
         OpType opType, size_t dataSize, int64_t broadcastRoot,
         const std::shared_ptr<TransferGroupMeta>& meta,
         int32_t* failedRanksHint,
@@ -126,6 +127,11 @@ class MooncakeWorker {
     bool drainTasks(const TransferGroupMeta* meta) const;
 
    private:
+    struct CudaTaskSubmissionToken {
+        size_t task_id;
+        uint64_t sequence;
+    };
+
     void startWorker();
     void waitUntilTasksSubmitted(
         const std::vector<CudaTaskSubmissionToken>& tasks) const;

@@ -3,26 +3,63 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <transfer_engine.h>
 
+#include "common_types.h"
 #include "control_plane/agent_host.h"
 #include "control_plane/coordinator_host.h"
 #include "control_plane/link_manager.h"
+#include "device_comm/device_arena.h"
+#include "device_comm/device_transfer/transfer_service.h"
+#include "device_comm/device_collective/device_collective_recovery.h"
 #include "error_types.h"
 #include "mooncake_pg.h"
 #include "mooncake_worker.cuh"
 #include "p2p_proxy.h"
-#include "comm_types.h"
 
 namespace mooncake {
+
+class DeviceCollectiveRuntime;
+class StrongStream;
+
+class WorkCompletion {
+   public:
+    explicit WorkCompletion(std::shared_future<void> completion)
+        : completion_(std::move(completion)) {}
+
+    bool isCompleted() const {
+        if (completion_.wait_for(std::chrono::microseconds(0)) !=
+            std::future_status::ready) {
+            return false;
+        }
+        completion_.get();
+        return true;
+    }
+
+    bool wait(std::chrono::microseconds timeout) const {
+        if (timeout.count() < 0) {
+            completion_.wait();
+        } else if (completion_.wait_for(timeout) != std::future_status::ready) {
+            return false;
+        }
+        completion_.get();
+        return true;
+    }
+
+   private:
+    std::shared_future<void> completion_;
+};
 
 static constexpr size_t kDefaultCollectiveTimeoutUs = 10000000;  // 10 s
 static constexpr int64_t kDefaultP2PTimeoutUs = 10000000;        // 10 s
@@ -40,15 +77,24 @@ struct MooncakePGContext {
     int64_t p2p_timeout_us = kDefaultP2PTimeoutUs;
     int64_t fault_reconciliation_window_us =
         kDefaultFaultReconciliationWindowUs;
+    size_t device_arena_size = kDefaultDeviceArenaSize;
 
     std::unique_ptr<TransferEngine> owned_engine =
         std::make_unique<TransferEngine>(true);
     TransferEngine* engine = owned_engine.get();
     bool engine_initialized = false;
-    int global_rank = -1;
+    GlobalRank global_rank = kInvalidGlobalRank;
     int max_world_size = 0;
+    int device_transfer_device_index = -1;
 
     LinkManager link_manager;
+    std::unique_ptr<DeviceTransferService> device_transfer_service;
+    // Non-owning allocator over device_transfer_service's registered region.
+    std::unique_ptr<DeviceArena> device_arena;
+    DeviceArenaSlice device_collective_workspace;
+    std::unique_ptr<StrongStream> device_collective_strong_stream;
+    std::unique_ptr<DeviceCollectiveRecoveryWorker>
+        device_collective_recovery_worker;
     MooncakeWorkerManager worker_manager;
     P2PDeviceWorkerManager p2p_device_worker_manager;
     // Coordinator (rank 0 only).
@@ -56,7 +102,7 @@ struct MooncakePGContext {
     std::unique_ptr<CoordinatorHost> coordinator_host;
     std::unique_ptr<AgentHost> agent_host;
 
-    MooncakePGContext() = default;
+    MooncakePGContext();
     ~MooncakePGContext();
 
     // Non-copyable: engine points to either owned_engine or an external engine
@@ -70,6 +116,7 @@ struct MooncakePGContext {
     PGResult<void> setHostIp(std::string value);
     PGResult<void> setExternalEngine(TransferEngine* transfer_engine);
     PGResult<void> setDeviceFilter(std::vector<std::string> filters);
+    PGResult<void> setDeviceArenaSize(size_t size);
     PGResult<void> setCollectiveTimeout(size_t timeout_us);
     PGResult<void> setP2PTimeout(int64_t timeout_us);
     PGResult<void> setFaultReconciliationWindow(int64_t timeout_us);
@@ -85,6 +132,7 @@ struct MooncakePGContext {
     size_t comm_use_count_ = 0;
     bool initialized_ = false;
     bool shutdown_requested_ = false;
+    bool shutdown_complete_ = false;
 };
 
 struct MooncakeCommunicatorConfig {
@@ -228,13 +276,15 @@ class MooncakeCommunicator {
     // decision has been made and the Agent has ACKed the resulting ViewUpdate.
     PGResult<SyncAfterFailureResponse> syncAfterFailure();
 
-    // Update the data-plane view. Called by AgentHost when a ViewUpdatePush is
-    // received or rank states change. rank_states and activatable are computed
-    // by the state machine.
-    void applyViewUpdate(const GroupView& view,
-                         const std::vector<RankState>& rank_states,
-                         const std::vector<uint64_t>& rank_epochs,
-                         const std::vector<bool>& activatable);
+    // Update the data-plane view. A ViewUpdate ACK is successful only when
+    // this returns success, including device collective materialization.
+    PGResult<void> applyViewUpdate(
+        const GroupView& view, const std::vector<RankState>& rank_states,
+        const std::vector<uint64_t>& rank_epochs,
+        const std::vector<std::optional<DeviceTransferEndpoint>>&
+            transfer_service_endpoints,
+        const std::vector<bool>& activatable,
+        bool materialize_device_collective_view);
     // Called by AgentHost when a TE link to a peer comes back up.
     void onPeerLinkReset(InGroupRank peer);
 
@@ -277,7 +327,7 @@ class MooncakeCommunicator {
 
     // Sync the caller-provided host/device active-ranks mirror from the current
     // GroupView.
-    void syncActiveRanksMirror() const;
+    PGResult<void> syncActiveRanksMirror() const;
 
     MooncakePGContext& context_;
     AgentInterface& agent_;
@@ -292,6 +342,7 @@ class MooncakeCommunicator {
     bool active_ranks_mirror_is_device_ = false;
     int active_ranks_mirror_device_index_ = -1;
     std::optional<GpuStream> active_ranks_mirror_stream_;
+    std::unique_ptr<DeviceCollectiveRuntime> device_collective_;
 
     std::shared_ptr<MooncakeWorker> worker_;
     std::array<void*, 2> send_buffer_{};

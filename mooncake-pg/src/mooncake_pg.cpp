@@ -14,7 +14,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-#include "comm_types.h"
+#include "common_types.h"
 #include "error_types.h"
 
 using namespace mooncake;
@@ -406,6 +406,14 @@ mooncakePgResult_t mooncakePgContextSetDeviceFilter(mooncakePgContext_t context,
     });
 }
 
+mooncakePgResult_t mooncakePgContextSetDeviceArenaSize(
+    mooncakePgContext_t context, size_t size) {
+    return asCApiResult([&]() -> PGResult<void> {
+        PG_VALIDATE_ARG(context && context->impl, "invalid context");
+        return context->impl->setDeviceArenaSize(size);
+    });
+}
+
 mooncakePgResult_t mooncakePgContextSetCollectiveTimeout(
     mooncakePgContext_t context, size_t timeout_us) {
     return asCApiResult([&]() -> PGResult<void> {
@@ -463,7 +471,21 @@ mooncakePgResult_t mooncakePgCommDestroy(mooncakePgComm_t comm) {
     return asCApiResult([&]() -> PGResult<void> {
         std::unique_ptr<mooncakePgComm> holder(comm);
         if (holder && holder->impl) {
-            return holder->impl->shutdown();
+            try {
+                auto result = holder->impl->shutdown();
+                if (!result.has_value()) {
+                    // Ownership stays with the caller. Keeping the complete C
+                    // wrapper also keeps the communicator's context use count,
+                    // and therefore its process-wide transfer resources, alive.
+                    holder.release();
+                }
+                return result;
+            } catch (...) {
+                // Destruction is retryable. Preserve the complete C handle
+                // even when an internal CUDA wrapper reports by exception.
+                holder.release();
+                throw;
+            }
         }
         return {};
     });

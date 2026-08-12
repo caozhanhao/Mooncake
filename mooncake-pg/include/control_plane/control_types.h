@@ -6,25 +6,28 @@
 #include <string>
 #include <vector>
 
-namespace mooncake {
+#include "common_types.h"
+#include "device_comm/device_transfer/transfer_endpoint.h"
 
-// There are two rank namespaces that are easy to confuse:
-//
-//   * GlobalRank  - process-wide identifier, range 0 .. max_world_size-1.
-//                   Used for process-level states
-//   * InGroupRank - group-local identifier, range 0 .. group_size-1.
-//                   Used inside a single process group and mapped to a
-//                   GlobalRank through GroupView::rank_order.
-using GlobalRank = int32_t;
-using InGroupRank = int32_t;
+namespace mooncake {
 
 // Bootstrap ID: Backend type ("cpu:" or "device:") + PyTorch-assigned group_id.
 using GroupBootstrapId = std::string;
 // Coordinator-assigned unique group id
 using GroupId = std::string;
 
-constexpr GlobalRank kInvalidGlobalRank = -1;
 constexpr int kMaxNumRanks = 64;
+
+// Communicator-specific device state inside the rank's transfer-service arena.
+// The arena itself is published once through RegisterAgentRequest. Members of
+// one runtime group use the same control-slice layout, so this base range is
+// enough for bound table descriptors to address their remote counterparts.
+struct DeviceCollectiveEndpoint {
+    uint64_t control_offset = 0;
+    uint64_t control_size = 0;
+
+    bool operator==(const DeviceCollectiveEndpoint&) const = default;
+};
 
 // Resolves a registration only against runtime groups stored under the same
 // GroupBootstrapId, i.e. the same device kind and PyTorch group id.
@@ -62,15 +65,19 @@ struct GroupEndpointInfo {
     // the Coordinator fills it in before pushing the ViewUpdate.
     uint64_t endpoint_epoch = 0;
 
-    // collective
+    // Legacy collective
     uint64_t send_buffer[2] = {};
     uint64_t recv_buffer[2] = {};
     uint64_t send_sync[2] = {};
     uint64_t recv_sync[2] = {};
 
-    // p2p
+    // Legacy P2P
     uint64_t p2p_credit_region = 0;
     uint64_t p2p_ack_region = 0;
+
+    // Present only for communicators using the new device-collective path.
+    // CPU communicators and legacy device execution leave it empty.
+    std::optional<DeviceCollectiveEndpoint> device_collective;
 
     bool operator==(const GroupEndpointInfo&) const = default;
 };

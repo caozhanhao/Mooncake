@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -24,6 +25,9 @@ struct RegisterAgentRequest {
     GlobalRank rank = kInvalidGlobalRank;
     std::string agent_addr;
     std::string te_server_name;
+    // Rank-scoped bootstrap metadata for the fixed device transfer service.
+    // It remains unchanged for the lifetime of this agent session.
+    DeviceTransferEndpoint transfer_service_endpoint;
     uint64_t agent_session_id = 0;
     uint64_t warmup_recv_addr = 0;
 };
@@ -33,6 +37,7 @@ struct RankConnectionMetadata {
     uint64_t rank_epoch = 0;
     std::string agent_addr;
     std::string te_server_name;
+    DeviceTransferEndpoint transfer_service_endpoint;
     uint64_t warmup_recv_addr = 0;
 };
 
@@ -193,6 +198,7 @@ struct PeerJoinedPush {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t rank_epoch = 0;
     std::string te_server_name;
+    DeviceTransferEndpoint transfer_service_endpoint;
     uint64_t warmup_recv_addr = 0;
 };
 
@@ -278,7 +284,15 @@ struct ApplyViewToCommunicator {
     GroupView view;
     std::vector<RankState> rank_states;
     std::vector<uint64_t> rank_epochs;
+    // Rank-scoped registration metadata indexed by GlobalRank. The control
+    // plane merely carries this snapshot; it does not manage transfer routes.
+    std::vector<std::optional<DeviceTransferEndpoint>>
+        transfer_service_endpoints;
     std::vector<bool> activatable;
+
+    // Rank-state pushes refresh only the communicator's host mirrors. A
+    // GroupView apply also materializes the device collective Plan.
+    bool materialize_device_collective_view = false;
 };
 
 struct ResetPeerState {

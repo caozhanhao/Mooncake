@@ -130,6 +130,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         RankState state = RankState::Offline;
         std::string agent_addr;
         std::string te_server_name;
+        DeviceTransferEndpoint transfer_service_endpoint;
         // Agent-generated key for one logical registration.
         uint64_t agent_session_id = 0;
         // Coordinator-assigned, monotonically increasing incarnation of this
