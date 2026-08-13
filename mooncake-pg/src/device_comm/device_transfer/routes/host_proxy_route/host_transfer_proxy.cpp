@@ -1,6 +1,5 @@
 #include "device_comm/device_transfer/routes/host_proxy_route/host_transfer_proxy.h"
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -11,7 +10,6 @@
 #include <string>
 #include <thread>
 #include <utility>
-#include <vector>
 
 #include <glog/logging.h>
 #include <transfer_engine.h>
@@ -76,7 +74,6 @@ struct HostTransferProxy::Lane {
 };
 
 struct HostTransferProxy::LaneSet {
-    int device_index = -1;
     HostProxyCommandSlot* host_slots = nullptr;
     HostProxyCommandSlot* device_slots = nullptr;
     std::unique_ptr<std::array<uint64_t, kTransferLaneCount>> signal_staging;
@@ -84,48 +81,35 @@ struct HostTransferProxy::LaneSet {
     bool signal_staging_registered = false;
 };
 
-HostTransferProxy::LaneSet* HostTransferProxy::findLaneSet(
-    int device_index) const noexcept {
-    for (const auto& lane_set : lane_sets_) {
-        if (lane_set->device_index == device_index) {
-            return lane_set.get();
+void HostTransferProxy::releaseLaneSet() noexcept {
+    if (!lane_set_) return;
+
+    if (lane_set_->signal_staging_registered) {
+        const int result =
+            engine_.unregisterLocalMemory(lane_set_->signal_staging->data());
+        if (result != 0) {
+            LOG(ERROR) << "Failed to unregister host-proxy signal staging, rc="
+                       << result;
+            // TE may still refer to this memory. Leak only the registered
+            // staging array; the command slots are unrelated to TE.
+            lane_set_->signal_staging.release();
+        } else {
+            lane_set_->signal_staging_registered = false;
         }
     }
-    return nullptr;
-}
+    lane_set_->signal_staging.reset();
 
-void HostTransferProxy::releaseLaneSets() noexcept {
-    for (auto& lane_set : lane_sets_) {
-        if (lane_set->signal_staging_registered) {
-            const int result =
-                engine_.unregisterLocalMemory(lane_set->signal_staging->data());
-            if (result != 0) {
-                LOG(ERROR) << "Failed to unregister host-proxy signal "
-                              "staging for CUDA device "
-                           << lane_set->device_index << ", rc=" << result;
-                // TE may still refer to this memory. Leak only the registered
-                // staging array; the command slots are unrelated to TE.
-                lane_set->signal_staging.release();
-            } else {
-                lane_set->signal_staging_registered = false;
-            }
+    if (lane_set_->host_slots) {
+        std::destroy_n(lane_set_->host_slots, kTransferLaneCount);
+        const auto result = cudaFreeHost(lane_set_->host_slots);
+        if (result != cudaSuccess) {
+            LOG(ERROR) << "Failed to free host-proxy slots: "
+                       << cudaGetErrorString(result);
         }
-        lane_set->signal_staging.reset();
-
-        if (lane_set->host_slots) {
-            std::destroy_n(lane_set->host_slots, kTransferLaneCount);
-            const auto result = cudaFreeHost(lane_set->host_slots);
-            if (result != cudaSuccess) {
-                LOG(ERROR) << "Failed to free host-proxy slots for CUDA "
-                              "device "
-                           << lane_set->device_index << ": "
-                           << cudaGetErrorString(result);
-            }
-            lane_set->host_slots = nullptr;
-            lane_set->device_slots = nullptr;
-        }
+        lane_set_->host_slots = nullptr;
+        lane_set_->device_slots = nullptr;
     }
-    lane_sets_.clear();
+    lane_set_.reset();
 }
 
 uint64_t HostTransferProxy::loadSubmitted(const Lane& lane) {
@@ -150,11 +134,8 @@ bool HostTransferProxy::laneSetIdle(const LaneSet& lane_set) {
     return true;
 }
 
-bool HostTransferProxy::allLaneSetsIdle() const {
-    for (const auto& lane_set : lane_sets_) {
-        if (!laneSetIdle(*lane_set)) return false;
-    }
-    return true;
+bool HostTransferProxy::lanesIdle() const {
+    return !lane_set_ || laneSetIdle(*lane_set_);
 }
 
 std::optional<TransferMetadata::SegmentID> HostTransferProxy::resolvePeer(
@@ -383,20 +364,16 @@ bool HostTransferProxy::step(Lane& lane) {
 
 void HostTransferProxy::run() noexcept {
     try {
-        std::vector<LaneSet*> snapshot;
         for (;;) {
+            LaneSet* lane_set = nullptr;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 if (stop_requested_) break;
-                snapshot.clear();
-                snapshot.reserve(lane_sets_.size());
-                for (const auto& lane_set : lane_sets_) {
-                    snapshot.push_back(lane_set.get());
-                }
+                lane_set = lane_set_.get();
             }
 
             bool progressed = false;
-            for (auto* lane_set : snapshot) {
+            if (lane_set) {
                 for (auto& lane : lane_set->lanes) {
                     progressed |= step(lane);
                 }
@@ -463,20 +440,19 @@ PGResult<void> HostTransferProxy::start() {
     return {};
 }
 
-PGResult<HostProxyCommandSlot*> HostTransferProxy::addDevice(int device_index) {
+PGResult<HostProxyCommandSlot*> HostTransferProxy::initializeDevice(
+    int device_index) {
     PG_VALIDATE_ARG(device_index >= 0, "invalid host-proxy CUDA device");
 
     PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
     std::lock_guard<std::mutex> lock(mutex_);
     PG_VALIDATE_STATE(started_ && !stop_requested_ && !worker_failed_,
                       "HostTransferProxy is not running");
-    if (const auto* existing = findLaneSet(device_index)) {
-        return existing->device_slots;
-    }
+    PG_VALIDATE_STATE(!lane_set_,
+                      "HostTransferProxy device is already initialized");
 
     std::unique_ptr<LaneSet> lane_set;
     try {
-        lane_sets_.reserve(lane_sets_.size() + 1);
         lane_set = std::make_unique<LaneSet>();
         lane_set->signal_staging =
             std::make_unique<std::array<uint64_t, kTransferLaneCount>>();
@@ -487,7 +463,6 @@ PGResult<HostProxyCommandSlot*> HostTransferProxy::addDevice(int device_index) {
                 error.what());
     }
 
-    lane_set->device_index = device_index;
     constexpr size_t slot_count = kTransferLaneCount;
     constexpr size_t slot_size = slot_count * sizeof(HostProxyCommandSlot);
     const auto allocation =
@@ -543,23 +518,23 @@ PGResult<HostProxyCommandSlot*> HostTransferProxy::addDevice(int device_index) {
         lane.signal_staging = lane_set->signal_staging->data() + index;
     }
     auto* const device_slots = lane_set->device_slots;
-    lane_sets_.push_back(std::move(lane_set));
+    lane_set_ = std::move(lane_set);
     state_changed_.notify_all();
     return device_slots;
 }
 
-PGResult<void> HostTransferProxy::installPeerEndpoint(
+void HostTransferProxy::installPeerEndpoint(
     uint32_t peer_index, const std::optional<HostProxyEndpoint>& endpoint) {
     std::lock_guard<std::mutex> lock(mutex_);
-    PG_VALIDATE_ARG(peer_index < peers_.size(),
-                    "host-proxy peer index is out of range");
+    PG_ASSERT(peer_index < peers_.size(),
+              "host-proxy peer index is out of range");
     auto& peer = peers_[peer_index];
     const std::string next_name = endpoint ? endpoint->te_server_name : "";
-    if (peer.te_server_name == next_name) return {};
+    if (peer.te_server_name == next_name) return;
 
-    PG_VALIDATE_STATE(allLaneSetsIdle(),
-                      "cannot replace a host-proxy endpoint while transfers "
-                      "are in flight");
+    PG_ASSERT(lanesIdle(),
+              "cannot replace a host-proxy endpoint while transfers are in "
+              "flight");
     if (peer.segment_id) {
         const int result = engine_.closeSegment(*peer.segment_id);
         if (result != 0) {
@@ -569,27 +544,26 @@ PGResult<void> HostTransferProxy::installPeerEndpoint(
         peer.segment_id.reset();
     }
     peer.te_server_name = next_name;
-    return {};
 }
 
-PGResult<void> HostTransferProxy::waitUntilIdle(int device_index) {
+PGResult<void> HostTransferProxy::waitUntilIdle() {
     std::unique_lock<std::mutex> lock(mutex_);
-    const auto* lane_set = findLaneSet(device_index);
-    PG_VALIDATE_ARG(lane_set, "host-proxy CUDA device is not registered");
-    state_changed_.wait(lock, [this, lane_set] {
-        return worker_failed_ || laneSetIdle(*lane_set);
+    PG_VALIDATE_STATE(lane_set_,
+                      "host-proxy CUDA device is not initialized");
+    state_changed_.wait(lock, [this] {
+        return worker_failed_ || lanesIdle();
     });
     PG_VALIDATE_STATE(!worker_failed_, "HostTransferProxy worker has failed");
     return {};
 }
 
 PGResult<void> HostTransferProxy::waitUntilIdle(
-    int device_index, std::chrono::milliseconds timeout) {
+    std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
-    const auto* lane_set = findLaneSet(device_index);
-    PG_VALIDATE_ARG(lane_set, "host-proxy CUDA device is not registered");
-    const bool ready = state_changed_.wait_for(lock, timeout, [this, lane_set] {
-        return worker_failed_ || laneSetIdle(*lane_set);
+    PG_VALIDATE_STATE(lane_set_,
+                      "host-proxy CUDA device is not initialized");
+    const bool ready = state_changed_.wait_for(lock, timeout, [this] {
+        return worker_failed_ || lanesIdle();
     });
     if (!ready) {
         return makePGError(PGErrorCode::Timeout,
@@ -603,7 +577,7 @@ PGResult<void> HostTransferProxy::shutdown() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stop_requested_) return {};
-        PG_VALIDATE_STATE(allLaneSetsIdle(),
+        PG_VALIDATE_STATE(lanesIdle(),
                           "HostTransferProxy still has in-flight commands");
         stop_requested_ = true;
     }
@@ -612,7 +586,7 @@ PGResult<void> HostTransferProxy::shutdown() {
 
     std::lock_guard<std::mutex> lock(mutex_);
     closePeerSegments();
-    releaseLaneSets();
+    releaseLaneSet();
     return {};
 }
 

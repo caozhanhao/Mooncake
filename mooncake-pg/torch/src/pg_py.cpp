@@ -263,16 +263,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                     "mooncakePgContextSetHostIp");
     });
     m.def(
-        "set_device_arena_size",
-        [](size_t size) {
-            checkResult(mooncakePgContextSetDeviceArenaSize(getContext(), size),
-                        "mooncakePgContextSetDeviceArenaSize");
-        },
-        py::arg("size"),
-        "Set the fixed communication arena size for the current device. Must "
-        "be "
-        "called before init_process_group().");
-    m.def(
         "set_collective_timeout_us",
         [](size_t us) {
             checkResult(mooncakePgContextSetCollectiveTimeout(getContext(), us),

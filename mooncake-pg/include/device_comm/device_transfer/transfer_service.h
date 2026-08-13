@@ -8,7 +8,7 @@
 #include <optional>
 #include <vector>
 
-#include "device_comm/device_transfer/transfer_endpoint.h"
+#include "control_plane/control_types.h"
 #include "error_types.h"
 
 namespace mooncake {
@@ -40,19 +40,14 @@ class DeviceTransferService {
     [[nodiscard]] const DeviceTransferEndpoint& localEndpoint() const noexcept;
 
     // Device address of the stable kernel-facing service handle.
-    PGResult<const DeviceTransferHandle*> deviceHandle(int device_index);
+    const DeviceTransferHandle* deviceHandle();
 
-    // Install a complete peer-indexed endpoint snapshot. Endpoint exchange is
-    // the caller's responsibility and is deliberately outside this service.
-    PGResult<void> installPeerEndpoints(
-        int device_index,
-        const std::vector<std::optional<DeviceTransferEndpoint>>& endpoints);
+    // Install the immutable endpoint published by one peer for its current
+    // rank epoch. Rank-epoch validation remains in the control plane.
+    PGResult<void> installPeerEndpoint(
+        uint32_t peer_index, const DeviceTransferEndpoint& endpoint);
 
-    // Invalidate the route used by the failed invocation and publish the next
-    // available route. The bool reports whether a fallback remains usable.
-    PGResult<bool> markRouteFailed(int device_index, uint32_t peer_index);
-
-    PGResult<void> waitUntilIdle(int device_index);
+    PGResult<void> waitUntilIdle();
 
     PGResult<void> shutdown();
 
@@ -60,7 +55,7 @@ class DeviceTransferService {
     struct DeviceState;
 
     // Caller holds mutex_.
-    PGResult<DeviceState*> deviceState(int device_index);
+    DeviceState& deviceState();
 
     std::mutex mutex_;
     std::unique_ptr<HostTransferProxy> host_proxy_;

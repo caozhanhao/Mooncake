@@ -406,14 +406,6 @@ mooncakePgResult_t mooncakePgContextSetDeviceFilter(mooncakePgContext_t context,
     });
 }
 
-mooncakePgResult_t mooncakePgContextSetDeviceArenaSize(
-    mooncakePgContext_t context, size_t size) {
-    return asCApiResult([&]() -> PGResult<void> {
-        PG_VALIDATE_ARG(context && context->impl, "invalid context");
-        return context->impl->setDeviceArenaSize(size);
-    });
-}
-
 mooncakePgResult_t mooncakePgContextSetCollectiveTimeout(
     mooncakePgContext_t context, size_t timeout_us) {
     return asCApiResult([&]() -> PGResult<void> {

@@ -15,9 +15,9 @@ namespace mooncake {
 // StrongStream gives one ordering domain a logical collective order while each
 // kernel remains on the user-provided stream. device collectives use one
 // domain per CUDA device, shared by all communicators on that device.
-// acquire() returns an order stream; the caller transfers its current tail to
-// the user stream before the kernel, then transfers kernel completion back
-// before release():
+// acquire() returns a scoped lease for an order stream; the caller transfers
+// its current tail to the user stream before the kernel, then transfers kernel
+// completion back before releasing the lease:
 //
 //      order stream                         user stream
 //           |                                   |
@@ -183,6 +183,33 @@ namespace mooncake {
 // otherwise they can wait for different communicators indefinitely.
 class StrongStream {
    public:
+    class Lease {
+       public:
+        ~Lease() noexcept;
+
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+        Lease(Lease&& other) noexcept;
+        Lease& operator=(Lease&& other) noexcept;
+
+        const GpuStream& stream() const noexcept { return stream_; }
+        PGResult<void> release();
+
+       private:
+        friend class StrongStream;
+
+        Lease(StrongStream& owner, GpuCaptureInfo capture, GpuStream stream)
+            : owner_(&owner),
+              capture_(capture),
+              stream_(std::move(stream)) {}
+
+        void releaseNoexcept() noexcept;
+
+        StrongStream* owner_ = nullptr;
+        GpuCaptureInfo capture_;
+        GpuStream stream_;
+    };
+
     // The service creates these fallible stream resources first, then
     // constructs the non-movable ordering state only after every creation
     // succeeded.
@@ -196,11 +223,12 @@ class StrongStream {
     StrongStream(StrongStream&&) = delete;
     StrongStream& operator=(StrongStream&&) = delete;
 
-    PGResult<GpuStream> acquire(const GpuCaptureInfo& capture);
-    PGResult<void> release(const GpuCaptureInfo& capture);
+    PGResult<Lease> acquire(const GpuCaptureInfo& capture);
     PGResult<void> waitUntilIdle(std::chrono::milliseconds timeout);
 
    private:
+    PGResult<void> release(const GpuCaptureInfo& capture);
+
     struct GraphOrder {
         GraphOrder(uint64_t graph_id, GpuStream stream)
             : graph_id(graph_id), stream(std::move(stream)) {}

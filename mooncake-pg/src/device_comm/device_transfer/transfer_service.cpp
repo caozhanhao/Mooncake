@@ -36,7 +36,7 @@ std::optional<uint64_t> alignUp(uint64_t value, uint64_t alignment) {
 }
 
 bool validEndpoint(const DeviceTransferEndpoint& endpoint) {
-    if (endpoint.device_index < 0 || endpoint.region_address == 0 ||
+    if (endpoint.region_address == 0 ||
         endpoint.region_address % alignof(uint64_t) != 0 ||
         endpoint.region_size == 0 ||
         addOverflows(endpoint.region_address, endpoint.region_size)) {
@@ -56,29 +56,26 @@ struct DeviceMetadataLayout {
     uint64_t lane_results_offset = 0;
 };
 
-PGResult<DeviceMetadataLayout> makeDeviceMetadataLayout(
-    uint32_t peer_capacity) {
+DeviceMetadataLayout makeDeviceMetadataLayout(uint32_t peer_capacity) {
     DeviceMetadataLayout layout;
     uint64_t cursor = 0;
-    auto reserve = [&](uint64_t size,
-                       uint64_t alignment) -> PGResult<uint64_t> {
+    auto reserve = [&](uint64_t size, uint64_t alignment) -> uint64_t {
         const auto aligned = alignUp(cursor, alignment);
-        PG_VALIDATE_ARG(aligned && !addOverflows(*aligned, size),
-                        "device-transfer service layout overflows");
+        PG_ASSERT(aligned && !addOverflows(*aligned, size),
+                  "device-transfer service layout overflows");
         const uint64_t result = *aligned;
         cursor = result + size;
         return result;
     };
 
-    PG_TRY(layout.handle_offset, reserve(sizeof(DeviceTransferHandle),
-                                         alignof(DeviceTransferHandle)));
-    PG_TRY(
-        layout.peer_routes_offset,
+    layout.handle_offset = reserve(sizeof(DeviceTransferHandle),
+                                   alignof(DeviceTransferHandle));
+    layout.peer_routes_offset =
         reserve(static_cast<uint64_t>(peer_capacity) * sizeof(DevicePeerRoute),
-                alignof(DevicePeerRoute)));
-    PG_TRY(layout.lane_results_offset,
-           reserve(kTransferLaneCount * sizeof(uint64_t), alignof(uint64_t)));
-    PG_TRY(layout.size, reserve(0, kServiceResourceAlignment));
+                alignof(DevicePeerRoute));
+    layout.lane_results_offset = reserve(
+        kTransferLaneCount * sizeof(uint64_t), alignof(uint64_t));
+    layout.size = reserve(0, kServiceResourceAlignment);
     return layout;
 }
 
@@ -140,7 +137,7 @@ struct DeviceTransferService::DeviceState {
         // Route selection and lane results are local device metadata, not
         // remotely addressed memory, so they do not consume registered-region
         // capacity.
-        PG_TRY(const auto layout, makeDeviceMetadataLayout(peer_capacity));
+        const auto layout = makeDeviceMetadataLayout(peer_capacity);
         PG_TRY_CUDA(
             cudaMalloc(&state->device_metadata.allocation, layout.size));
         PG_TRY_CUDA(
@@ -181,7 +178,6 @@ struct DeviceTransferService::DeviceState {
         const auto p2p_handle = state->p2p_route->localHandle();
         const auto te_server_name = engine.getLocalIpAndPort();
         state->local_endpoint = DeviceTransferEndpoint{
-            .device_index = device_index,
             .region_address =
                 reinterpret_cast<uint64_t>(state->registered_region.addr),
             .region_size = region_size,
@@ -198,8 +194,7 @@ struct DeviceTransferService::DeviceState {
                           "local transfer-service endpoint is invalid");
 
         state->peer_endpoints.resize(peer_capacity);
-        PG_TRY(
-            state->installPeerEndpoint(self_peer_index, state->local_endpoint));
+        state->installPeerEndpoint(self_peer_index, state->local_endpoint);
         state->host_route_image[self_peer_index] =
             state->resolveRoute(self_peer_index);
         PG_TRY(state->publishRoutes());
@@ -229,23 +224,22 @@ struct DeviceTransferService::DeviceState {
     DeviceState(const DeviceState&) = delete;
     DeviceState& operator=(const DeviceState&) = delete;
 
-    PGResult<void> installPeerEndpoint(
+    void installPeerEndpoint(
         uint32_t peer_index,
         const std::optional<DeviceTransferEndpoint>& endpoint) {
-        PG_VALIDATE_ARG(peer_index < peer_capacity,
-                        "transfer peer index is out of range");
+        PG_ASSERT(peer_index < peer_capacity,
+                  "transfer peer index is out of range");
         auto& installed = peer_endpoints[peer_index];
-        if (installed == endpoint) return {};
+        if (installed == endpoint) return;
 
-        PG_TRY(host_proxy_route.installPeerEndpoint(
+        host_proxy_route.installPeerEndpoint(
             peer_index, endpoint ? endpoint->host_proxy
-                                 : std::optional<HostProxyEndpoint>{}));
+                                 : std::optional<HostProxyEndpoint>{});
         const std::vector<int32_t> empty_handle;
         p2p_route->installPeerHandle(peer_index, endpoint && endpoint->p2p
                                                      ? endpoint->p2p->ipc_handle
                                                      : empty_handle);
         installed = endpoint;
-        return {};
     }
 
     DevicePeerRoute resolveRoute(uint32_t peer_index) const {
@@ -255,8 +249,8 @@ struct DeviceTransferService::DeviceState {
         if (!endpoint) return route;
 
         route.region_size = endpoint->region_size;
-        // One invocation sees one stable route. Recovery may invalidate P2P
-        // and publish HostProxy for later/released work.
+        // One invocation sees one stable route selected from the currently
+        // installed endpoint snapshot.
         if (const auto p2p = p2p_route->resolve(peer_index)) {
             route.kind = DeviceRouteKind::P2p;
             route.p2p.region_addr = *p2p;
@@ -280,33 +274,86 @@ struct DeviceTransferService::DeviceState {
 
     PGResult<void> shutdown() {
         if (closed) return {};
-        PG_TRY(host_proxy_route.shutdown());
-        PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
+
+        // This is the only retryable preflight. Once teardown starts below,
+        // every owned resource is visited exactly once and failures are
+        // reported after the remaining cleanup has run.
+        auto route_shutdown = host_proxy_route.shutdown();
+        if (!route_shutdown.has_value()) return route_shutdown;
+
+        std::optional<PGError> first_error;
+        const auto record_error = [&](PGError error) {
+            if (!first_error) first_error = std::move(error);
+        };
+
+        std::optional<GpuDeviceGuard> device_guard;
+        auto guard_result = GpuDeviceGuard::create(device_index);
+        if (guard_result.has_value()) {
+            device_guard.emplace(std::move(guard_result).value());
+        } else {
+            record_error(std::move(guard_result).error());
+        }
+
         if (host_route_image) {
-            PG_TRY_CUDA(cudaFreeHost(host_route_image));
+            if (device_guard) {
+                const auto result = cudaFreeHost(host_route_image);
+                if (result != cudaSuccess) {
+                    record_error(PGError{
+                        PGErrorCode::SystemError,
+                        std::string("cudaFreeHost(host_route_image) failed: ") +
+                            cudaGetErrorString(result),
+                    });
+                }
+            } else {
+                LOG(ERROR) << "Leaking transfer-service host route image "
+                              "because its CUDA device could not be selected";
+            }
             host_route_image = nullptr;
         }
         if (device_metadata.allocation) {
-            PG_TRY_CUDA(cudaFree(device_metadata.allocation));
+            if (device_guard) {
+                const auto result = cudaFree(device_metadata.allocation);
+                if (result != cudaSuccess) {
+                    record_error(PGError{
+                        PGErrorCode::SystemError,
+                        std::string("cudaFree(device metadata) failed: ") +
+                            cudaGetErrorString(result),
+                    });
+                }
+            } else {
+                LOG(ERROR) << "Leaking transfer-service device metadata "
+                              "because its CUDA device could not be selected";
+            }
             device_metadata = {};
         }
         p2p_route.reset();
+
+        bool may_free_registered_region = device_guard.has_value();
         if (registered_region.registered && registered_region.addr) {
             const int result =
                 engine.unregisterLocalMemory(registered_region.addr);
             if (result != 0) {
-                return makePGError(
+                record_error(PGError{
                     PGErrorCode::TransferEngineError,
                     "failed to unregister transfer-service memory, rc=" +
-                        std::to_string(result));
+                        std::to_string(result),
+                });
+                // TE may still refer to the allocation. Deliberately leak it
+                // instead of freeing memory behind a live registration.
+                may_free_registered_region = false;
             }
-            registered_region.registered = false;
         }
         if (registered_region.addr) {
-            p2p_transport.freeBuffer(registered_region.addr);
+            if (may_free_registered_region) {
+                p2p_transport.freeBuffer(registered_region.addr);
+            } else {
+                LOG(ERROR) << "Leaking registered transfer-service region "
+                              "after cleanup failure";
+            }
         }
         registered_region = {};
         closed = true;
+        if (first_error) return makePGError(std::move(*first_error));
         return {};
     }
 
@@ -365,21 +412,15 @@ PGResult<void> DeviceTransferService::initialize(
     return {};
 }
 
-PGResult<DeviceTransferService::DeviceState*>
-DeviceTransferService::deviceState(int device_index) {
-    PG_VALIDATE_STATE(!shutdown_ && device_,
-                      "DeviceTransferService is not initialized");
-    PG_VALIDATE_ARG(device_index == device_->device_index,
-                    "requested a different CUDA device from the initialized "
-                    "transfer service");
-    return device_.get();
+DeviceTransferService::DeviceState& DeviceTransferService::deviceState() {
+    PG_ASSERT(!shutdown_ && device_,
+              "DeviceTransferService is not initialized");
+    return *device_;
 }
 
-PGResult<const DeviceTransferHandle*> DeviceTransferService::deviceHandle(
-    int device_index) {
+const DeviceTransferHandle* DeviceTransferService::deviceHandle() {
     std::lock_guard<std::mutex> lock(mutex_);
-    PG_TRY(auto* state, deviceState(device_index));
-    return state->device_metadata.handle;
+    return deviceState().device_metadata.handle;
 }
 
 const DeviceTransferEndpoint& DeviceTransferService::localEndpoint()
@@ -398,72 +439,59 @@ size_t DeviceTransferService::regionSize() const noexcept {
     return device_->registered_region.size;
 }
 
-PGResult<void> DeviceTransferService::installPeerEndpoints(
-    int device_index,
-    const std::vector<std::optional<DeviceTransferEndpoint>>& endpoints) {
+PGResult<void> DeviceTransferService::installPeerEndpoint(
+    uint32_t peer_index, const DeviceTransferEndpoint& endpoint) {
     std::lock_guard<std::mutex> lock(mutex_);
-    PG_TRY(auto* state, deviceState(device_index));
-    PG_VALIDATE_ARG(endpoints.size() == state->peer_capacity,
-                    "transfer-service endpoint table has the wrong size");
+    auto& state = deviceState();
+    PG_VALIDATE_ARG(peer_index < state.peer_capacity,
+                    "transfer peer index is out of range");
+    PG_VALIDATE_ARG(peer_index != state.self_peer_index,
+                    "cannot replace the local transfer endpoint");
+    PG_VALIDATE_ARG(validEndpoint(endpoint),
+                    "transfer-service endpoint is invalid");
 
-    for (uint32_t peer_index = 0; peer_index < state->peer_capacity;
-         ++peer_index) {
-        if (peer_index == state->self_peer_index || !endpoints[peer_index]) {
-            continue;
-        }
-        PG_VALIDATE_ARG(validEndpoint(*endpoints[peer_index]),
-                        "transfer-service endpoint is invalid");
-    }
+    state.installPeerEndpoint(peer_index, endpoint);
 
-    for (uint32_t peer_index = 0; peer_index < state->peer_capacity;
-         ++peer_index) {
-        if (peer_index == state->self_peer_index) continue;
-        PG_TRY(state->installPeerEndpoint(peer_index, endpoints[peer_index]));
+    PG_TRY(state.p2p_route->refreshMappings());
+    for (uint32_t rank = 0; rank < state.peer_capacity; ++rank) {
+        state.host_route_image[rank] = state.resolveRoute(rank);
     }
-
-    PG_TRY(state->p2p_route->refreshMappings());
-    for (uint32_t peer_index = 0; peer_index < state->peer_capacity;
-         ++peer_index) {
-        state->host_route_image[peer_index] = state->resolveRoute(peer_index);
-    }
-    return state->publishRoutes();
+    return state.publishRoutes();
 }
 
-PGResult<bool> DeviceTransferService::markRouteFailed(int device_index,
-                                                      uint32_t peer_index) {
+PGResult<void> DeviceTransferService::waitUntilIdle() {
     std::lock_guard<std::mutex> lock(mutex_);
-    PG_TRY(auto* state, deviceState(device_index));
-    PG_VALIDATE_ARG(peer_index < state->peer_capacity,
-                    "failed transfer peer index is out of range");
-
-    const auto route = state->host_route_image[peer_index];
-    if (route.kind != DeviceRouteKind::P2p) return false;
-    state->p2p_route->invalidate(peer_index);
-    state->host_route_image[peer_index] = state->resolveRoute(peer_index);
-    PG_TRY(state->publishRoutes());
-    return state->host_route_image[peer_index].kind !=
-           DeviceRouteKind::Unreachable;
-}
-
-PGResult<void> DeviceTransferService::waitUntilIdle(int device_index) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    PG_TRY(auto* state, deviceState(device_index));
-    return state->host_proxy_route.waitUntilIdle();
+    return deviceState().host_proxy_route.waitUntilIdle();
 }
 
 PGResult<void> DeviceTransferService::shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (shutdown_) return {};
 
+    std::optional<PGError> first_error;
     if (device_) {
-        PG_TRY(device_->shutdown());
-        device_.reset();
+        auto result = device_->shutdown();
+        if (!result.has_value()) {
+            first_error = std::move(result).error();
+        }
+        if (device_->closed) device_.reset();
     }
-    if (host_proxy_) {
-        PG_TRY(host_proxy_->shutdown());
-        host_proxy_.reset();
+
+    // A failed preflight means commands are still in flight and the proxy must
+    // remain alive for a later retry. A closed DeviceState no longer exposes
+    // command slots to kernels, so proxy teardown can proceed even if another
+    // cleanup operation above was only best-effort.
+    if (!device_ && host_proxy_) {
+        auto result = host_proxy_->shutdown();
+        if (!result.has_value()) {
+            if (!first_error) first_error = std::move(result).error();
+        } else {
+            host_proxy_.reset();
+        }
     }
-    shutdown_ = true;
+
+    shutdown_ = !device_ && !host_proxy_;
+    if (first_error) return makePGError(std::move(*first_error));
     return {};
 }
 

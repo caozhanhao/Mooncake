@@ -29,7 +29,7 @@ class DeviceCollectiveRecoveryWorker {
         const DeviceCollectiveRecoveryWorker&) = delete;
 
     PGResult<void> start();
-    PGResult<void> shutdown();
+    void shutdown();
 
    private:
     friend class DeviceCollectiveRuntime;

@@ -28,7 +28,10 @@ def _collective_payload(
 
     if case_name == "allreduce":
         if case_arg == "sum":
-            tensor = torch.tensor([rank + 1], dtype=torch.int32, device=device)
+            # CUDA AllReduce uses the new device-collective path, whose first
+            # implementation supports floating-point SUM.
+            dtype = torch.float32 if device_type == "cuda" else torch.int32
+            tensor = torch.tensor([rank + 1], dtype=dtype, device=device)
             op = dist.ReduceOp.SUM
         elif case_arg == "min":
             tensor = torch.tensor([rank + 10], dtype=torch.int32, device=device)

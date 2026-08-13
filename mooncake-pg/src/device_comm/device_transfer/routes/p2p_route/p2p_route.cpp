@@ -29,7 +29,6 @@ void P2pRoute::installPeerHandle(uint32_t peer_index,
 
     mapping.ipc_handle = ipc_handle;
     mapping.remote_region_address = 0;
-    mapping.disabled = false;
     refresh_needed_ = true;
 }
 
@@ -39,7 +38,7 @@ PGResult<void> P2pRoute::refreshMappings() {
     std::vector<std::vector<int32_t>> handles(peer_capacity_);
     std::vector<int> active(peer_capacity_, 0);
     for (uint32_t peer = 0; peer < peer_capacity_; ++peer) {
-        if (peers_[peer].ipc_handle.empty() || peers_[peer].disabled) continue;
+        if (peers_[peer].ipc_handle.empty()) continue;
         handles[peer] = peers_[peer].ipc_handle;
         active[peer] = 1;
     }
@@ -84,14 +83,6 @@ std::optional<uint64_t> P2pRoute::resolve(uint32_t peer_index) const {
         return std::nullopt;
     }
     return mapping.remote_region_address;
-}
-
-void P2pRoute::invalidate(uint32_t peer_index) {
-    if (peer_index >= peer_capacity_) return;
-    peers_[peer_index].remote_region_address = 0;
-    // Keep a failed route disabled when an unrelated peer later causes a
-    // full-snapshot refresh. A new IPC handle re-enables it when installed.
-    peers_[peer_index].disabled = true;
 }
 
 }  // namespace mooncake

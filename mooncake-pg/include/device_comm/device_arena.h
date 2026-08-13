@@ -51,9 +51,8 @@ class DeviceArenaSlice {
 // must outlive the arena and all of its slices.
 class DeviceArena {
    public:
-    static PGResult<std::unique_ptr<DeviceArena>> create(int device_index,
-                                                         void* base,
-                                                         size_t arena_size);
+    static std::unique_ptr<DeviceArena> create(int device_index, void* base,
+                                               size_t arena_size);
 
     ~DeviceArena() noexcept;
 
@@ -63,11 +62,9 @@ class DeviceArena {
     PGResult<DeviceArenaSlice> allocate(size_t size, size_t alignment);
 
     [[nodiscard]] void* base() const noexcept;
-    [[nodiscard]] size_t size() const noexcept;
     [[nodiscard]] int deviceIndex() const noexcept;
-    [[nodiscard]] size_t allocationCount() const noexcept;
 
-    PGResult<void> close();
+    void close();
 
    private:
     friend class DeviceArenaSlice;

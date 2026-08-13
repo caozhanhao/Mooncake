@@ -183,11 +183,11 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
     auto transfer_service = std::make_unique<DeviceTransferService>();
     PG_TRY(transfer_service->initialize(
         static_cast<uint32_t>(rank), static_cast<uint32_t>(world_size),
-        service_device_index, *engine, device_arena_size));
+        service_device_index, *engine, kDefaultDeviceArenaSize));
 
-    PG_TRY(auto arena, DeviceArena::create(service_device_index,
-                                           transfer_service->regionAddr(),
-                                           transfer_service->regionSize()));
+    auto arena = DeviceArena::create(service_device_index,
+                                     transfer_service->regionAddr(),
+                                     transfer_service->regionSize());
     PG_TRY(auto workspace,
            arena->allocate(kDeviceCollectiveWorkspaceSize, 256));
 
@@ -252,7 +252,7 @@ PGResult<void> MooncakePGContext::connectCoordinator(
     if (!agent_host) {
         auto candidate = std::make_unique<AgentHost>(
             coordinator_address, host_ip, global_rank, max_world_size,
-            device_transfer_service->localEndpoint(), link_manager,
+            *device_transfer_service, link_manager,
             fault_reconciliation_window_us);
         PG_TRY(candidate->start());
         agent_host = std::move(candidate);
@@ -308,18 +308,6 @@ PGResult<void> MooncakePGContext::setDeviceFilter(
         device_filters_ = filters;
         engine->setWhitelistFilters(std::move(filters));
     }
-    return {};
-}
-
-PGResult<void> MooncakePGContext::setDeviceArenaSize(size_t size) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    PG_TRY(checkRunning());
-    PG_VALIDATE_ARG(size >= kDeviceCollectiveWorkspaceSize + (64ull << 10),
-                    "device arena is too small for the shared buffers");
-    PG_VALIDATE_STATE(!initialized_ || device_arena_size == size,
-                      "device arena size cannot be changed after context "
-                      "initialization");
-    if (!initialized_) device_arena_size = size;
     return {};
 }
 
@@ -393,12 +381,7 @@ PGResult<void> MooncakePGContext::shutdown() {
     }
 
     if (device_collective_recovery_worker) {
-        auto result = device_collective_recovery_worker->shutdown();
-        if (!result.has_value()) {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            shutdown_requested_ = false;
-            return makePGError(std::move(result).error());
-        }
+        device_collective_recovery_worker->shutdown();
         device_collective_recovery_worker.reset();
     }
     // Stop registration retries before invalidating the service endpoint that
@@ -407,10 +390,7 @@ PGResult<void> MooncakePGContext::shutdown() {
     device_collective_strong_stream.reset();
     device_collective_workspace.reset();
     if (device_arena) {
-        auto result = device_arena->close();
-        if (!result.has_value()) {
-            return makePGError(std::move(result).error());
-        }
+        device_arena->close();
         device_arena.reset();
     }
     if (device_transfer_service) {
@@ -651,29 +631,25 @@ PGResult<void> MooncakeCommunicator::initialize(
                           "device collective recovery worker is unavailable");
         PG_TRY(device_collective_->enableRecovery(
             *context_.device_collective_recovery_worker,
-            [this](const DeviceCollectiveFailure& failure) -> PGResult<void> {
+            [this](InGroupRank failed_rank) -> PGResult<void> {
                 PG_VALIDATE_STATE(meta_,
                                   "device collective group metadata is "
                                   "unavailable during recovery");
-                if (!failure.peer_still_reachable) {
-                    const auto failed_global_rank =
-                        meta_->rank_order[failure.failed_rank];
-                    PG_VALIDATE_STATE(
-                        failed_global_rank >= 0 &&
-                            failed_global_rank < context_.max_world_size,
-                        "device collective failure has no global-rank "
-                        "mapping");
+                const auto failed_global_rank =
+                    meta_->rank_order[failed_rank];
+                PG_VALIDATE_STATE(
+                    failed_global_rank >= 0 &&
+                        failed_global_rank < context_.max_world_size,
+                    "device collective failure has no global-rank mapping");
 
-                    LinkEvent event;
-                    event.events.assign(kMaxNumRanks,
-                                        LinkEvent::EventType::None);
-                    event.target_rank_epochs.assign(kMaxNumRanks, 0);
-                    event.events[failed_global_rank] =
-                        LinkEvent::EventType::Failure;
-                    event.target_rank_epochs[failed_global_rank] =
-                        meta_->rankEpochs[failed_global_rank];
-                    agent_.pushLinkEvent(event);
-                }
+                LinkEvent event;
+                event.events.assign(kMaxNumRanks, LinkEvent::EventType::None);
+                event.target_rank_epochs.assign(kMaxNumRanks, 0);
+                event.events[failed_global_rank] =
+                    LinkEvent::EventType::Failure;
+                event.target_rank_epochs[failed_global_rank] =
+                    meta_->rankEpochs[failed_global_rank];
+                agent_.pushLinkEvent(event);
 
                 PG_TRY(auto response, syncAfterFailure());
                 PG_VALIDATE_STATE(
@@ -714,8 +690,7 @@ PGResult<void> MooncakeCommunicator::initialize(
         meta_->activeRanks[rank_] = true;
         meta_->autoSyncOnFailure = false;
         if (device_collective_) {
-            PG_TRY(device_collective_->useLocalOnly(
-                meta_->epoch.load(std::memory_order_acquire), rank_));
+            PG_TRY(device_collective_->useLocalOnly(rank_));
         }
         PG_TRY(syncActiveRanksMirror());
         refreshSegmentID(rank_);
@@ -984,7 +959,7 @@ PGResult<void> MooncakeCommunicator::allReduceGpu(
     if (device_collective_) {
         return device_collective_->enqueueAllReduce(
             send_buffer, recv_buffer, count, datatype, op, stream,
-            failed_ranks_hint, failed_ranks_hint_count);
+            failed_ranks_hint);
     }
     PG_TRY(checkReduction(datatype, op, false));
     const int active_size = getSize();
@@ -1669,8 +1644,6 @@ PGResult<SyncAfterFailureResponse> MooncakeCommunicator::syncAfterFailure() {
 PGResult<void> MooncakeCommunicator::applyViewUpdate(
     const GroupView& view, const std::vector<RankState>& rank_states,
     const std::vector<uint64_t>& rank_epochs,
-    const std::vector<std::optional<DeviceTransferEndpoint>>&
-        transfer_service_endpoints,
     const std::vector<bool>& activatable,
     bool materialize_device_collective_view) {
     if (!meta_) return {};
@@ -1686,9 +1659,6 @@ PGResult<void> MooncakeCommunicator::applyViewUpdate(
     PG_VALIDATE_ARG(
         rank_epochs.size() == static_cast<size_t>(context_.max_world_size),
         "rank epoch table has the wrong size");
-    PG_VALIDATE_ARG(transfer_service_endpoints.size() ==
-                        static_cast<size_t>(context_.max_world_size),
-                    "transfer-service endpoint table has the wrong size");
     PG_VALIDATE_ARG(activatable.size() == view.rank_order.size(),
                     "activatable table has the wrong size");
     for (const auto global_rank : view.rank_order) {
@@ -1738,13 +1708,9 @@ PGResult<void> MooncakeCommunicator::applyViewUpdate(
         }
     }
 
-    // Materialize the failure-prone device collective data plane before
-    // publishing the legacy host mirrors and epoch below.
-    // DeviceCollectiveRuntime publishes Blocked first, so an error cannot leave
-    // a kernel using a partial view.
+    // Materialize the device collective data plane before publishing the
+    // legacy host mirrors and epoch below.
     if (device_collective_ && materialize_device_collective_view) {
-        PG_TRY(context_.device_transfer_service->installPeerEndpoints(
-            device_index_, transfer_service_endpoints));
         PGResult<void> device_collective_result;
         if (next_mode == CollectiveExtensionState::Isolated) {
             InGroupRank self_rank = kInvalidInGroupRank;
@@ -1756,7 +1722,6 @@ PGResult<void> MooncakeCommunicator::applyViewUpdate(
                 }
             }
             device_collective_result = device_collective_->useLocalOnly(
-                view.epoch,
                 self_rank >= 0 ? self_rank : static_cast<InGroupRank>(rank_));
         } else {
             device_collective_result =

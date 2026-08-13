@@ -7,9 +7,32 @@
 #include <vector>
 
 #include "common_types.h"
-#include "device_comm/device_transfer/transfer_endpoint.h"
 
 namespace mooncake {
+
+struct P2pEndpoint {
+    std::vector<int32_t> ipc_handle;
+
+    bool operator==(const P2pEndpoint&) const = default;
+};
+
+struct HostProxyEndpoint {
+    std::string te_server_name;
+
+    bool operator==(const HostProxyEndpoint&) const = default;
+};
+
+// Rank-scoped bootstrap metadata for the device transfer service. A peer
+// publishes one immutable value for each rank epoch.
+struct DeviceTransferEndpoint {
+    uint64_t region_address = 0;
+    uint64_t region_size = 0;
+
+    std::optional<P2pEndpoint> p2p;
+    std::optional<HostProxyEndpoint> host_proxy;
+
+    bool operator==(const DeviceTransferEndpoint&) const = default;
+};
 
 // Bootstrap ID: Backend type ("cpu:" or "device:") + PyTorch-assigned group_id.
 using GroupBootstrapId = std::string;

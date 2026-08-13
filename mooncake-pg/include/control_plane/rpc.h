@@ -253,6 +253,12 @@ using CoordinatorEffect =
 
 // Agent effects
 
+struct InstallDeviceTransferEndpoint {
+    GlobalRank rank = kInvalidGlobalRank;
+    uint64_t rank_epoch = 0;
+    DeviceTransferEndpoint endpoint;
+};
+
 struct EnablePeerProbe {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t rank_epoch = 0;
@@ -284,10 +290,6 @@ struct ApplyViewToCommunicator {
     GroupView view;
     std::vector<RankState> rank_states;
     std::vector<uint64_t> rank_epochs;
-    // Rank-scoped registration metadata indexed by GlobalRank. The control
-    // plane merely carries this snapshot; it does not manage transfer routes.
-    std::vector<std::optional<DeviceTransferEndpoint>>
-        transfer_service_endpoints;
     std::vector<bool> activatable;
 
     // Rank-state pushes refresh only the communicator's host mirrors. A
@@ -317,11 +319,11 @@ struct NotifyRanksActivated {
 };
 
 using AgentEffect =
-    std::variant<EnablePeerProbe, DisconnectLink, RequestLinkHealthCheck,
-                 SendLinkEventReport, StopReconnect, DisconnectAllLinks,
-                 ClearAllPeerMetadata, ApplyViewToCommunicator, ResetPeerState,
-                 RefreshPeerLink, NotifyLinkRefreshed, NotifyGroupReady,
-                 NotifyRanksActivated>;
+    std::variant<InstallDeviceTransferEndpoint, EnablePeerProbe, DisconnectLink,
+                 RequestLinkHealthCheck, SendLinkEventReport, StopReconnect,
+                 DisconnectAllLinks, ClearAllPeerMetadata,
+                 ApplyViewToCommunicator, ResetPeerState, RefreshPeerLink,
+                 NotifyLinkRefreshed, NotifyGroupReady, NotifyRanksActivated>;
 
 // Results produced by the Coordinator/Agent state machine
 

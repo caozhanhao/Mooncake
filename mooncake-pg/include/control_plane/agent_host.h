@@ -22,6 +22,7 @@ namespace mooncake {
 class RpcServer;
 class RpcClient;
 class MooncakeCommunicator;
+class DeviceTransferService;
 
 // =========================================================================
 // Control Plane Architecture (Agent side)
@@ -33,7 +34,7 @@ class MooncakeCommunicator;
 //   MooncakeCommunicator                      AgentHost
 //   +-----------------+              +---------------------------+
 //   | proposeActivate |-> (sync) --->| call Coordinator RPC      |
-//   | registerGroup   |-> post() --->| apply GroupView           |
+//   | registerGroup   |-> post() --->| agent_.registerGroup()    |
 //   | pushLinkEvent   |-> post() --->| agent_.pushLinkEvent()      |
 //   +-----------------+              +---------------------------+
 //                                            |
@@ -125,7 +126,7 @@ class AgentHost : public AgentInterface {
 
     AgentHost(std::string coordinator_addr, const std::string& host_ip,
               GlobalRank rank, int max_world_size,
-              DeviceTransferEndpoint transfer_service_endpoint,
+              DeviceTransferService& device_transfer_service,
               LinkManager& link_manager,
               int64_t fault_reconciliation_window_us);
 
@@ -174,6 +175,7 @@ class AgentHost : public AgentInterface {
     AgentStateMachine agent_;
     SerializedExecutor executor_;
 
+    DeviceTransferService& device_transfer_service_;
     LinkManager& link_manager_;
 
     std::string host_ip_;
@@ -234,6 +236,8 @@ class AgentHost : public AgentInterface {
 
     PGResult<void> applyGroupView(const GroupView& view);
     PGResult<void> runEffects(const AgentApplyResult& effects);
+    void runAsyncEffects(const AgentApplyResult& effects,
+                         const char* source);
     template <typename F>
     void forEachCommunicator(F&& func) {
         for (auto& [group_id, communicator] : communicators_) {

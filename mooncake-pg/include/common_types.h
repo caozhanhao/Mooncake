@@ -1,7 +1,6 @@
 // Common value types shared by host and device code.
 // Keep this header free of host-only facilities such as STL containers,
-// exceptions, and PGResult so device translation units can include
-// it directly.
+// exceptions, and PGResult so device translation units can include it directly.
 
 #ifndef MOONCAKE_PG_COMMON_TYPES_H
 #define MOONCAKE_PG_COMMON_TYPES_H

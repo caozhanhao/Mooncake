@@ -8,12 +8,8 @@
 
 namespace mooncake {
 
-AgentStateMachine::AgentStateMachine(
-    GlobalRank rank, int max_world_size,
-    DeviceTransferEndpoint local_transfer_endpoint)
-    : rank_(rank),
-      max_world_size_(max_world_size),
-      local_transfer_endpoint_(std::move(local_transfer_endpoint)) {
+AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
+    : rank_(rank), max_world_size_(max_world_size) {
     PG_ASSERT(max_world_size_ > 0 && max_world_size_ <= kMaxNumRanks,
               "invalid max_world_size: ", max_world_size_);
     global_rank_states_ = std::vector<RankState>(max_world_size_);
@@ -27,17 +23,6 @@ AgentStateMachine::AgentStateMachine(
 void AgentStateMachine::appendApplyViewToCommunicator(
     const GroupView& view, AgentApplyResult& effects,
     bool materialize_device_collective_view) const {
-    std::vector<std::optional<DeviceTransferEndpoint>> transfer_endpoints(
-        max_world_size_);
-    transfer_endpoints[rank_] = local_transfer_endpoint_;
-    for (int rank = 0; rank < max_world_size_; ++rank) {
-        if (rank == rank_) continue;
-        const auto& connection = rank_connections_[rank];
-        if (connection && connection->rank_epoch == global_rank_epochs_[rank]) {
-            transfer_endpoints[rank] = connection->transfer_service_endpoint;
-        }
-    }
-
     std::vector<bool> activatable(view.rank_order.size());
     for (size_t i = 0; i < view.rank_order.size(); ++i) {
         GlobalRank gr = view.rank_order[i];
@@ -51,7 +36,6 @@ void AgentStateMachine::appendApplyViewToCommunicator(
         .view = view,
         .rank_states = global_rank_states_,
         .rank_epochs = global_rank_epochs_,
-        .transfer_service_endpoints = std::move(transfer_endpoints),
         .activatable = std::move(activatable),
         .materialize_device_collective_view =
             materialize_device_collective_view,
@@ -129,6 +113,11 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
         .transfer_service_endpoint = push.transfer_service_endpoint,
         .warmup_recv_addr = push.warmup_recv_addr,
     };
+    effects.push_back(InstallDeviceTransferEndpoint{
+        .rank = push.rank,
+        .rank_epoch = push.rank_epoch,
+        .endpoint = push.transfer_service_endpoint,
+    });
     effects.push_back(EnablePeerProbe{push.rank, push.rank_epoch,
                                       push.te_server_name,
                                       push.warmup_recv_addr});
@@ -321,6 +310,11 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
             continue;
 
         rank_connections_[connection.rank] = connection;
+        effects.push_back(InstallDeviceTransferEndpoint{
+            .rank = connection.rank,
+            .rank_epoch = connection.rank_epoch,
+            .endpoint = connection.transfer_service_endpoint,
+        });
         effects.push_back(EnablePeerProbe{
             .rank = connection.rank,
             .rank_epoch = connection.rank_epoch,

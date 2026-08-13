@@ -121,20 +121,16 @@ __device__ __forceinline__ void finishInvocation(
 __device__ __forceinline__ void failInvocation(
     const DeviceAllReduceKernelArgs& request,
     const DeviceCollectiveKernelResources& resources,
-    DeviceCollectiveKernelError error, InGroupRank failed_rank,
-    uint64_t view_epoch, cg::thread_block block) {
+    InGroupRank failed_rank, cg::thread_block block) {
     block.sync();
     if (block.thread_rank() == 0) {
         auto* const failed = reinterpret_cast<unsigned int*>(
             &resources.invocation->failure_latched);
         if (atomicCAS(failed, 0u, 1u) == 0u) {
             auto* const mailbox = resources.recovery;
-            mailbox->error_code = static_cast<int32_t>(error);
             mailbox->failed_rank = failed_rank;
-            mailbox->view_epoch = view_epoch;
             mailbox->failed_hint_address =
                 reinterpret_cast<uint64_t>(request.failed_ranks_hint);
-            mailbox->failed_hint_count = request.failed_ranks_hint_count;
             __threadfence_system();
         }
     }
@@ -184,9 +180,7 @@ __device__ __forceinline__ void parkAfterRingFailure(
             __trap();
             return;
     }
-    failInvocation(request, resources,
-                   DeviceCollectiveKernelError::IncomingTransferTimedOut,
-                   failed_rank, plan.view_epoch, block);
+    failInvocation(request, resources, failed_rank, block);
 }
 
 template <typename T>

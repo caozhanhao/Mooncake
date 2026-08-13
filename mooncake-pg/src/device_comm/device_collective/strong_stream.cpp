@@ -1,6 +1,7 @@
 #include "device_comm/device_collective/strong_stream.h"
 
 #include <chrono>
+#include <exception>
 #include <list>
 #include <mutex>
 #include <thread>
@@ -21,6 +22,44 @@ bool sameCapture(const GpuCaptureInfo& left,
 
 }  // namespace
 
+StrongStream::Lease::~Lease() noexcept { releaseNoexcept(); }
+
+StrongStream::Lease::Lease(Lease&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr)),
+      capture_(other.capture_),
+      stream_(std::move(other.stream_)) {}
+
+StrongStream::Lease& StrongStream::Lease::operator=(Lease&& other) noexcept {
+    if (this != &other) {
+        releaseNoexcept();
+        owner_ = std::exchange(other.owner_, nullptr);
+        capture_ = other.capture_;
+        stream_ = std::move(other.stream_);
+    }
+    return *this;
+}
+
+PGResult<void> StrongStream::Lease::release() {
+    if (!owner_) return {};
+    auto* owner = std::exchange(owner_, nullptr);
+    return owner->release(capture_);
+}
+
+void StrongStream::Lease::releaseNoexcept() noexcept {
+    if (!owner_) return;
+    try {
+        auto result = release();
+        if (!result.has_value()) {
+            LOG(ERROR) << "Failed to release StrongStream lease: "
+                       << result.error().message;
+        }
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Failed to release StrongStream lease: " << error.what();
+    } catch (...) {
+        LOG(ERROR) << "Failed to release StrongStream lease";
+    }
+}
+
 StrongStream::StrongStream(int device, GpuStream eager_order_stream,
                            GpuEvent serial_event) noexcept
     : device_index_(device),
@@ -33,10 +72,11 @@ StrongStream::~StrongStream() noexcept {
     }
 }
 
-PGResult<GpuStream> StrongStream::acquire(const GpuCaptureInfo& capture) {
+PGResult<StrongStream::Lease> StrongStream::acquire(
+    const GpuCaptureInfo& capture) {
     std::lock_guard<std::mutex> lock(mutex_);
-    PG_VALIDATE_STATE(!pending_release_.has_value(),
-                      "StrongStream already has an unmatched acquire");
+    PG_ASSERT(!pending_release_.has_value(),
+              "StrongStream already has an unmatched acquire");
 
     cudaStream_t order_stream = nullptr;
 
@@ -54,8 +94,8 @@ PGResult<GpuStream> StrongStream::acquire(const GpuCaptureInfo& capture) {
         // construction lane per active Graph capture; all calls in that same
         // capture reuse its CUDA-maintained dependency frontier. Collective
         // kernels themselves remain on their user streams.
-        PG_VALIDATE_STATE(capture.graph,
-                          "active CUDA Graph capture has no graph handle");
+        PG_ASSERT(capture.graph,
+                  "active CUDA Graph capture has no graph handle");
 
         // acquire() may be called more than once during the same capture. Find
         // its existing ordering state, and discard ended captures.
@@ -117,18 +157,19 @@ PGResult<GpuStream> StrongStream::acquire(const GpuCaptureInfo& capture) {
         .capture = capture,
         .order_stream = order_stream,
     });
-    return GpuStream::borrow(order_stream, device_index_);
+    return Lease(*this, capture,
+                 GpuStream::borrow(order_stream, device_index_));
 }
 
 PGResult<void> StrongStream::release(const GpuCaptureInfo& capture) {
     std::lock_guard<std::mutex> lock(mutex_);
-    PG_VALIDATE_STATE(pending_release_.has_value(),
-                      "StrongStream release has no matching acquire");
-    PG_VALIDATE_STATE(
+    PG_ASSERT(pending_release_.has_value(),
+              "StrongStream release has no matching acquire");
+    PG_ASSERT(
         pending_release_->owner_thread == std::this_thread::get_id(),
         "StrongStream must be released by its acquiring thread");
-    PG_VALIDATE_STATE(sameCapture(pending_release_->capture, capture),
-                      "StrongStream release uses a different CUDA capture");
+    PG_ASSERT(sameCapture(pending_release_->capture, capture),
+              "StrongStream release uses a different CUDA capture");
 
     GraphOrder* graph_order = nullptr;
     if (capture.active) {
@@ -139,26 +180,27 @@ PGResult<void> StrongStream::release(const GpuCaptureInfo& capture) {
                 break;
             }
         }
-        PG_VALIDATE_STATE(graph_order,
-                          "StrongStream Graph order is no longer available");
+        PG_ASSERT(graph_order,
+                  "StrongStream Graph order is no longer available");
     }
+
+    // Clear the protocol state before the fallible CUDA publication below. A
+    // failed release is an operation error, not a permanently unmatched
+    // acquire that poisons every later call with a misleading invariant error.
+    pending_release_.reset();
 
     if (capture.active) {
-        PG_TRY(serial_event_.recordExternal(graph_order->stream));
-    } else if (ever_captured_) {
-        PG_TRY(serial_event_.record(eager_order_stream_));
+        return serial_event_.recordExternal(graph_order->stream);
     }
-
-    pending_release_.reset();
+    if (ever_captured_) return serial_event_.record(eager_order_stream_);
     return {};
 }
 
 PGResult<void> StrongStream::waitUntilIdle(std::chrono::milliseconds timeout) {
     std::lock_guard<std::mutex> lock(mutex_);
-    PG_VALIDATE_STATE(!pending_release_.has_value(),
-                      "StrongStream cannot wait before release");
-    PG_VALIDATE_ARG(timeout.count() >= 0,
-                    "StrongStream idle timeout is negative");
+    PG_ASSERT(!pending_release_.has_value(),
+              "StrongStream cannot wait before release");
+    PG_ASSERT(timeout.count() >= 0, "StrongStream idle timeout is negative");
 
     if (ever_captured_) {
         PG_TRY(eager_order_stream_.waitEvent(serial_event_));

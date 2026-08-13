@@ -89,38 +89,35 @@ bool validDeviceCollectiveControlRange(const DeviceCollectiveEndpoint& endpoint,
                std::numeric_limits<uint64_t>::max() - endpoint.control_size;
 }
 
-PGResult<void> validatePlanImage(const DeviceAllReducePlanImage& plan,
-                                 uint32_t max_group_size) {
-    PG_VALIDATE_STATE(plan.status == DeviceCollectivePlanStatus::Ready ||
-                          plan.status == DeviceCollectivePlanStatus::Inactive ||
-                          plan.status == DeviceCollectivePlanStatus::Blocked,
-                      "device collective Plan has an invalid status");
+void assertValidPlanImage(const DeviceAllReducePlanImage& plan,
+                          uint32_t max_group_size) {
+    PG_ASSERT(plan.status == DeviceCollectivePlanStatus::Ready ||
+                  plan.status == DeviceCollectivePlanStatus::Unavailable,
+              "device collective Plan has an invalid status");
 
-    if (plan.status == DeviceCollectivePlanStatus::Blocked) return {};
+    if (plan.status == DeviceCollectivePlanStatus::Unavailable) return;
 
-    PG_VALIDATE_STATE(
+    PG_ASSERT(
         plan.self_rank >= 0 &&
             static_cast<uint32_t>(plan.self_rank) < max_group_size,
         "device collective Plan has an invalid local group rank");
-    if (plan.status == DeviceCollectivePlanStatus::Inactive) return {};
 
-    PG_VALIDATE_STATE(
+    PG_ASSERT(
         plan.participant_count != 0 && plan.participant_count <= max_group_size,
         "device collective Plan has an invalid participant count");
-    PG_VALIDATE_STATE(
+    PG_ASSERT(
         plan.self_active_index >= 0 &&
             static_cast<uint32_t>(plan.self_active_index) <
                 plan.participant_count,
         "device collective Plan has an invalid local active index");
-    PG_VALIDATE_STATE(
+    PG_ASSERT(
         plan.predecessor_rank >= 0 &&
             static_cast<uint32_t>(plan.predecessor_rank) < max_group_size,
         "device collective Plan has an invalid predecessor rank");
-    PG_VALIDATE_STATE(
+    PG_ASSERT(
         plan.successor_rank >= 0 &&
             static_cast<uint32_t>(plan.successor_rank) < max_group_size,
         "device collective Plan has an invalid successor rank");
-    return {};
 }
 
 #ifdef USE_CUDA
@@ -192,47 +189,47 @@ class GpuStreamDrainGuard {
 
 }  // namespace
 
-PGResult<DeviceCollectiveRuntime::ControlSliceLayout>
+DeviceCollectiveRuntime::ControlSliceLayout
 DeviceCollectiveRuntime::ControlSliceLayout::make(uint32_t max_group_size) {
     ControlSliceLayout layout;
     uint64_t cursor = 0;
 
-    auto reserve = [&](uint64_t size,
-                       uint64_t alignment) -> PGResult<uint64_t> {
+    auto reserve = [&](uint64_t size, uint64_t alignment) -> uint64_t {
+        PG_ASSERT(alignment != 0,
+                  "device collective control-slice alignment is zero");
         const uint64_t remainder = cursor % alignment;
         const uint64_t padding = remainder == 0 ? 0 : alignment - remainder;
-        PG_VALIDATE_ARG(
+        PG_ASSERT(
             padding <= std::numeric_limits<uint64_t>::max() - cursor,
             "device collective control-slice layout alignment overflows");
         cursor += padding;
         const uint64_t result = cursor;
-        PG_VALIDATE_ARG(size <= std::numeric_limits<uint64_t>::max() - cursor,
-                        "device collective control-slice layout size "
-                        "overflows");
+        PG_ASSERT(size <= std::numeric_limits<uint64_t>::max() - cursor,
+                  "device collective control-slice layout size overflows");
         cursor += size;
         return result;
     };
 
-    PG_TRY(layout.peers_offset, reserve(static_cast<uint64_t>(max_group_size) *
-                                            sizeof(DeviceCollectivePeerBinding),
-                                        alignof(DeviceCollectivePeerBinding)));
-    PG_TRY(layout.plan_offset, reserve(sizeof(DeviceAllReducePlanImage),
-                                       alignof(DeviceAllReducePlanImage)));
-    PG_TRY(layout.next_step_sequences_offset,
-           reserve(kMaxDeviceCollectiveChannels * sizeof(uint64_t),
-                   alignof(uint64_t)));
-    PG_TRY(layout.invocation_offset,
-           reserve(sizeof(DeviceCollectiveInvocationState),
-                   alignof(DeviceCollectiveInvocationState)));
-    PG_TRY(layout.signal_slots_offset,
-           reserve(static_cast<uint64_t>(kMaxDeviceCollectiveChannels) *
-                       max_group_size * sizeof(uint64_t),
-                   alignof(uint64_t)));
-    PG_TRY(layout.consumed_ack_slots_offset,
-           reserve(static_cast<uint64_t>(kMaxDeviceCollectiveChannels) *
-                       max_group_size * sizeof(uint64_t),
-                   alignof(uint64_t)));
-    PG_TRY(layout.size, reserve(0, kGroupResourceAlignment));
+    layout.peers_offset =
+        reserve(static_cast<uint64_t>(max_group_size) *
+                    sizeof(DeviceCollectivePeerBinding),
+                alignof(DeviceCollectivePeerBinding));
+    layout.plan_offset = reserve(sizeof(DeviceAllReducePlanImage),
+                                 alignof(DeviceAllReducePlanImage));
+    layout.next_step_sequences_offset =
+        reserve(kMaxDeviceCollectiveChannels * sizeof(uint64_t),
+                alignof(uint64_t));
+    layout.invocation_offset = reserve(sizeof(DeviceCollectiveInvocationState),
+                                       alignof(DeviceCollectiveInvocationState));
+    layout.signal_slots_offset =
+        reserve(static_cast<uint64_t>(kMaxDeviceCollectiveChannels) *
+                    max_group_size * sizeof(uint64_t),
+                alignof(uint64_t));
+    layout.consumed_ack_slots_offset =
+        reserve(static_cast<uint64_t>(kMaxDeviceCollectiveChannels) *
+                    max_group_size * sizeof(uint64_t),
+                alignof(uint64_t));
+    layout.size = reserve(0, kGroupResourceAlignment);
 
     layout.max_group_size = max_group_size;
     return layout;
@@ -255,7 +252,6 @@ DeviceCollectiveRuntime::ControlSliceLayout::bind(
             DeviceCollectivePeerTable{
                 .entries = reinterpret_cast<DeviceCollectivePeerBinding*>(
                     control_base + peers_offset),
-                .max_group_size = max_group_size,
             },
         .send_buffer = send_buffer,
         .recv_buffer = recv_buffer,
@@ -347,7 +343,7 @@ void DeviceCollectiveRuntime::releaseHostControl() noexcept {
 
 PGResult<void> DeviceCollectiveRuntime::publishPlan(
     DeviceAllReducePlanImage plan, bool reset_protocol_state) {
-    PG_TRY(validatePlanImage(plan, layout_.max_group_size));
+    assertValidPlanImage(plan, layout_.max_group_size);
     PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
     auto& update = host_control_->plan_staging;
     update.plan = plan;
@@ -368,8 +364,7 @@ PGResult<void> DeviceCollectiveRuntime::publishPlan(
             update.initial_step_sequences.size() * sizeof(uint64_t),
             cudaMemcpyHostToDevice, control_stream_.get()));
     }
-    PG_TRY_CUDA(cudaMemcpyAsync(const_cast<DeviceAllReducePlanImage*>(
-                                    kernel_resources_.all_reduce_plan),
+    PG_TRY_CUDA(cudaMemcpyAsync(kernel_resources_.all_reduce_plan,
                                 &update.plan, sizeof(update.plan),
                                 cudaMemcpyHostToDevice, control_stream_.get()));
     PG_TRY(drain.finish());
@@ -404,54 +399,36 @@ PGResult<void> DeviceCollectiveRuntime::recoverFailure(uint64_t generation) {
     // The peer signal may time out while an outgoing HostProxy command is
     // still in flight. The parked kernel owns the shared buffers, so this
     // dedicated worker can wait here without introducing a retry state.
-    PG_TRY(transfer_service_.waitUntilIdle(device_index_));
+    PG_TRY(transfer_service_.waitUntilIdle());
 
-    DeviceCollectiveFailure failure{
-        .generation = generation,
-        .error = static_cast<DeviceCollectiveKernelError>(recovery.error_code),
-        .failed_rank = recovery.failed_rank,
-        .view_epoch = recovery.view_epoch,
-        .peer_still_reachable = false,
-    };
+    const auto failed_rank = recovery.failed_rank;
     PG_ASSERT(
-        failure.error == DeviceCollectiveKernelError::IncomingTransferTimedOut,
-        "device collective recovery received a non-transfer failure");
-    PG_ASSERT(
-        failure.failed_rank >= 0 &&
-            static_cast<uint32_t>(failure.failed_rank) < layout_.max_group_size,
+        failed_rank >= 0 &&
+            static_cast<uint32_t>(failed_rank) < layout_.max_group_size,
         "device collective transfer failure has an invalid peer rank");
 
     if (recovery.failed_hint_address != 0) {
-        PG_ASSERT(static_cast<uint32_t>(failure.failed_rank) <
-                      recovery.failed_hint_count,
-                  "device collective failed-ranks hint is too small");
         auto* hint = reinterpret_cast<int32_t*>(recovery.failed_hint_address);
-        hint[failure.failed_rank] = 1;
+        hint[failed_rank] = 1;
     }
 
-    auto recovered = [&]() -> PGResult<void> {
-        const auto& peer =
-            host_control_->peer_binding_staging[failure.failed_rank];
-        PG_ASSERT(peer.peer_idx != UINT32_MAX,
-                  "device collective transfer failure has no peer endpoint");
-        PG_TRY(failure.peer_still_reachable,
-               transfer_service_.markRouteFailed(device_index_, peer.peer_idx));
-        return recovery_handler_(failure);
-    }();
+    auto recovered = recovery_handler_(failed_rank);
 
     if (!recovered.has_value()) {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto blocked_plan = host_plan_;
-        blocked_plan.status = DeviceCollectivePlanStatus::Blocked;
-        auto blocked = publishPlan(blocked_plan, false);
-        if (!blocked.has_value()) {
+        auto unavailable_plan = host_plan_;
+        unavailable_plan.status = DeviceCollectivePlanStatus::Unavailable;
+        auto unavailable = publishPlan(unavailable_plan, false);
+        if (!unavailable.has_value()) {
             return makePGError(
                 PGErrorCode::SystemError,
-                "device collective recovery failed and a Blocked Plan "
+                "device collective recovery failed and an unavailable Plan "
                 "could not be published: " +
-                    recovered.error().message + "; " + blocked.error().message);
+                    recovered.error().message + "; " +
+                    unavailable.error().message);
         }
-        LOG(ERROR) << "device collective recovery failed; Plan was blocked: "
+        LOG(ERROR) << "device collective recovery failed; Plan was made "
+                      "unavailable: "
                    << recovered.error().message;
     }
 
@@ -480,8 +457,8 @@ DeviceCollectiveRuntime::create(DeviceTransferService& transfer_service,
 
     PG_TRY(auto timeout_ticks,
            timeoutTicks(device_index, collective_timeout_us));
-    PG_TRY(auto layout, ControlSliceLayout::make(max_group_size));
-    PG_TRY(auto transfer_handle, transfer_service.deviceHandle(device_index));
+    auto layout = ControlSliceLayout::make(max_group_size);
+    const auto* transfer_handle = transfer_service.deviceHandle();
     PG_TRY(auto control_slice,
            arena.allocate(layout.size, kGroupResourceAlignment));
     {
@@ -539,25 +516,26 @@ const DeviceCollectiveEndpoint& DeviceCollectiveRuntime::localEndpoint() const {
     return endpoint_;
 }
 
-PGResult<void> DeviceCollectiveRuntime::useLocalOnly(uint64_t view_epoch,
-                                                     InGroupRank self_rank) {
+PGResult<void> DeviceCollectiveRuntime::useLocalOnly(InGroupRank self_rank) {
     std::lock_guard<std::mutex> lock(mutex_);
     PG_VALIDATE_STATE(!shutdown_requested_ && !shutdown_complete_,
                       "device collective runtime is shutting down");
 
-    auto blocked = host_plan_;
-    blocked.status = DeviceCollectivePlanStatus::Blocked;
-    blocked.view_epoch = view_epoch;
-    PG_TRY(publishPlan(blocked, false));
+    PG_ASSERT(self_rank >= 0 && static_cast<uint32_t>(self_rank) <
+                                        layout_.max_group_size,
+              "local-only group rank is out of range");
 
-    PG_VALIDATE_ARG(self_rank >= 0 && static_cast<uint32_t>(self_rank) <
-                                          layout_.max_group_size,
-                    "local-only group rank is out of range");
+    // Gate host submission before changing any device-visible state. If either
+    // publication below fails, enqueueAllReduce() must not reuse the previous
+    // Ready Plan with partially updated control data.
+    auto unavailable = host_plan_;
+    unavailable.status = DeviceCollectivePlanStatus::Unavailable;
+    host_plan_.status = DeviceCollectivePlanStatus::Unavailable;
+    PG_TRY(publishPlan(unavailable, false));
 
     return publishPlan(
         DeviceAllReducePlanImage{
             .status = DeviceCollectivePlanStatus::Ready,
-            .view_epoch = view_epoch,
             .self_rank = self_rank,
             .self_active_index = 0,
             .participant_count = 1,
@@ -573,16 +551,17 @@ PGResult<void> DeviceCollectiveRuntime::materializeGroupView(
     PG_VALIDATE_STATE(!shutdown_requested_ && !shutdown_complete_,
                       "device collective runtime is shutting down");
 
-    // No device kernel may observe a partially materialized view. Every
-    // successful path below ends by publishing a complete Ready/Inactive Plan;
-    // every failure leaves this Blocked image in place.
-    auto blocked = host_plan_;
-    blocked.status = DeviceCollectivePlanStatus::Blocked;
-    blocked.view_epoch = view.epoch;
-    PG_TRY(publishPlan(blocked, false));
+    PG_ASSERT(view.rank_order.size() <= layout_.max_group_size,
+              "GroupView exceeds device collective capacity");
 
-    PG_VALIDATE_ARG(view.rank_order.size() <= layout_.max_group_size,
-                    "GroupView exceeds device collective capacity");
+    // Keep the old Plan unavailable throughout the update. Peer bindings and
+    // protocol state are published separately, so a failed update must never
+    // leave the old Ready Plan paired with a partial new view.
+    auto unavailable = host_plan_;
+    unavailable.status = DeviceCollectivePlanStatus::Unavailable;
+    host_plan_.status = DeviceCollectivePlanStatus::Unavailable;
+    PG_TRY(publishPlan(unavailable, false));
+
     std::fill_n(host_control_->peer_binding_staging.data(),
                 layout_.max_group_size, DeviceCollectivePeerBinding{});
 
@@ -593,24 +572,22 @@ PGResult<void> DeviceCollectiveRuntime::materializeGroupView(
     for (size_t peer_rank = 0; peer_rank < view.rank_order.size();
          ++peer_rank) {
         const auto global_rank = view.rank_order[peer_rank];
-        PG_VALIDATE_ARG(global_rank >= 0 && static_cast<size_t>(global_rank) <
-                                                view.members.size(),
-                        "GroupView contains an invalid global rank");
+        PG_ASSERT(global_rank >= 0 && static_cast<size_t>(global_rank) <
+                                          view.members.size(),
+                  "GroupView contains an invalid global rank");
         const auto& member = view.members[global_rank];
         const bool valid_binding =
             member.endpoint && member.endpoint->device_collective &&
             validDeviceCollectiveControlRange(
                 *member.endpoint->device_collective, layout_.size);
-        PG_VALIDATE_STATE(!member.isActive() || valid_binding,
-                          "active device collective peer has no valid control "
-                          "range");
+        PG_ASSERT(!member.isActive() || valid_binding,
+                  "active device collective peer has no valid control range");
         if (valid_binding) {
             const auto& endpoint = *member.endpoint->device_collective;
             host_control_->peer_binding_staging[peer_rank] =
                 DeviceCollectivePeerBinding{
                     .peer_idx = static_cast<uint32_t>(global_rank),
                     .remote_control_offset = endpoint.control_offset,
-                    .remote_control_size = endpoint.control_size,
                 };
         }
     }
@@ -618,13 +595,12 @@ PGResult<void> DeviceCollectiveRuntime::materializeGroupView(
     {
         PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
         GpuStreamDrainGuard drain(control_stream_);
-        PG_TRY_CUDA(
-            cudaMemcpyAsync(const_cast<DeviceCollectivePeerBinding*>(
-                                kernel_resources_.peers.entries),
-                            host_control_->peer_binding_staging.data(),
-                            static_cast<size_t>(layout_.max_group_size) *
-                                sizeof(DeviceCollectivePeerBinding),
-                            cudaMemcpyHostToDevice, control_stream_.get()));
+        PG_TRY_CUDA(cudaMemcpyAsync(
+            kernel_resources_.peers.entries,
+            host_control_->peer_binding_staging.data(),
+            static_cast<size_t>(layout_.max_group_size) *
+                sizeof(DeviceCollectivePeerBinding),
+            cudaMemcpyHostToDevice, control_stream_.get()));
         PG_TRY(drain.finish());
     }
 
@@ -643,15 +619,14 @@ PGResult<void> DeviceCollectiveRuntime::materializeGroupView(
             active_ranks.push_back(static_cast<InGroupRank>(group_rank));
         }
     }
-    PG_VALIDATE_STATE(self_rank >= 0, "local rank is absent from GroupView");
+    PG_ASSERT(self_rank >= 0, "local rank is absent from GroupView");
 
     const auto self =
         std::find(active_ranks.begin(), active_ranks.end(), self_rank);
     if (self == active_ranks.end()) {
         return publishPlan(
             DeviceAllReducePlanImage{
-                .status = DeviceCollectivePlanStatus::Inactive,
-                .view_epoch = view.epoch,
+                .status = DeviceCollectivePlanStatus::Unavailable,
                 .self_rank = self_rank,
             },
             true);
@@ -667,7 +642,6 @@ PGResult<void> DeviceCollectiveRuntime::materializeGroupView(
     return publishPlan(
         DeviceAllReducePlanImage{
             .status = DeviceCollectivePlanStatus::Ready,
-            .view_epoch = view.epoch,
             .self_rank = self_rank,
             .self_active_index = static_cast<int32_t>(active_index),
             .participant_count = static_cast<uint32_t>(participant_count),
@@ -700,8 +674,8 @@ PGResult<void> DeviceCollectiveRuntime::enableRecovery(
 
 PGResult<void> DeviceCollectiveRuntime::enqueueAllReduce(
     const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
-    ReduceOp op, cudaStream_t user_stream_handle, int32_t* failed_ranks_hint,
-    size_t failed_ranks_hint_count) {
+    ReduceOp op, cudaStream_t user_stream_handle,
+    int32_t* failed_ranks_hint) {
 #ifndef USE_CUDA
     (void)send_buffer;
     (void)recv_buffer;
@@ -710,7 +684,6 @@ PGResult<void> DeviceCollectiveRuntime::enqueueAllReduce(
     (void)op;
     (void)user_stream_handle;
     (void)failed_ranks_hint;
-    (void)failed_ranks_hint_count;
     return makePGError(PGErrorCode::NotSupported,
                        "device collectives initially require CUDA");
 #else
@@ -744,41 +717,50 @@ PGResult<void> DeviceCollectiveRuntime::enqueueAllReduce(
     auto user_stream = GpuStream::borrow(user_stream_handle, device_index_);
     PG_TRY(auto capture, user_stream.captureInfo());
     PG_TRY(attachGraphUse(capture));
-    PG_TRY(auto order_stream, strong_stream_.acquire(capture));
+    PG_TRY(auto order_lease, strong_stream_.acquire(capture));
+    const auto& order_stream = order_lease.stream();
 
-    // Keep the kernel on the user-provided stream
-    PG_TRY(handoff_event_.record(order_stream));
-    PG_TRY(user_stream.waitEvent(handoff_event_));
+    cudaError_t launch_error = cudaSuccess;
+    auto submitted = [&]() -> PGResult<void> {
+        // Keep the kernel on the user-provided stream.
+        PG_TRY(handoff_event_.record(order_stream));
+        PG_TRY(user_stream.waitEvent(handoff_event_));
 
-    const auto launch_error = launchDeviceAllReduceKernel(
-        DeviceAllReduceKernelArgs{
-            .send_buffer = send_buffer,
-            .recv_buffer = recv_buffer,
-            .count = static_cast<uint64_t>(count),
-            .datatype = datatype,
-            .channel_count = chooseChannelCount(buffer_size),
-            // A captured node can outlive the Work object that owns this raw
-            // host pointer. V1 deliberately keeps Graph failure reporting in
-            // the PG-owned mailbox instead of retaining caller memory.
-            .failed_ranks_hint = capture.active ? nullptr : failed_ranks_hint,
-            .failed_ranks_hint_count =
-                capture.active
-                    ? 0
-                    : static_cast<uint32_t>(std::min<size_t>(
-                          failed_ranks_hint_count, layout_.max_group_size)),
-        },
-        kernel_resources_, user_stream.get());
+        launch_error = launchDeviceAllReduceKernel(
+            DeviceAllReduceKernelArgs{
+                .send_buffer = send_buffer,
+                .recv_buffer = recv_buffer,
+                .count = static_cast<uint64_t>(count),
+                .datatype = datatype,
+                .channel_count = chooseChannelCount(buffer_size),
+                // A captured node can outlive the Work object that owns this raw
+                // host pointer. V1 deliberately keeps Graph failure reporting in
+                // the PG-owned mailbox instead of retaining caller memory.
+                .failed_ranks_hint = capture.active ? nullptr
+                                                    : failed_ranks_hint,
+            },
+            kernel_resources_, user_stream.get());
 
-    PG_TRY(handoff_event_.record(user_stream));
-    PG_TRY(order_stream.waitEvent(handoff_event_));
-    PG_TRY(strong_stream_.release(capture));
+        PG_TRY(handoff_event_.record(user_stream));
+        PG_TRY(order_stream.waitEvent(handoff_event_));
+        return {};
+    }();
+
+    // release() clears StrongStream's acquire state even when publishing its
+    // final event fails. Always call it before propagating a submission error.
+    auto released = order_lease.release();
+    if (!submitted.has_value()) {
+        auto error = std::move(submitted).error();
+        if (!released.has_value()) {
+            error.message += "; StrongStream release also failed: " +
+                             released.error().message;
+        }
+        return makePGError(std::move(error));
+    }
+    PG_TRY(released);
     PG_TRY_CUDA(launch_error);
     return {};
 #endif
-}
-
-size_t DeviceCollectiveRuntime::liveGraphUses() const noexcept {
-    return live_graph_uses_.load(std::memory_order_acquire);
 }
 
 PGResult<void> DeviceCollectiveRuntime::shutdown(

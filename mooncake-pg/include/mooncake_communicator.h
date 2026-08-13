@@ -77,8 +77,6 @@ struct MooncakePGContext {
     int64_t p2p_timeout_us = kDefaultP2PTimeoutUs;
     int64_t fault_reconciliation_window_us =
         kDefaultFaultReconciliationWindowUs;
-    size_t device_arena_size = kDefaultDeviceArenaSize;
-
     std::unique_ptr<TransferEngine> owned_engine =
         std::make_unique<TransferEngine>(true);
     TransferEngine* engine = owned_engine.get();
@@ -116,7 +114,6 @@ struct MooncakePGContext {
     PGResult<void> setHostIp(std::string value);
     PGResult<void> setExternalEngine(TransferEngine* transfer_engine);
     PGResult<void> setDeviceFilter(std::vector<std::string> filters);
-    PGResult<void> setDeviceArenaSize(size_t size);
     PGResult<void> setCollectiveTimeout(size_t timeout_us);
     PGResult<void> setP2PTimeout(int64_t timeout_us);
     PGResult<void> setFaultReconciliationWindow(int64_t timeout_us);
@@ -281,8 +278,6 @@ class MooncakeCommunicator {
     PGResult<void> applyViewUpdate(
         const GroupView& view, const std::vector<RankState>& rank_states,
         const std::vector<uint64_t>& rank_epochs,
-        const std::vector<std::optional<DeviceTransferEndpoint>>&
-            transfer_service_endpoints,
         const std::vector<bool>& activatable,
         bool materialize_device_collective_view);
     // Called by AgentHost when a TE link to a peer comes back up.

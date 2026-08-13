@@ -1,11 +1,10 @@
 #ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_TRANSFER_ROUTES_HOST_PROXY_ROUTE_HOST_PROXY_ROUTE_H
 #define MOONCAKE_PG_DEVICE_COMM_DEVICE_TRANSFER_ROUTES_HOST_PROXY_ROUTE_HOST_PROXY_ROUTE_H
 
-#include <chrono>
 #include <cstdint>
 #include <optional>
 
-#include "device_comm/device_transfer/transfer_endpoint.h"
+#include "control_plane/control_types.h"
 #include "error_types.h"
 
 namespace mooncake {
@@ -23,17 +22,15 @@ class HostProxyRoute {
     PGResult<void> initialize(int device_index);
     [[nodiscard]] HostProxyCommandSlot* deviceCommandSlots() const noexcept;
 
-    PGResult<void> installPeerEndpoint(
+    void installPeerEndpoint(
         uint32_t peer_index, const std::optional<HostProxyEndpoint>& endpoint);
 
     PGResult<void> waitUntilIdle();
-    PGResult<void> waitUntilIdle(std::chrono::milliseconds timeout);
     PGResult<void> shutdown();
 
    private:
     HostTransferProxy& proxy_;
     HostProxyCommandSlot* device_slots_ = nullptr;
-    int device_index_ = -1;
     bool initialized_ = false;
 };
 

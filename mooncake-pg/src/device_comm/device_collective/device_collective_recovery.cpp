@@ -105,12 +105,7 @@ void DeviceCollectiveRecoveryWorker::run() noexcept {
 DeviceCollectiveRecoveryWorker::DeviceCollectiveRecoveryWorker() = default;
 
 DeviceCollectiveRecoveryWorker::~DeviceCollectiveRecoveryWorker() noexcept {
-    auto result = shutdown();
-    if (!result.has_value()) {
-        LOG(ERROR) << "DeviceCollectiveRecoveryWorker shutdown failed during "
-                      "destruction: "
-                   << result.error().message;
-    }
+    shutdown();
 }
 
 PGResult<void> DeviceCollectiveRecoveryWorker::start() {
@@ -175,10 +170,10 @@ void DeviceCollectiveRecoveryWorker::removeMailbox(
     });
 }
 
-PGResult<void> DeviceCollectiveRecoveryWorker::shutdown() {
+void DeviceCollectiveRecoveryWorker::shutdown() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (stop_requested_) return {};
+        if (stop_requested_) return;
         if (!mailboxes_.empty() || active_mailbox_) {
             LOG(ERROR)
                 << "DeviceCollectiveRecoveryWorker is shutting down with "
@@ -190,7 +185,6 @@ PGResult<void> DeviceCollectiveRecoveryWorker::shutdown() {
     if (worker_.joinable()) worker_.join();
     std::lock_guard<std::mutex> lock(mutex_);
     mailboxes_.clear();
-    return {};
 }
 
 }  // namespace mooncake

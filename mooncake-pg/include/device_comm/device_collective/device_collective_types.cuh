@@ -20,18 +20,13 @@ inline constexpr size_t kDeviceCollectiveWorkspaceSize =
     2 * kDeviceCollectiveTransferBufferSize;
 
 enum class DeviceCollectivePlanStatus : uint32_t {
-    Ready = 0,
-    Inactive = 1,
-    Blocked = 2,
-};
-
-enum class DeviceCollectiveKernelError : int32_t {
-    IncomingTransferTimedOut = 0,
+    Unavailable = 0,
+    Ready = 1,
 };
 
 struct DeviceAllReducePlanImage {
-    DeviceCollectivePlanStatus status = DeviceCollectivePlanStatus::Blocked;
-    uint64_t view_epoch = 0;
+    DeviceCollectivePlanStatus status =
+        DeviceCollectivePlanStatus::Unavailable;
 
     InGroupRank self_rank = kInvalidInGroupRank;
     int32_t self_active_index = -1;
@@ -44,19 +39,15 @@ struct DeviceAllReducePlanImage {
 // The device publishes a new failure generation only after every active
 // channel CTA has stopped touching the old Plan, peer map, and shared buffers.
 // Host publishes the matching ready generation after recovery has applied a
-// usable view or blocked the Plan.
+// usable or unavailable Plan.
 struct alignas(64) DeviceCollectiveRecoveryMailbox {
     uint64_t failure_generation = 0;
     uint64_t ready_generation = 0;
 
-    int32_t error_code = 0;
-    // The diagnostics below are valid only while failure_generation is newer
-    // than ready_generation. Every published failure names a concrete peer.
+    // The failure data below is valid only while failure_generation is newer
+    // than ready_generation.
     InGroupRank failed_rank = 0;
-    uint64_t view_epoch = 0;
     uint64_t failed_hint_address = 0;
-    uint32_t failed_hint_count = 0;
-    uint32_t reserved = 0;
 };
 
 // Device-only rendezvous reused by serialized invocations. Each channel CTA
@@ -103,14 +94,11 @@ struct DeviceCollectiveSignalTable {
 // communicator-specific remote control range inside that peer's region.
 struct DeviceCollectivePeerBinding {
     uint32_t peer_idx = UINT32_MAX;
-    uint32_t reserved = 0;
     uint64_t remote_control_offset = 0;
-    uint64_t remote_control_size = 0;
 };
 
 struct DeviceCollectivePeerTable {
-    const DeviceCollectivePeerBinding* entries = nullptr;
-    uint32_t max_group_size = 0;
+    DeviceCollectivePeerBinding* entries = nullptr;
 };
 
 struct DeviceCollectiveTransferBuffer {
@@ -130,7 +118,7 @@ struct DeviceCollectiveKernelResources {
     DeviceCollectiveTransferBuffer recv_buffer;
     uint64_t timeout_ticks = 0;
 
-    const DeviceAllReducePlanImage* all_reduce_plan = nullptr;
+    DeviceAllReducePlanImage* all_reduce_plan = nullptr;
     uint64_t* next_step_sequences = nullptr;
     DeviceCollectiveInvocationState* invocation = nullptr;
     DeviceCollectiveRecoveryMailbox* recovery = nullptr;
@@ -146,7 +134,6 @@ struct DeviceAllReduceKernelArgs {
     DataType datatype = DataType::Float32;
     uint32_t channel_count = 1;
     int32_t* failed_ranks_hint = nullptr;
-    uint32_t failed_ranks_hint_count = 0;
 };
 
 // Implemented in device_collective.cu so ordinary host C++ never sees kernel

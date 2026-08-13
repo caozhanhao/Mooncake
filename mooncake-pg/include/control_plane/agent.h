@@ -15,8 +15,7 @@ namespace mooncake {
 // AgentStateMachine - Pure state machine for the control-plane client.
 class AgentStateMachine {
    public:
-    AgentStateMachine(GlobalRank rank, int max_world_size,
-                      DeviceTransferEndpoint local_transfer_endpoint);
+    AgentStateMachine(GlobalRank rank, int max_world_size);
 
     void unregisterGroup(GroupId group_id);
 
@@ -60,14 +59,9 @@ class AgentStateMachine {
         return self_rank_epoch_.load(std::memory_order_acquire);
     }
 
-    const DeviceTransferEndpoint& localTransferEndpoint() const noexcept {
-        return local_transfer_endpoint_;
-    }
-
    private:
     GlobalRank rank_;
     int max_world_size_;
-    DeviceTransferEndpoint local_transfer_endpoint_;
 
     std::atomic<uint64_t> agent_session_id_{0};
     std::atomic<uint64_t> self_rank_epoch_{0};

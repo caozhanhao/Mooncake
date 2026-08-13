@@ -14,7 +14,7 @@
 #include <transfer_engine.h>
 
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_types.cuh"
-#include "device_comm/device_transfer/transfer_endpoint.h"
+#include "control_plane/control_types.h"
 #include "error_types.h"
 
 namespace mooncake {
@@ -32,15 +32,14 @@ class HostTransferProxy {
 
     PGResult<void> start();
 
-    // Create the fixed command-slot set used by one transfer-service device.
-    PGResult<HostProxyCommandSlot*> addDevice(int device_index);
+    // Create the fixed command-slot set used by the transfer-service device.
+    PGResult<HostProxyCommandSlot*> initializeDevice(int device_index);
 
-    PGResult<void> installPeerEndpoint(
+    void installPeerEndpoint(
         uint32_t peer_index, const std::optional<HostProxyEndpoint>& endpoint);
 
-    PGResult<void> waitUntilIdle(int device_index);
-    PGResult<void> waitUntilIdle(int device_index,
-                                 std::chrono::milliseconds timeout);
+    PGResult<void> waitUntilIdle();
+    PGResult<void> waitUntilIdle(std::chrono::milliseconds timeout);
     PGResult<void> shutdown();
 
    private:
@@ -53,15 +52,14 @@ class HostTransferProxy {
         Failed,
     };
 
-    // These helpers inspect collections protected by mutex_.
-    LaneSet* findLaneSet(int device_index) const noexcept;
-    void releaseLaneSets() noexcept;
+    // These helpers inspect state protected by mutex_.
+    void releaseLaneSet() noexcept;
 
     static uint64_t loadSubmitted(const Lane& lane);
     static uint64_t loadCompleted(const Lane& lane);
     static bool laneIdle(const Lane& lane);
     static bool laneSetIdle(const LaneSet& lane_set);
-    bool allLaneSetsIdle() const;
+    bool lanesIdle() const;
     std::optional<TransferMetadata::SegmentID> resolvePeer(uint32_t peer_index);
     void closePeerSegments() noexcept;
 
@@ -88,7 +86,7 @@ class HostTransferProxy {
     std::vector<Peer> peers_;
     mutable std::mutex mutex_;
     std::condition_variable state_changed_;
-    std::vector<std::unique_ptr<LaneSet>> lane_sets_;
+    std::unique_ptr<LaneSet> lane_set_;
     std::thread worker_;
     bool started_ = false;
     bool stop_requested_ = false;

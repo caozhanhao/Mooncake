@@ -68,13 +68,12 @@ void DeviceArenaSlice::moveFrom(DeviceArenaSlice&& other) noexcept {
     size_ = std::exchange(other.size_, 0);
 }
 
-PGResult<std::unique_ptr<DeviceArena>> DeviceArena::create(int device_index,
-                                                           void* base,
-                                                           size_t arena_size) {
-    PG_VALIDATE_ARG(device_index >= 0, "invalid DeviceArena CUDA device");
-    PG_VALIDATE_ARG(base, "DeviceArena base address is null");
-    PG_VALIDATE_ARG(arena_size != 0, "DeviceArena size must be positive");
-    PG_VALIDATE_ARG(
+std::unique_ptr<DeviceArena> DeviceArena::create(int device_index, void* base,
+                                                 size_t arena_size) {
+    PG_ASSERT(device_index >= 0, "invalid DeviceArena CUDA device");
+    PG_ASSERT(base, "DeviceArena base address is null");
+    PG_ASSERT(arena_size != 0, "DeviceArena size must be positive");
+    PG_ASSERT(
         !addOverflows(reinterpret_cast<uintptr_t>(base), arena_size),
         "DeviceArena address range overflows");
 
@@ -90,13 +89,14 @@ DeviceArena::DeviceArena(int device_index, void* base,
 }
 
 DeviceArena::~DeviceArena() noexcept {
-    auto result = close();
-    if (result.has_value()) return;
-
-    // A slice stores its owning Arena address. Continuing destruction here
-    // would turn every remaining slice into a dangling owner pointer.
-    LOG(FATAL) << "DeviceArena destroyed with live slices: "
-               << result.error().message;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!allocations_.empty()) {
+        // A slice stores its owning Arena address. Continuing destruction here
+        // would turn every remaining slice into a dangling owner pointer.
+        LOG(FATAL) << "DeviceArena destroyed with live slices";
+    }
+    base_ = nullptr;
+    closed_ = true;
 }
 
 PGResult<DeviceArenaSlice> DeviceArena::allocate(size_t size,
@@ -134,14 +134,7 @@ PGResult<DeviceArenaSlice> DeviceArena::allocate(size_t size,
 
 void* DeviceArena::base() const noexcept { return base_; }
 
-size_t DeviceArena::size() const noexcept { return arena_size_; }
-
 int DeviceArena::deviceIndex() const noexcept { return device_index_; }
-
-size_t DeviceArena::allocationCount() const noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return allocations_.size();
-}
 
 void DeviceArena::release(uint64_t offset) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -172,15 +165,13 @@ void DeviceArena::release(uint64_t offset) noexcept {
     free_ranges_.emplace(begin, size);
 }
 
-PGResult<void> DeviceArena::close() {
+void DeviceArena::close() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (closed_) return {};
-    PG_VALIDATE_STATE(allocations_.empty(),
-                      "DeviceArena still has live slices");
+    if (closed_) return;
+    PG_ASSERT(allocations_.empty(), "DeviceArena still has live slices");
 
     base_ = nullptr;
     closed_ = true;
-    return {};
 }
 
 }  // namespace mooncake

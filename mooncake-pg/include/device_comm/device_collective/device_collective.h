@@ -8,7 +8,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <vector>
 
 #include "common_types.h"
@@ -24,18 +23,9 @@ namespace mooncake {
 
 class StrongStream;
 
-struct DeviceCollectiveFailure {
-    uint64_t generation;
-    DeviceCollectiveKernelError error;
-    InGroupRank failed_rank;
-    uint64_t view_epoch;
-    bool peer_still_reachable;
-};
-
 class DeviceCollectiveRuntime {
    public:
-    using RecoveryHandler =
-        std::function<PGResult<void>(const DeviceCollectiveFailure&)>;
+    using RecoveryHandler = std::function<PGResult<void>(InGroupRank)>;
 
     static PGResult<std::unique_ptr<DeviceCollectiveRuntime>> create(
         DeviceTransferService& transfer_service, DeviceArena& arena,
@@ -50,7 +40,7 @@ class DeviceCollectiveRuntime {
 
     [[nodiscard]] const DeviceCollectiveEndpoint& localEndpoint() const;
 
-    PGResult<void> useLocalOnly(uint64_t view_epoch, InGroupRank self_rank);
+    PGResult<void> useLocalOnly(InGroupRank self_rank);
     PGResult<void> materializeGroupView(const GroupView& view);
 
     PGResult<void> enableRecovery(DeviceCollectiveRecoveryWorker& worker,
@@ -60,10 +50,8 @@ class DeviceCollectiveRuntime {
                                     size_t count, DataType datatype,
                                     ReduceOp op,
                                     cudaStream_t user_stream_handle,
-                                    int32_t* failed_ranks_hint,
-                                    size_t failed_ranks_hint_count);
+                                    int32_t* failed_ranks_hint);
 
-    [[nodiscard]] size_t liveGraphUses() const noexcept;
     PGResult<void> shutdown(std::chrono::milliseconds eager_timeout);
 
    private:
@@ -82,7 +70,7 @@ class DeviceCollectiveRuntime {
         uint64_t consumed_ack_slots_offset = 0;
         uint32_t max_group_size = 0;
 
-        static PGResult<ControlSliceLayout> make(uint32_t max_group_size);
+        static ControlSliceLayout make(uint32_t max_group_size);
 
         [[nodiscard]] DeviceCollectiveKernelResources bind(
             void* control_addr, uint64_t control_region_offset,

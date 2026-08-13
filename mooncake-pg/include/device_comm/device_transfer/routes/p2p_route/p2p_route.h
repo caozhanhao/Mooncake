@@ -32,13 +32,10 @@ class P2pRoute {
 
     [[nodiscard]] std::optional<uint64_t> resolve(uint32_t peer_index) const;
 
-    void invalidate(uint32_t peer_index);
-
    private:
     struct PeerMapping {
         std::vector<int32_t> ipc_handle;
         uint64_t remote_region_address = 0;
-        bool disabled = false;
     };
 
     device::P2pTransport& transport_;

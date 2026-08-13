@@ -168,8 +168,6 @@ MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgContextSetTransferEngine(
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgContextSetDeviceFilter(
     mooncakePgContext_t context, const char* const* filters,
     size_t filterCount);
-MOONCAKE_PG_EXPORT mooncakePgResult_t
-mooncakePgContextSetDeviceArenaSize(mooncakePgContext_t context, size_t size);
 MOONCAKE_PG_EXPORT mooncakePgResult_t mooncakePgContextSetCollectiveTimeout(
     mooncakePgContext_t context, size_t timeoutUs);
 MOONCAKE_PG_EXPORT mooncakePgResult_t
