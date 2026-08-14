@@ -14,7 +14,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-#include "comm_types.h"
+#include "common_types.h"
 #include "error_types.h"
 
 using namespace mooncake;
@@ -461,10 +461,12 @@ mooncakePgResult_t mooncakePgCommCreate(mooncakePgContext_t context,
 
 mooncakePgResult_t mooncakePgCommDestroy(mooncakePgComm_t comm) {
     return asCApiResult([&]() -> PGResult<void> {
-        std::unique_ptr<mooncakePgComm> holder(comm);
-        if (holder && holder->impl) {
-            return holder->impl->shutdown();
+        // Keep ownership with the caller until shutdown succeeds so the same
+        // handle remains valid for retry after an error or exception.
+        if (comm && comm->impl) {
+            PG_TRY(comm->impl->shutdown());
         }
+        delete comm;
         return {};
     });
 }

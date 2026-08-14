@@ -709,11 +709,15 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
 
 void MooncakeBackend::shutdown() {
     if (isShutdown_) return;
-    isShutdown_ = true;
-    auto comm = std::exchange(comm_, nullptr);
-    const auto result = comm ? mooncakePgCommDestroy(comm) : mooncakePgSuccess;
+    if (comm_) {
+        // A captured CUDA Graph may still reference the communicator. The C
+        // API leaves the handle valid on ResourceBusy, so do not discard it
+        // until destruction has actually succeeded.
+        checkResult(mooncakePgCommDestroy(comm_), "mooncakePgCommDestroy");
+        comm_ = nullptr;
+    }
     work_tracker_->shutdown();
-    checkResult(result, "mooncakePgCommDestroy");
+    isShutdown_ = true;
 }
 
 void MooncakeBackend::extendGroupSizeTo(int) {

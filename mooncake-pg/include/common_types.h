@@ -1,15 +1,25 @@
-#ifndef MOONCAKE_PG_COMM_TYPES_H
-#define MOONCAKE_PG_COMM_TYPES_H
+// Common types shared by host and device code.
+// Keep this header free of host-only facilities such as STL containers,
+// exceptions, and PGResult so device translation units can include it directly.
 
-#include <chrono>
+#ifndef MOONCAKE_PG_COMMON_TYPES_H
+#define MOONCAKE_PG_COMMON_TYPES_H
+
 #include <cstddef>
 #include <cstdint>
-#include <future>
-#include <utility>
-
-#include "error_types.h"
 
 namespace mooncake {
+
+// There are two rank namespaces that are easy to confuse:
+//
+//   * GlobalRank  - process-wide identifier, range 0 .. max_world_size-1.
+//   * InGroupRank - group-local identifier, range 0 .. group_size-1. A
+//                   GroupView maps it to GlobalRank through rank_order.
+using GlobalRank = int32_t;
+using InGroupRank = int32_t;
+
+inline constexpr GlobalRank kInvalidGlobalRank = -1;
+inline constexpr InGroupRank kInvalidInGroupRank = -1;
 
 enum class OpType : uint8_t {
     Unknown = 0,
@@ -47,8 +57,10 @@ enum class DataType : uint8_t {
     Float8e8m0fnu,
 };
 
-inline size_t elementSize(DataType dataType) {
-    switch (dataType) {
+// Returns zero for an invalid enum value. Public API validation is responsible
+// for rejecting such values before using the result in size arithmetic.
+inline constexpr std::size_t elementSize(DataType datatype) noexcept {
+    switch (datatype) {
         case DataType::Int8:
         case DataType::Uint8:
         case DataType::Bool:
@@ -72,8 +84,7 @@ inline size_t elementSize(DataType dataType) {
         case DataType::Float64:
             return 8;
     }
-    PG_ASSERT(false,
-              "unsupported Mooncake datatype: ", static_cast<int>(dataType));
+    return 0;
 }
 
 enum class ReduceOp : uint8_t {
@@ -84,39 +95,6 @@ enum class ReduceOp : uint8_t {
     Max = 4,
 };
 
-class WorkCompletion {
-   public:
-    explicit WorkCompletion(std::shared_future<void> completion)
-        : completion_(std::move(completion)) {}
-
-    bool isCompleted() const {
-        if (completion_.wait_for(std::chrono::microseconds(0)) !=
-            std::future_status::ready) {
-            return false;
-        }
-        completion_.get();
-        return true;
-    }
-
-    bool wait(std::chrono::microseconds timeout) const {
-        if (timeout.count() < 0) {
-            completion_.wait();
-        } else if (completion_.wait_for(timeout) != std::future_status::ready) {
-            return false;
-        }
-        completion_.get();
-        return true;
-    }
-
-   private:
-    std::shared_future<void> completion_;
-};
-
-struct CudaTaskSubmissionToken {
-    size_t task_id;
-    uint64_t sequence;
-};
-
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_COMM_TYPES_H
+#endif  // MOONCAKE_PG_COMMON_TYPES_H

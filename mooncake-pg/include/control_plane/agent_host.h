@@ -22,6 +22,7 @@ namespace mooncake {
 class RpcServer;
 class RpcClient;
 class MooncakeCommunicator;
+class DeviceTransferService;
 
 // =========================================================================
 // Control Plane Architecture (Agent side)
@@ -124,7 +125,9 @@ class AgentHost : public AgentInterface {
     static constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
 
     AgentHost(std::string coordinator_addr, const std::string& host_ip,
-              GlobalRank rank, int max_world_size, LinkManager& link_manager,
+              GlobalRank rank, int max_world_size,
+              DeviceTransferService& device_transfer_service,
+              LinkManager& link_manager,
               int64_t fault_reconciliation_window_us);
 
     ~AgentHost() override;
@@ -172,6 +175,7 @@ class AgentHost : public AgentInterface {
     AgentStateMachine agent_;
     SerializedExecutor executor_;
 
+    DeviceTransferService& device_transfer_service_;
     LinkManager& link_manager_;
 
     std::string host_ip_;

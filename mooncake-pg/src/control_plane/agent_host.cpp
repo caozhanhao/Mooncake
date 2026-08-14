@@ -9,6 +9,7 @@
 #include "mooncake_communicator.h"
 #include "control_plane/link_manager.h"
 #include "control_plane/rpc_runtime.h"
+#include "device_comm/device_transfer/transfer_service.h"
 #include "pg_utils.h"
 
 namespace mooncake {
@@ -52,10 +53,12 @@ void AgentRpcServiceImpl::onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
 
 AgentHost::AgentHost(std::string coordinator_addr, const std::string& host_ip,
                      GlobalRank rank, int max_world_size,
+                     DeviceTransferService& device_transfer_service,
                      LinkManager& link_manager,
                      int64_t fault_reconciliation_window_us)
     : agent_(rank, max_world_size),
       executor_("AgentHost"),
+      device_transfer_service_(device_transfer_service),
       link_manager_(link_manager),
       host_ip_(host_ip),
       rank_(rank),
@@ -492,6 +495,7 @@ void AgentHost::startAgentRegistration(bool start_new_session) {
     req.agent_addr = rpc_server_->getListenAddr(host_ip_);
     req.te_server_name = link_manager_.localServerName();
     req.warmup_recv_addr = link_manager_.getWarmupRecvAddr();
+    req.transfer_service_endpoint = device_transfer_service_.localEndpoint();
     req.agent_session_id = agent_session_id_;
     const uint64_t request_session_id = req.agent_session_id;
 
@@ -622,6 +626,10 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
     for (const auto& effect : effects) {
         std::visit(
             overloaded{
+                [this](const InstallDeviceTransferEndpoint& e) {
+                    PG_ASSERT_OK(device_transfer_service_.installPeerEndpoint(
+                        static_cast<uint32_t>(e.rank), e.endpoint));
+                },
                 [this](const EnablePeerProbe& e) {
                     link_manager_.enablePeerProbe(e.rank, e.rank_epoch,
                                                   e.te_server_name,
@@ -684,9 +692,9 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                 },
                 [this](const ApplyViewToCommunicator& e) {
                     withCommunicator(e.view.group_id, [&](auto communicator) {
-                        communicator->applyViewUpdate(e.view, e.rank_states,
-                                                      e.rank_epochs,
-                                                      e.activatable);
+                        communicator->applyViewUpdate(
+                            e.view, e.rank_states, e.rank_epochs, e.activatable,
+                            e.materialize_device_collective_view);
                     });
                 },
                 [this](const NotifyGroupReady& e) {

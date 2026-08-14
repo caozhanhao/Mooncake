@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -26,6 +27,7 @@ struct RegisterAgentRequest {
     std::string te_server_name;
     uint64_t agent_session_id = 0;
     uint64_t warmup_recv_addr = 0;
+    DeviceTransferEndpoint transfer_service_endpoint;
 };
 
 struct RankConnectionMetadata {
@@ -34,6 +36,7 @@ struct RankConnectionMetadata {
     std::string agent_addr;
     std::string te_server_name;
     uint64_t warmup_recv_addr = 0;
+    DeviceTransferEndpoint transfer_service_endpoint;
 };
 
 struct RegisterAgentResponse {
@@ -194,6 +197,7 @@ struct PeerJoinedPush {
     uint64_t rank_epoch = 0;
     std::string te_server_name;
     uint64_t warmup_recv_addr = 0;
+    DeviceTransferEndpoint transfer_service_endpoint;
 };
 
 struct RankStatePush {
@@ -247,6 +251,11 @@ using CoordinatorEffect =
 
 // Agent effects
 
+struct InstallDeviceTransferEndpoint {
+    GlobalRank rank = kInvalidGlobalRank;
+    DeviceTransferEndpoint endpoint;
+};
+
 struct EnablePeerProbe {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t rank_epoch = 0;
@@ -279,6 +288,10 @@ struct ApplyViewToCommunicator {
     std::vector<RankState> rank_states;
     std::vector<uint64_t> rank_epochs;
     std::vector<bool> activatable;
+
+    // Rank-state pushes refresh only the communicator's host mirrors. A
+    // GroupView apply also materializes the device collective Plan.
+    bool materialize_device_collective_view = false;
 };
 
 struct ResetPeerState {
@@ -303,11 +316,11 @@ struct NotifyRanksActivated {
 };
 
 using AgentEffect =
-    std::variant<EnablePeerProbe, DisconnectLink, RequestLinkHealthCheck,
-                 SendLinkEventReport, StopReconnect, DisconnectAllLinks,
-                 ClearAllPeerMetadata, ApplyViewToCommunicator, ResetPeerState,
-                 RefreshPeerLink, NotifyLinkRefreshed, NotifyGroupReady,
-                 NotifyRanksActivated>;
+    std::variant<InstallDeviceTransferEndpoint, EnablePeerProbe, DisconnectLink,
+                 RequestLinkHealthCheck, SendLinkEventReport, StopReconnect,
+                 DisconnectAllLinks, ClearAllPeerMetadata,
+                 ApplyViewToCommunicator, ResetPeerState, RefreshPeerLink,
+                 NotifyLinkRefreshed, NotifyGroupReady, NotifyRanksActivated>;
 
 // Results produced by the Coordinator/Agent state machine
 

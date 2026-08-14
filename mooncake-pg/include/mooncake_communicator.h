@@ -13,16 +13,22 @@
 
 #include <transfer_engine.h>
 
+#include "common_types.h"
 #include "control_plane/agent_host.h"
 #include "control_plane/coordinator_host.h"
 #include "control_plane/link_manager.h"
+#include "device_comm/device_arena.h"
+#include "device_comm/device_transfer/transfer_service.h"
+#include "device_comm/device_collective/device_collective_recovery.h"
 #include "error_types.h"
 #include "mooncake_pg.h"
 #include "mooncake_worker.cuh"
 #include "p2p_proxy.h"
-#include "comm_types.h"
 
 namespace mooncake {
+
+class DeviceCollectiveRuntime;
+class StrongStream;
 
 static constexpr size_t kDefaultCollectiveTimeoutUs = 10000000;  // 10 s
 static constexpr int64_t kDefaultP2PTimeoutUs = 10000000;        // 10 s
@@ -56,7 +62,14 @@ struct MooncakePGContext {
     std::unique_ptr<CoordinatorHost> coordinator_host;
     std::unique_ptr<AgentHost> agent_host;
 
-    MooncakePGContext() = default;
+    std::unique_ptr<DeviceTransferService> device_transfer_service;
+    std::unique_ptr<DeviceArena> device_arena;
+    std::optional<DeviceArenaSlice> device_collective_workspace;
+    std::unique_ptr<StrongStream> device_collective_strong_stream;
+    std::unique_ptr<DeviceCollectiveRecoveryWorker>
+        device_collective_recovery_worker;
+
+    MooncakePGContext();
     ~MooncakePGContext();
 
     // Non-copyable: engine points to either owned_engine or an external engine
@@ -234,7 +247,8 @@ class MooncakeCommunicator {
     void applyViewUpdate(const GroupView& view,
                          const std::vector<RankState>& rank_states,
                          const std::vector<uint64_t>& rank_epochs,
-                         const std::vector<bool>& activatable);
+                         const std::vector<bool>& activatable,
+                         bool materialize_device_collective_view);
     // Called by AgentHost when a TE link to a peer comes back up.
     void onPeerLinkReset(InGroupRank peer);
 
@@ -277,7 +291,7 @@ class MooncakeCommunicator {
 
     // Sync the caller-provided host/device active-ranks mirror from the current
     // GroupView.
-    void syncActiveRanksMirror() const;
+    PGResult<void> syncActiveRanksMirror() const;
 
     MooncakePGContext& context_;
     AgentInterface& agent_;
@@ -287,11 +301,12 @@ class MooncakeCommunicator {
         1;  // per-group capacity (max active members for this group)
     int device_index_ = -1;
     bool is_cpu_ = false;
-    bool is_shutdown_ = false;
+    bool shutdown_requested_ = false;
     int32_t* active_ranks_mirror_ = nullptr;
     bool active_ranks_mirror_is_device_ = false;
     int active_ranks_mirror_device_index_ = -1;
     std::optional<GpuStream> active_ranks_mirror_stream_;
+    std::unique_ptr<DeviceCollectiveRuntime> device_collective_;
 
     std::shared_ptr<MooncakeWorker> worker_;
     std::array<void*, 2> send_buffer_{};

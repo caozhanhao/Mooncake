@@ -83,8 +83,8 @@ class AgentStateMachine {
         return 0 <= rank && rank < max_world_size_;
     }
 
-    void appendApplyViewEffect(const GroupView& view,
-                               AgentApplyResult& effects) const;
+    void appendApplyViewEffect(const GroupView& view, AgentApplyResult& effects,
+                               bool materialize_device_collective_view) const;
     void appendApplyViewEffectsForRank(GlobalRank rank,
                                        AgentApplyResult& effects) const;
     void resetRankForNewEpoch(GlobalRank rank, uint64_t rank_epoch,
