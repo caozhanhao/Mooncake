@@ -17,6 +17,7 @@
 #include "memory_location.h"
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
 #include "device_comm/device_collective/device_collective.h"
+#include "device_comm/device_collective/device_collective_resources.h"
 #include "device_comm/device_collective/strong_stream.h"
 #endif
 
@@ -197,8 +198,9 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
         DeviceArena::create(device_index, transfer_service->regionAddr(),
                             transfer_service->regionSize());
     PG_TRY(auto workspace,
-           arena->allocate(kDeviceCollectiveWorkspaceSize,
-                           kDeviceCollectiveWorkspaceAlignment));
+           DeviceCollectiveWorkspace::create(
+               *arena, kDeviceCollectiveBufferCapacity,
+               kDeviceCollectiveWorkspaceAlignment));
 
     PG_TRY(auto strong_stream, StrongStream::create(device_index));
 
@@ -207,7 +209,7 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
 
     device_transfer_service = std::move(transfer_service);
     device_arena = std::move(arena);
-    device_collective_workspace.emplace(std::move(workspace));
+    device_collective_workspace = std::move(workspace);
     device_collective_strong_stream = std::move(strong_stream);
     device_collective_recovery_worker = std::move(recovery_worker);
 #endif

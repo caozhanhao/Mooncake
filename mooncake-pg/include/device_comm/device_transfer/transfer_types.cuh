@@ -11,7 +11,7 @@ class TransferLane;
 
 // Each lane owns one fixed submission slot.
 // The caller decides how lanes map to its work.
-inline constexpr uint32_t kTransferLaneCount = 4;
+inline constexpr uint32_t kTransferLaneCount = 32;
 
 enum class DeviceRouteKind : uint32_t {
     Unreachable = 0,
@@ -73,21 +73,33 @@ struct SignalAdd {
     uint64_t delta = 1;
 };
 
-// One standalone remote notification operation. It does not order unrelated
-// payload operations.
+struct SignalAction {
+    enum class Kind : uint32_t {
+        None = 0,
+        Add = 1,
+    };
+
+    Kind kind = Kind::None;
+    // Meaningful only when kind is Add.
+    SignalAdd add;
+};
+
+// One CTA-collective remote notification operation. Before updating the
+// counter, signal() releases the calling CTA's preceding direct memory
+// accesses. It does not order independently submitted transfer operations.
 struct SignalRequest {
-    SignalAdd signal;
+    SignalAction signal;
     uint64_t timeout_ticks = 0;
 };
 
-// Transfer one payload and then add to the attached remote notification
-// counter. Observing the counter update implies that this attached payload is
-// visible, but says nothing about unrelated operations.
-struct PutAndSignalRequest {
+// Transfer one payload between registered-region offsets.
+// When `signal.kind` is Add, observing the attached notification implies this
+// payload is visible, but says nothing about unrelated transfer operations.
+struct PutRequest {
     uint64_t local_offset = 0;
     uint64_t remote_offset = 0;
     uint64_t size = 0;
-    SignalAdd signal;
+    SignalAction signal;
     uint64_t timeout_ticks = 0;
 };
 

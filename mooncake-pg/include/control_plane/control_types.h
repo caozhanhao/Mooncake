@@ -69,10 +69,14 @@ struct DeviceTransferEndpoint {
     bool operator==(const DeviceTransferEndpoint&) const = default;
 };
 
-// Group-level device state inside the rank's transfer-service arena.
+// Group-level collective resources inside the rank's transfer-service arena.
+// Protocols bind fixed prefixes of these regions and own their internal
+// indexing/layout; no protocol-private Plan or sequence state is published.
 struct DeviceCollectiveEndpoint {
-    uint64_t control_offset = 0;
-    uint64_t control_size = 0;
+    uint64_t buffer_offset = 0;
+    uint64_t buffer_size = 0;
+    uint64_t signal_offset = 0;
+    uint32_t signal_capacity = 0;
 
     bool operator==(const DeviceCollectiveEndpoint&) const = default;
 };
