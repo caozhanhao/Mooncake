@@ -19,14 +19,21 @@ namespace mooncake {
 
 #ifdef USE_NCCL_DEVICE
 class NcclDeviceTransferTicket {
-    struct GinTicket {
-        bool submitted = false;
-        const device::NcclDeviceContext* context = nullptr;
-        int32_t nccl_rank = -1;
-        uint32_t lane = 0;
-        uint64_t start_ticks = 0;
-        uint64_t timeout_ticks = 0;
+    struct ErrorTicket {
         TransferResult result = TransferResult::RouteUnavailable;
+
+        __device__ __forceinline__ TransferResult
+        wait(cooperative_groups::thread_block) const {
+            return result;
+        }
+    };
+
+    struct GinTicket {
+        const device::NcclDeviceContext* context;
+        int32_t nccl_rank;
+        uint32_t lane;
+        uint64_t start_ticks;
+        uint64_t timeout_ticks;
 
         __device__ __forceinline__ TransferResult
         wait(cooperative_groups::thread_block block) const {
@@ -41,8 +48,7 @@ class NcclDeviceTransferTicket {
         }
 
        private:
-        __device__ __forceinline__ TransferResult waitLeader() const {
-            if (!submitted) return result;
+        __device__ __noinline__ TransferResult waitLeader() const {
             const uint64_t elapsed_ticks = clock64() - start_ticks;
             if (timeout_ticks != 0 && elapsed_ticks >= timeout_ticks)
                 return TransferResult::TimedOut;
@@ -66,7 +72,7 @@ class NcclDeviceTransferTicket {
         }
     };
 
-    enum class Type : uint8_t { Unavailable, Gin, Lsa };
+    enum class Type : uint8_t { Error, Gin, Lsa };
 
    public:
     __device__ __forceinline__ NcclDeviceTransferTicket() = default;
@@ -76,12 +82,11 @@ class NcclDeviceTransferTicket {
         uint32_t lane, uint64_t start_ticks, uint64_t timeout_ticks) {
         NcclDeviceTransferTicket ticket;
         ticket.type_ = Type::Gin;
-        ticket.gin_.submitted = true;
-        ticket.gin_.context = context;
-        ticket.gin_.nccl_rank = nccl_rank;
-        ticket.gin_.lane = lane;
-        ticket.gin_.start_ticks = start_ticks;
-        ticket.gin_.timeout_ticks = timeout_ticks;
+        ticket.gin_ = {.context = context,
+                       .nccl_rank = nccl_rank,
+                       .lane = lane,
+                       .start_ticks = start_ticks,
+                       .timeout_ticks = timeout_ticks};
         return ticket;
     }
 
@@ -96,16 +101,15 @@ class NcclDeviceTransferTicket {
     __device__ __forceinline__ static NcclDeviceTransferTicket
     createFailedTicket() {
         NcclDeviceTransferTicket ticket;
-        ticket.type_ = Type::Gin;
-        ticket.gin_.result = TransferResult::Failed;
+        ticket.error_.result = TransferResult::Failed;
         return ticket;
     }
 
     __device__ __forceinline__ TransferResult
     wait(cooperative_groups::thread_block block) const {
         switch (type_) {
-            case Type::Unavailable:
-                return TransferResult::RouteUnavailable;
+            case Type::Error:
+                return error_.wait(block);
             case Type::Gin:
                 return gin_.wait(block);
             case Type::Lsa:
@@ -116,9 +120,10 @@ class NcclDeviceTransferTicket {
     }
 
    private:
-    Type type_ = Type::Unavailable;
+    Type type_ = Type::Error;
     union {
-        GinTicket gin_ = {};
+        ErrorTicket error_ = {};
+        GinTicket gin_;
         LsaTicket lsa_;
     };
 };
@@ -146,6 +151,55 @@ __device__ __forceinline__ void applyNcclLsaSignalAction(
     }
 }
 
+// Keep NCCL GIN's implementation out of every collective dtype/op instance.
+// LSA's direct-memory path remains inline in the route dispatch below.
+static __device__ __noinline__ NcclDeviceTransferTicket
+ncclGinPut(const DeviceNcclRoute& route, const DeviceNcclContext& context,
+           const void* source, uint64_t remote_payload_offset, uint64_t size,
+           const SignalAction& signal, uint64_t timeout_ticks, uint32_t lane,
+           cooperative_groups::thread_block block) {
+    const auto nccl_rank = route.nccl_rank;
+    // Every source writer participates in publication to the NIC.
+    __threadfence_system();
+    block.sync();
+    if (!context.peer_accessible_ctx) return {};
+    if (signal.kind == SignalAction::Kind::Set) {
+        // NCCL GIN has no attached Set action; reject it for the whole CTA.
+        PG_UNREACHABLE();
+        return NcclDeviceTransferTicket::createFailedTicket();
+    }
+    const uint64_t start_ticks = clock64();
+
+    if (block.thread_rank() == 0) {
+        device::NcclGinHandle gin(*context.peer_accessible_ctx, lane);
+        auto* signal_ptr = reinterpret_cast<uint64_t*>(
+            static_cast<char*>(context.peer_accessible_region.addr) +
+            signal.remote_offset);
+        const auto* source_context =
+            context.peer_accessible_region.contains(source, size)
+                ? context.peer_accessible_ctx
+                : context.local_staging_ctx;
+        auto* recv_ptr =
+            static_cast<char*>(context.peer_accessible_region.addr) +
+            remote_payload_offset;
+        if (signal.kind == SignalAction::Kind::None) {
+            gin.put<device::NcclGinTeam::kWorld>(nccl_rank, *source_context,
+                                                 source, recv_ptr, size);
+        } else {
+            PG_ASSERT(signal.kind == SignalAction::Kind::Add);
+            // Attach the VA update to the actual payload operation. A
+            // separate weak signal after put() would not publish this
+            // payload.
+            gin.put<device::NcclGinTeam::kWorld>(
+                nccl_rank, *source_context, source, recv_ptr, size,
+                gin.makeWeakVaSignalAdd(signal_ptr, signal.add.delta));
+        }
+    }
+    return NcclDeviceTransferTicket::createGinTicket(
+        context.peer_accessible_ctx, nccl_rank, lane, start_ticks,
+        timeout_ticks);
+}
+
 __device__ __forceinline__ NcclDeviceTransferTicket
 ncclDevicePut(const DeviceNcclRoute& route, const DeviceNcclContext& context,
               const void* source, uint64_t remote_payload_offset, uint64_t size,
@@ -162,59 +216,14 @@ ncclDevicePut(const DeviceNcclRoute& route, const DeviceNcclContext& context,
         applyNcclLsaSignalAction(remote_region, signal, block);
         return NcclDeviceTransferTicket::createLsaTicket();
     }
-    const auto nccl_rank = route.nccl_rank;
-    // Every source writer participates in publication to the NIC.
-    __threadfence_system();
-    block.sync();
-    if (!context.peer_accessible_ctx) return {};
-    const uint64_t start_ticks = clock64();
-
-    if (block.thread_rank() == 0) {
-        device::NcclGinHandle gin(*context.peer_accessible_ctx, lane);
-        auto* signal_ptr = reinterpret_cast<uint64_t*>(
-            static_cast<char*>(context.peer_accessible_region.addr) +
-            signal.remote_offset);
-        const auto* source_context =
-            context.peer_accessible_region.contains(source, size)
-                ? context.peer_accessible_ctx
-                : context.local_staging_ctx;
-        auto* recv_ptr =
-            static_cast<char*>(context.peer_accessible_region.addr) +
-            remote_payload_offset;
-        switch (signal.kind) {
-            case SignalAction::Kind::None:
-                gin.put<device::NcclGinTeam::kWorld>(nccl_rank, *source_context,
-                                                     source, recv_ptr, size);
-                break;
-            case SignalAction::Kind::Add:
-                // Attach the VA update to the actual payload operation. A
-                // separate weak signal after put() would not publish this
-                // payload.
-                gin.put<device::NcclGinTeam::kWorld>(
-                    nccl_rank, *source_context, source, recv_ptr, size,
-                    gin.makeWeakVaSignalAdd(signal_ptr, signal.add.delta));
-                break;
-            case SignalAction::Kind::Set:
-                // NCCL GIN has no attached Set action.
-                PG_UNREACHABLE();
-                return NcclDeviceTransferTicket::createFailedTicket();
-        }
-    }
-    return NcclDeviceTransferTicket::createGinTicket(
-        context.peer_accessible_ctx, nccl_rank, lane, start_ticks,
-        timeout_ticks);
+    return ncclGinPut(route, context, source, remote_payload_offset, size,
+                      signal, timeout_ticks, lane, block);
 }
 
-__device__ __forceinline__ NcclDeviceTransferTicket
-ncclDeviceSignal(const DeviceNcclRoute& route, const DeviceNcclContext& context,
-                 const SignalAction& signal, uint64_t timeout_ticks,
-                 uint32_t lane, cooperative_groups::thread_block block) {
-    if (route.mapped_region_address != 0) {
-        auto* const remote_region = reinterpret_cast<char*>(
-            static_cast<uintptr_t>(route.mapped_region_address));
-        applyNcclLsaSignalAction(remote_region, signal, block);
-        return NcclDeviceTransferTicket::createLsaTicket();
-    }
+static __device__ __noinline__ NcclDeviceTransferTicket
+ncclGinSignal(const DeviceNcclRoute& route, const DeviceNcclContext& context,
+              const SignalAction& signal, uint64_t timeout_ticks, uint32_t lane,
+              cooperative_groups::thread_block block) {
     const auto nccl_rank = route.nccl_rank;
     // Fence each thread's memory accesses before the leader sends the signal.
     // This does not flush previously submitted network transfers.
@@ -244,6 +253,19 @@ ncclDeviceSignal(const DeviceNcclRoute& route, const DeviceNcclContext& context,
     return NcclDeviceTransferTicket::createGinTicket(
         context.peer_accessible_ctx, nccl_rank, lane, start_ticks,
         timeout_ticks);
+}
+
+__device__ __forceinline__ NcclDeviceTransferTicket
+ncclDeviceSignal(const DeviceNcclRoute& route, const DeviceNcclContext& context,
+                 const SignalAction& signal, uint64_t timeout_ticks,
+                 uint32_t lane, cooperative_groups::thread_block block) {
+    if (route.mapped_region_address != 0) {
+        auto* const remote_region = reinterpret_cast<char*>(
+            static_cast<uintptr_t>(route.mapped_region_address));
+        applyNcclLsaSignalAction(remote_region, signal, block);
+        return NcclDeviceTransferTicket::createLsaTicket();
+    }
+    return ncclGinSignal(route, context, signal, timeout_ticks, lane, block);
 }
 
 // Best-effort drain of all GIN contexts for the selected NCCL peers after

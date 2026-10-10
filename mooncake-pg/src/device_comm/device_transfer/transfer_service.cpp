@@ -341,22 +341,21 @@ struct DeviceTransferService::DeviceState {
     }
 
     PGResult<void> prepareLocalStaging() {
-        if (!local_staging_region) {
-            PG_TRY(auto staging, DeviceTransferRegion::create(
-                                     device_index, local_staging_capacity));
-            PG_TRY(registerRegion(DeviceRegionKind::LocalStaging, staging));
-            local_staging_region.emplace(std::move(staging));
-        }
-        if (!local_staging_handle_initialized) {
-            PG_ASSERT_OK(pause());
-            PG_ASSERT_OK(publishRoutes());
-            resume();
-        }
+        if (local_staging_region) return {};
+        PG_TRY(auto staging, DeviceTransferRegion::create(
+                                 device_index, local_staging_capacity));
+        PG_TRY(registerRegion(DeviceRegionKind::LocalStaging, staging));
+        local_staging_region.emplace(std::move(staging));
         return {};
     }
 
     PGResult<RegionSlice> allocateLocalStaging(size_t size, size_t alignment) {
         PG_TRY(prepareLocalStaging());
+        if (!local_staging_handle_initialized) {
+            PG_ASSERT_OK(pause());
+            PG_ASSERT_OK(publishRoutes());
+            resume();
+        }
         return local_staging_region->allocate(size, alignment);
     }
 
