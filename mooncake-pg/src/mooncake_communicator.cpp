@@ -718,6 +718,8 @@ PGResult<void> MooncakeCommunicator::initialize(
                     "device collective failure has no global-rank mapping");
 
                 LinkEvent event;
+                event.observer = {meta_->globalRank,
+                                  meta_->rankEpochs[meta_->globalRank]};
                 event.events.assign(context_.max_world_size,
                                     LinkEvent::EventType::None);
                 event.target_rank_epochs.assign(context_.max_world_size, 0);

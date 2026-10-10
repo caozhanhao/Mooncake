@@ -21,6 +21,7 @@
 namespace mooncake {
 
 struct TELinkUpEvent {
+    RankIdentity observer;
     GlobalRank peer = kInvalidGlobalRank;
     uint64_t target_rank_epoch = 0;
 };
@@ -141,6 +142,7 @@ class LinkManager {
 
     std::atomic<bool> initialized_{false};
     std::atomic<bool> started_{false};
+    std::atomic<uint64_t> self_epoch_{0};
     std::atomic<bool> shutdown_requested_{false};
 
     void pollerLoop();

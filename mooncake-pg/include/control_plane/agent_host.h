@@ -8,12 +8,14 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
 #include "agent.h"
 #include "rpc.h"
 #include "serialized_executor.h"
+#include "rpc_runtime.h"
 #include "link_manager.h"
 
 #include "error_types.h"
@@ -184,7 +186,7 @@ class AgentHost : public AgentInterface {
    private:
     AgentStateMachine agent_;
     SerializedExecutor executor_;
-    // Runs blocking DTS endpoint installation and sends the RPC reply.
+    // Runs blocking DTS endpoint installation; completion returns to executor_.
     SerializedExecutor transfer_endpoint_installer_{
         "TransferEndpointInstaller"};
 
@@ -198,8 +200,10 @@ class AgentHost : public AgentInterface {
 
     std::string coordinator_addr_;
     std::atomic<int64_t> fault_reconciliation_window_us_;
-    uint64_t agent_session_id_ = 0;
-    bool agent_session_initialized_ = false;
+    RegistrationId registration_id_ = 0;
+    std::optional<RegisterAgentRequest> registration_request_;
+    bool registration_in_flight_ = false;
+    std::chrono::steady_clock::time_point next_registration_at_;
     std::atomic<bool> shutdown_requested_{false};
     std::chrono::steady_clock::time_point next_heartbeat_at_;
 
@@ -213,8 +217,7 @@ class AgentHost : public AgentInterface {
     std::unordered_map<uint64_t, coro_rpc::context<TransferEndpointUpdateAck>>
         pending_transfer_endpoint_resps_;
 
-    // Bootstrap synchronization: one-shot latch with executor-managed promises.
-    bool agent_registration_done_ = false;
+    // Registration waiters are completed only after the confirmation snapshot.
     std::vector<std::shared_ptr<std::promise<void>>>
         agent_registration_promises_;
 
@@ -244,18 +247,122 @@ class AgentHost : public AgentInterface {
         const InstallTransferEndpoints& effect,
         coro_rpc::context<TransferEndpointUpdateAck> ctx);
 
-    void startAgentRegistration(bool start_new_session = false);
+    void startAgentRegistration();
+    void sendRegistration();
+    void sendConfirmation();
     bool shouldLogAgentRegistrationError();
     void unregisterAgent();
     void tick();
 
-    PGResult<void> sendPublishEndpointRpc(GroupEndpointPublication endpoint);
+    PGResult<void> sendPublishEndpointRpc(GroupEndpointPublication endpoint,
+                                          RankIdentity identity);
 
     void sendLinkEventReport(LinkEventReport report);
 
     PGResult<ProposeViewUpdateResponse> proposeViewUpdateInternal(
         GroupId group_id, const std::vector<InGroupRank>& ranks,
         bool is_activation);
+
+    template <typename Request>
+    PGResult<void> prepareRpc(const Request& request) const {
+        const auto identity = agent_.identity();
+        PG_VALIDATE_STATE(identity.valid(), "agent identity is not assigned");
+        if constexpr (!std::is_same_v<Request, UnregisterAgentRequest>) {
+            PG_VALIDATE_STATE(
+                !shutdown_requested_.load(std::memory_order_acquire) &&
+                    agent_.registrationPhase() ==
+                        AgentStateMachine::RegistrationPhase::Registered,
+                "agent registration is not complete");
+        }
+        PG_VALIDATE_STATE(request.identity == identity,
+                          "stale outbound agent identity");
+        return {};
+    }
+
+    template <typename Response>
+    PGResult<Response> consumeReply(RankIdentity identity,
+                                    PGResult<Response> result) {
+        PG_VALIDATE_STATE(agent_.accepts(identity),
+                          "agent identity changed during RPC");
+        return result;
+    }
+
+    template <auto Method>
+    using RpcResponse = decltype(coro_rpc::get_return_type<Method>());
+
+    template <auto Method, typename Request>
+    PGResult<RpcResponse<Method>> callCoordinator(
+        Request request,
+        std::optional<std::chrono::milliseconds> timeout = std::nullopt) {
+        PG_TRY(prepareRpc(request));
+        const auto identity = request.identity;
+        return consumeReply(identity,
+                            rpc_client_->call<Method>(
+                                coordinator_addr_, std::move(request), timeout));
+    }
+
+    template <auto Func, typename Request>
+    PGResult<void> callAndCheck(Request request) {
+        PG_TRY(auto response, callCoordinator<Func>(std::move(request)));
+        if (!response.success) {
+            return makePGError(PGErrorCode::InvalidState,
+                               std::string(coro_rpc::get_func_name<Func>()) +
+                                   " rejected: " + response.reject_reason);
+        }
+        return {};
+    }
+
+    // Called on the executor; completion and its identity gate run there too.
+    template <auto Method, typename Request, typename Callback>
+    void callCoordinatorAsync(Request request, Callback callback) {
+        auto prepared = prepareRpc(request);
+        if (!prepared.has_value()) {
+            callback(PGResult<RpcResponse<Method>>{
+                makePGError(std::move(prepared).error())});
+            return;
+        }
+        const auto identity = request.identity;
+        rpc_client_->callAsync<Method>(
+            coordinator_addr_, std::move(request),
+            [this, identity, callback = std::move(callback)](
+                PGResult<RpcResponse<Method>> result) mutable {
+                executor_.post([this, identity, callback = std::move(callback),
+                                result = std::move(result)]() mutable {
+                    if (shutdown_requested_.load(std::memory_order_acquire))
+                        return;
+                    callback(consumeReply(identity, std::move(result)));
+                });
+            });
+    }
+
+    bool acceptsRpc(RankIdentity identity) const {
+        return !shutdown_requested_.load(std::memory_order_acquire) &&
+               agent_.accepts(identity);
+    }
+
+    template <typename Response>
+    void replyRpc(coro_rpc::context<Response> ctx, RankIdentity identity,
+                  Response response) {
+        if (!acceptsRpc(identity)) {
+            ctx.response_error(coro_rpc::errc::invalid_rpc_arguments,
+                               "stale agent identity");
+            return;
+        }
+        ctx.response_msg(std::move(response));
+    }
+
+    template <typename Response, typename Request, typename Handler>
+    void postRpc(coro_rpc::context<Response> ctx, Request request,
+                 Handler handler) {
+        executor_.post([this, ctx = std::move(ctx), request = std::move(request),
+                        handler = std::move(handler)]() mutable {
+            if (!acceptsRpc(request.identity)) {
+                replyRpc(std::move(ctx), request.identity, Response{});
+                return;
+            }
+            handler(std::move(ctx), std::move(request));
+        });
+    }
 
     void runEffects(const AgentApplyResult& effects);
     template <typename F>

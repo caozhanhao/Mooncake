@@ -423,6 +423,9 @@ void MooncakeWorker::startWorker() {
                             }
                             if (has_any_attempted) {
                                 LinkEvent event;
+                                event.observer = {
+                                    group->globalRank,
+                                    group->rankEpochs[group->globalRank]};
                                 const auto max_world_size =
                                     group->communicator->getMaxWorldSize();
                                 event.events.assign(max_world_size,

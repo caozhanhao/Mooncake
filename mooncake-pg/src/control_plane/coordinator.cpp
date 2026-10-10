@@ -78,83 +78,128 @@ CoordinatorApplyResult<RegisterAgentResponse>
 CentralizedCoordinatorStateMachine::handleRegisterAgent(
     const RegisterAgentRequest& req) {
     CoordinatorApplyResult<RegisterAgentResponse> result;
-    if (!rankInRange(req.rank)) {
-        result.response.success = false;
-        result.response.reject_reason = "rank out of valid range";
+    auto& response = result.response;
+    if (!rankInRange(req.rank) || req.registration_id == 0) {
+        response.reject_reason = "invalid rank or registration id";
         return result;
     }
-    if (req.collective_workspace_endpoint &&
+    const auto& workspace = req.collective_workspace_endpoint;
+    if (workspace &&
         (!req.transfer_service_endpoint ||
          !validDeviceCollectiveWorkspaceEndpoint(
-             *req.collective_workspace_endpoint,
-             *req.transfer_service_endpoint))) {
-        result.response.success = false;
-        result.response.reject_reason =
-            "invalid device collective workspace endpoint";
+             *workspace, *req.transfer_service_endpoint))) {
+        response.reject_reason = "invalid device collective workspace endpoint";
         return result;
     }
+
     auto& info = ranks_[req.rank];
+    const auto now = std::chrono::steady_clock::now();
+    if (info.pending_registration &&
+        now > info.pending_registration->deadline) {
+        info.retired_registrations.insert(
+            info.pending_registration->request.registration_id);
+        info.pending_registration.reset();
+    }
+    if (info.retired_registrations.contains(req.registration_id)) {
+        response.require_new_registration = true;
+        response.reject_reason = "registration is no longer valid";
+        return result;
+    }
+    if (info.registration_id == req.registration_id) {
+        response.success = true;
+        response.identity = getIdentity(req.rank);
+        return result;
+    }
+    if (info.pending_registration) {
+        const auto& pending = *info.pending_registration;
+        if (pending.request == req) {
+            response.success = true;
+            response.identity = pending.identity;
+        } else {
+            response.reject_reason = "rank has a different pending registration";
+        }
+        return result;
+    }
+    if (shutdown_requested_ || info.state == RankState::Healthy) {
+        response.reject_reason = shutdown_requested_
+                                     ? "coordinator is shutting down"
+                                     : "rank is already Healthy";
+        return result;
+    }
 
-    // agent_session_id is the idempotency key for a logical registration.
-    // Retrying an already-accepted registration must not invalidate link
-    // evidence, demote rank state, or rebroadcast lifecycle events.
-    const bool same_session = info.agent_session_id == req.agent_session_id;
-    if (same_session) {
-        if (info.state == RankState::Offline) {
-            result.response.success = false;
-            result.response.reject_reason =
-                "agent session is Offline; start a new registration session";
-            result.response.require_new_session = true;
-            return result;
-        }
-        const auto& incoming = req.transfer_service_endpoint;
-        auto& current = info.transfer_service_endpoint;
-        if (incoming && (!current || incoming->version > current->version)) {
-            current = incoming;
-            updateTransferEndpoints(result.effects);
-        }
+    RankIdentity identity{req.rank, info.next_epoch++};
+    info.pending_registration =
+        PendingRegistration{req, identity, now + kRegistrationTimeout};
+    response.success = true;
+    response.identity = identity;
+    return result;
+}
+
+CoordinatorApplyResult<ConfirmAgentRegistrationResponse>
+CentralizedCoordinatorStateMachine::handleConfirmAgentRegistration(
+    const ConfirmAgentRegistrationRequest& req) {
+    CoordinatorApplyResult<ConfirmAgentRegistrationResponse> result;
+    auto& response = result.response;
+    if (!req.identity.valid() || !rankInRange(req.identity.rank)) {
+        response.reject_reason = "invalid rank identity";
+        response.require_new_registration = true;
+        return result;
+    }
+    auto& info = ranks_[req.identity.rank];
+    if (info.registration_id == req.registration_id && accepts(req.identity)) {
         info.last_heartbeat = std::chrono::steady_clock::now();
-        populateRegisterAgentResponse(result.response, req.rank);
+        populateConfirmAgentRegistrationResponse(response, req.identity.rank);
         return result;
     }
 
-    if (shutdown_requested_) {
-        result.response.success = false;
-        result.response.reject_reason = "coordinator is shutting down";
+    const auto now = std::chrono::steady_clock::now();
+    if (!info.pending_registration ||
+        info.pending_registration->request.registration_id !=
+            req.registration_id ||
+        info.pending_registration->identity != req.identity ||
+        now > info.pending_registration->deadline) {
+        response.reject_reason = "registration is no longer pending";
+        response.require_new_registration = true;
+        return result;
+    }
+    if (shutdown_requested_ || info.state == RankState::Healthy) {
+        info.retired_registrations.insert(req.registration_id);
+        info.pending_registration.reset();
+        response.reject_reason = shutdown_requested_
+                                     ? "coordinator is shutting down"
+                                     : "rank became Healthy during registration";
+        response.require_new_registration = true;
         return result;
     }
 
-    // A failed / auto-deactivated rank (Synced or Offline) may be replaced
-    // immediately. A different logical session may not take ownership from a
-    // Healthy rank.
-    if (info.state == RankState::Healthy) {
-        result.response.success = false;
-        result.response.reject_reason =
-            "rank already registered and is Healthy; replacement must wait "
-            "for the old process to leave the healthy set.";
-        return result;
-    }
-
-    ++info.rank_epoch;
-    info.agent_addr = req.agent_addr;
-    info.te_server_name = req.te_server_name;
-    info.transfer_service_endpoint = req.transfer_service_endpoint;
-    info.collective_workspace_endpoint = req.collective_workspace_endpoint;
-    info.agent_session_id = req.agent_session_id;
-    info.warmup_recv_addr = req.warmup_recv_addr;
-    info.last_heartbeat = std::chrono::steady_clock::now();
+    auto registration = std::move(info.pending_registration->request);
+    info.pending_registration.reset();
+    if (info.registration_id != 0)
+        info.retired_registrations.insert(info.registration_id);
+    info.registration_id = req.registration_id;
+    info.state = RankState::Synced;
+    info.rank_epoch = req.identity.epoch;
+    ++info.rank_state_version;
+    info.agent_addr = std::move(registration.agent_addr);
+    info.te_server_name = std::move(registration.te_server_name);
+    info.warmup_recv_addr = registration.warmup_recv_addr;
+    info.collective_workspace_endpoint =
+        registration.collective_workspace_endpoint;
+    info.transfer_service_endpoint =
+        std::move(registration.transfer_service_endpoint);
+    info.last_heartbeat = now;
 
     // A new rank epoch invalidates both outgoing and incoming observations for
     // the previous incarnation. No old edge is allowed to make the replacement
     // Healthy before fresh, epoch-matched evidence arrives.
     info.link_status.assign(max_world_size_, 0);
     for (auto& peer : ranks_) {
-        peer.link_status[req.rank] = 0;
+        peer.link_status[req.identity.rank] = 0;
     }
     info.last_link_event_report_id = 0;
 
     for (auto& [group_id, view] : group_views_) {
-        auto& member = view.members[req.rank];
+        auto& member = view.members[req.identity.rank];
         // AwaitingActivation is an uncommitted promise made by the old Agent
         // session, so a new rank epoch cancels it. Active membership is already
         // committed and must only be changed by explicit or automatic
@@ -176,22 +221,21 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
             view.epoch++;
             result.effects.push_back(PushViewUpdate{view});
         }
+        rejectPendingSyncs(group_id, req.identity.rank, "rank replaced",
+                           result.effects);
+        dropRankFromPendingBarriers(group_id, req.identity.rank, result.effects);
     }
 
-    info.state = RankState::Synced;
-    ++info.rank_state_version;
-
     result.effects.push_back(BroadcastPeerJoined{PeerJoinedPush{
-        .rank = req.rank,
+        .rank = req.identity.rank,
         .rank_epoch = info.rank_epoch,
         .te_server_name = info.te_server_name,
         .warmup_recv_addr = info.warmup_recv_addr,
         .collective_workspace_endpoint = info.collective_workspace_endpoint,
     }});
-    result.effects.push_back(makeRankStateEffect(req.rank));
-
+    result.effects.push_back(makeRankStateEffect(req.identity.rank));
     updateTransferEndpoints(result.effects);
-    populateRegisterAgentResponse(result.response, req.rank);
+    populateConfirmAgentRegistrationResponse(response, req.identity.rank);
     return result;
 }
 
@@ -210,10 +254,9 @@ CentralizedCoordinatorStateMachine::requestShutdown() {
     return result;
 }
 
-void CentralizedCoordinatorStateMachine::populateRegisterAgentResponse(
-    RegisterAgentResponse& response, GlobalRank rank) const {
+void CentralizedCoordinatorStateMachine::populateConfirmAgentRegistrationResponse(
+    ConfirmAgentRegistrationResponse& response, GlobalRank rank) const {
     response.success = true;
-    response.rank_epoch = ranks_[rank].rank_epoch;
     response.all_rank_states.resize(max_world_size_);
     response.all_rank_epochs.resize(max_world_size_);
     response.all_rank_state_versions.resize(max_world_size_);
@@ -245,11 +288,7 @@ CoordinatorApplyResult<HeartbeatResponse>
 CentralizedCoordinatorStateMachine::handleHeartbeat(
     const HeartbeatRequest& req) {
     CoordinatorApplyResult<HeartbeatResponse> result;
-    if (!hasValidSession(req.rank, req.agent_session_id)) {
-        result.response.require_new_session = true;
-        return result;
-    }
-    auto& info = ranks_[req.rank];
+    auto& info = ranks_[req.identity.rank];
     info.last_heartbeat = std::chrono::steady_clock::now();
     return result;
 }
@@ -258,22 +297,11 @@ CoordinatorApplyResult<UnregisterAgentResponse>
 CentralizedCoordinatorStateMachine::handleUnregisterAgent(
     const UnregisterAgentRequest& req) {
     CoordinatorApplyResult<UnregisterAgentResponse> result;
-    if (!rankInRange(req.rank)) {
-        result.response.reject_reason = "rank out of valid range";
-        return result;
-    }
-
-    auto& info = ranks_[req.rank];
-    if (info.agent_session_id != req.agent_session_id) {
-        result.response.reject_reason = "stale agent_session_id";
-        return result;
-    }
-
     // Agent lifetime is process-scoped and independent from every group. This
     // RPC does not change GroupView; group lifecycle and fault handling remain
     // separate operations.
-    if (invalidateAgentSession(req.rank)) {
-        result.effects.push_back(makeRankStateEffect(req.rank));
+    if (invalidateAgentSession(req.identity.rank)) {
+        result.effects.push_back(makeRankStateEffect(req.identity.rank));
         updateTransferEndpoints(result.effects);
         updateRankStates(result.effects);
     }
@@ -286,11 +314,6 @@ CoordinatorApplyResult<RegisterGroupResponse>
 CentralizedCoordinatorStateMachine::handleRegisterGroup(
     const RegisterGroupRequest& req) {
     CoordinatorApplyResult<RegisterGroupResponse> result;
-    if (!hasValidSession(req.rank, req.agent_session_id)) {
-        result.response.success = false;
-        result.response.reject_reason = "rank out of range or stale session";
-        return result;
-    }
 
     if (req.group_bootstrap_id.empty()) {
         result.response.reject_reason = "group bootstrap id is empty";
@@ -332,11 +355,6 @@ CoordinatorApplyResult<ConfirmReadyForActivationResponse>
 CentralizedCoordinatorStateMachine::handleConfirmReadyForActivation(
     const ConfirmReadyForActivationRequest& req) {
     CoordinatorApplyResult<ConfirmReadyForActivationResponse> result;
-    if (!hasValidSession(req.rank, req.agent_session_id)) {
-        result.response.reject_reason =
-            "rank is out of range or has a stale session";
-        return result;
-    }
 
     auto group_it = group_views_.find(req.group_id);
     if (group_it == group_views_.end()) {
@@ -345,7 +363,7 @@ CentralizedCoordinatorStateMachine::handleConfirmReadyForActivation(
     }
 
     auto& view = group_it->second;
-    auto& member = view.members[req.rank];
+    auto& member = view.members[req.identity.rank];
     if (member.isAwaitingActivation()) {
         result.response.success = true;
         return result;
@@ -366,11 +384,6 @@ CoordinatorApplyResult<UnregisterGroupResponse>
 CentralizedCoordinatorStateMachine::handleUnregisterGroup(
     const UnregisterGroupRequest& req) {
     CoordinatorApplyResult<UnregisterGroupResponse> result;
-    if (!hasValidSession(req.rank, req.agent_session_id)) {
-        result.response.reject_reason =
-            "rank is out of range, Offline, or has a stale session";
-        return result;
-    }
 
     auto it = group_views_.find(req.group_id);
     if (it == group_views_.end()) {
@@ -379,7 +392,7 @@ CentralizedCoordinatorStateMachine::handleUnregisterGroup(
     }
 
     auto& view = it->second;
-    auto& member = view.members[req.rank];
+    auto& member = view.members[req.identity.rank];
     if (member.hasLeft()) {
         result.response.success = true;
         return result;
@@ -392,11 +405,11 @@ CentralizedCoordinatorStateMachine::handleUnregisterGroup(
     member.status = GroupMemberState::Left;
     member.endpoint = std::nullopt;
     view.epoch++;
-    rejectPendingProposals(req.group_id, req.rank, "target rank left the group",
+    rejectPendingProposals(req.group_id, req.identity.rank, "target rank left the group",
                            result.effects);
-    rejectPendingSyncs(req.group_id, req.rank, "rank left the group",
+    rejectPendingSyncs(req.group_id, req.identity.rank, "rank left the group",
                        result.effects);
-    dropRankFromPendingBarriers(req.group_id, req.rank, result.effects);
+    dropRankFromPendingBarriers(req.group_id, req.identity.rank, result.effects);
 
     // Don't push a ViewUpdate when other members remain. The departing
     // rank's unregister races with in-flight collectives on survivors:
@@ -413,11 +426,6 @@ CoordinatorApplyResult<PublishEndpointResponse>
 CentralizedCoordinatorStateMachine::handlePublishEndpoint(
     const PublishEndpointRequest& req) {
     CoordinatorApplyResult<PublishEndpointResponse> result;
-    if (!hasValidSession(req.rank, req.agent_session_id)) {
-        result.response.success = false;
-        result.response.reject_reason = "rank out of range or stale session";
-        return result;
-    }
 
     for (const auto& ep : req.endpoints) {
         auto it = group_views_.find(ep.group_id);
@@ -428,10 +436,10 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
         }
 
         auto& view = it->second;
-        auto& member = view.members[req.rank];
+        auto& member = view.members[req.identity.rank];
         const auto& device_group_endpoint = ep.endpoint_info.device_collective;
         if (!device_group_endpoint.empty() &&
-            !ranks_[req.rank].collective_workspace_endpoint.has_value()) {
+            !ranks_[req.identity.rank].collective_workspace_endpoint.has_value()) {
             result.response.success = false;
             result.response.reject_reason =
                 "device group endpoint requires a collective workspace, "
@@ -448,10 +456,10 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
             return result;
         }
         member.endpoint = ep.endpoint_info;
-        member.endpoint->endpoint_epoch = ++endpoint_epochs_[req.rank];
+        member.endpoint->endpoint_epoch = ++endpoint_epochs_[req.identity.rank];
 
+        ++view.epoch;
         if (member.isMember() && view.status == GroupStatus::Ready) {
-            view.epoch++;
             result.effects.push_back(PushViewUpdate{view});
         }
     }
@@ -515,14 +523,6 @@ void CentralizedCoordinatorStateMachine::tryCloseReconciliationWindow(
 std::optional<LinkEventReportAck>
 CentralizedCoordinatorStateMachine::processLinkEventReport(
     const LinkEventReport& report, std::vector<CoordinatorEffect>& effects) {
-    if (!hasValidSession(report.reporter_rank, report.agent_session_id)) {
-        return std::nullopt;
-    }
-    const auto& reporter_info = ranks_[report.reporter_rank];
-    if (report.reporter_rank_epoch != reporter_info.rank_epoch) {
-        return std::nullopt;
-    }
-
     if (report.events.size() != static_cast<size_t>(max_world_size_) ||
         report.target_rank_epochs.size() !=
             static_cast<size_t>(max_world_size_)) {
@@ -530,10 +530,9 @@ CentralizedCoordinatorStateMachine::processLinkEventReport(
         return std::nullopt;
     }
 
-    LinkEventReportAck ack{report.reporter_rank, report.reporter_rank_epoch,
-                           report.report_id};
+    LinkEventReportAck ack{report.report_id};
 
-    auto& reporter = ranks_[report.reporter_rank];
+    auto& reporter = ranks_[report.identity.rank];
     if (report.report_id <= reporter.last_link_event_report_id) return ack;
     reporter.last_link_event_report_id = report.report_id;
 
@@ -581,13 +580,6 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
     uint64_t sync_id, const SyncAfterFailureRequest& req) {
     CoordinatorApplyResult<void> result;
 
-    if (!hasValidSession(req.reporter_rank, req.agent_session_id)) {
-        SyncAfterFailureResponse response;
-        response.status = SyncAfterFailureStatus::Rejected;
-        response.reject_reason = "rank out of range or stale session";
-        result.effects.push_back(ReplySync{sync_id, response});
-        return result;
-    }
     auto view_it = group_views_.find(req.group_id);
     if (view_it == group_views_.end()) {
         SyncAfterFailureResponse response;
@@ -601,15 +593,14 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
 
     // Apply piggybacked link event report inline.
     if (req.link_event_report.has_value() &&
-        req.link_event_report->reporter_rank == req.reporter_rank &&
-        req.link_event_report->agent_session_id == req.agent_session_id) {
+        req.link_event_report->identity == req.identity) {
         link_event_report_ack =
             processLinkEventReport(*req.link_event_report, result.effects);
     }
 
     if (reconciliation_ctx_.active) {
-        reconciliation_ctx_.pending_syncs[req.group_id][req.reporter_rank]
-            .push_back(PendingSync{sync_id, req.agent_session_id,
+        reconciliation_ctx_.pending_syncs[req.group_id][req.identity.rank]
+            .push_back(PendingSync{sync_id, req.identity,
                                    std::move(link_event_report_ack)});
         return result;
     }
@@ -654,30 +645,28 @@ CentralizedCoordinatorStateMachine::handleViewUpdateAck(GroupId group_id,
 
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleTransferEndpointUpdateAck(
-    const TransferEndpointUpdateAck& ack) {
+    RankIdentity identity, const TransferEndpointUpdateAck& ack) {
     CoordinatorApplyResult<void> result;
     if (!ack.applied || !pending_transfer_endpoint_installation_) return result;
     auto& installation = *pending_transfer_endpoint_installation_;
     if (ack.version != installation.snapshot.version ||
-        !installation.waiting_acks.contains(ack.rank) ||
-        ack.rank_epoch != installation.snapshot.rank_epochs[ack.rank] ||
-        ranks_[ack.rank].state == RankState::Offline ||
-        ranks_[ack.rank].rank_epoch != ack.rank_epoch)
+        !installation.waiting_acks.contains(identity.rank) ||
+        identity.epoch != installation.snapshot.rank_epochs[identity.rank])
         return result;
     if (ack.updated_endpoint) {
-        const auto& old = installation.snapshot.endpoints[ack.rank];
+        const auto& old = installation.snapshot.endpoints[identity.rank];
         if (ack.updated_endpoint->version <= old->version) {
             LOG(WARNING)
                 << "[COORD] Invalid post-install device endpoint, rank="
-                << ack.rank;
+                << identity.rank;
             return result;
         }
         // Save bootstrap metadata for future installations.
-        auto& latest = ranks_[ack.rank].transfer_service_endpoint;
+        auto& latest = ranks_[identity.rank].transfer_service_endpoint;
         if (ack.updated_endpoint->version > latest->version)
             latest = ack.updated_endpoint;
     }
-    installation.waiting_acks.erase(ack.rank);
+    installation.waiting_acks.erase(identity.rank);
     tryCompleteTransferEndpointInstallation(result.effects);
     return result;
 }
@@ -691,6 +680,11 @@ CoordinatorApplyResult<void> CentralizedCoordinatorStateMachine::tick() {
     // Heartbeat timeout
     for (int rank = 0; rank < max_world_size_; ++rank) {
         auto& info = ranks_[rank];
+        if (info.pending_registration && now > info.pending_registration->deadline) {
+            info.retired_registrations.insert(
+                info.pending_registration->request.registration_id);
+            info.pending_registration.reset();
+        }
         if (info.state == RankState::Offline) continue;
         if (now - info.last_heartbeat > kHeartbeatTimeout) {
             handleTimedOutAgent(rank, "heartbeat timeout", result.effects);
@@ -778,6 +772,9 @@ bool CentralizedCoordinatorStateMachine::invalidateAgentSession(
     GlobalRank rank) {
     if (ranks_[rank].state == RankState::Offline) return false;
 
+    auto& info = ranks_[rank];
+    info.retired_registrations.insert(info.registration_id);
+    info.registration_id = 0;
     ranks_[rank].state = RankState::Offline;
     ++ranks_[rank].rank_state_version;
     ranks_[rank].link_status.assign(max_world_size_, 0);
@@ -971,7 +968,7 @@ void CentralizedCoordinatorStateMachine::updateTransferEndpoints(
         installed_transfer_endpoints_ ? installed_transfer_endpoints_->version
                                       : 0;
     effects.push_back(PushTransferEndpointUpdate{
-        {installation.snapshot, reclaim_before_version}});
+        {{}, installation.snapshot, reclaim_before_version}});
     pending_transfer_endpoint_installation_ = std::move(installation);
 }
 
@@ -1164,7 +1161,7 @@ void CentralizedCoordinatorStateMachine::tryAdmitPendingProposals(
         const auto& pending = queue.front();
         const auto& req = pending.request;
 
-        if (!hasValidSession(req.source_rank, req.agent_session_id)) {
+        if (!accepts(req.identity)) {
             reply_and_pop(ProposalStatus::Rejected,
                           "source rank is Offline or has a stale session");
             continue;
@@ -1560,13 +1557,6 @@ bool CentralizedCoordinatorStateMachine::validateGroupRegistration(
         return false;
     }
 
-    // Validate joining_rank
-    if (!rankInRange(request.rank)) {
-        response.success = false;
-        response.reject_reason = "joining rank is out of valid range";
-        return false;
-    }
-
     // Validate rank_order elements.
     for (GlobalRank r : request.rank_order) {
         if (!rankInRange(r)) {
@@ -1589,7 +1579,7 @@ bool CentralizedCoordinatorStateMachine::validateGroupRegistration(
 
     // The joining rank must be one of the ranks it declares in rank_order.
     if (std::find(request.rank_order.begin(), request.rank_order.end(),
-                  request.rank) == request.rank_order.end()) {
+                  request.identity.rank) == request.rank_order.end()) {
         response.success = false;
         response.reject_reason = "joining rank not in rank_order";
         return false;
@@ -1677,7 +1667,7 @@ std::optional<GroupId> CentralizedCoordinatorStateMachine::resolveGroupId(
                 auto appended_begin =
                     request.rank_order.begin() + existing_order.size();
                 if (std::find(appended_begin, request.rank_order.end(),
-                              request.rank) == request.rank_order.end()) {
+                              request.identity.rank) == request.rank_order.end()) {
                     continue;
                 }
 
@@ -1728,7 +1718,7 @@ void CentralizedCoordinatorStateMachine::processGroupRegistration(
         for (GlobalRank r : request.rank_order) {
             view.members[r].status = GroupMemberState::Active;
         }
-        view.members[request.rank].preferred_gpu_collective_backend =
+        view.members[request.identity.rank].preferred_gpu_collective_backend =
             request.preferred_gpu_collective_backend;
         view.status = GroupStatus::Bootstrapping;
         group_views_[group_id] = std::move(view);
@@ -1752,7 +1742,7 @@ void CentralizedCoordinatorStateMachine::processGroupRegistration(
         view_changed = true;
     }
 
-    auto& joining_member = view.members[request.rank];
+    auto& joining_member = view.members[request.identity.rank];
     if (joining_member.preferred_gpu_collective_backend !=
         request.preferred_gpu_collective_backend) {
         joining_member.preferred_gpu_collective_backend =
@@ -1769,11 +1759,8 @@ void CentralizedCoordinatorStateMachine::processGroupRegistration(
     // A Ready group that receives a registerGroup should push the authoritative
     // Ready view to all members (including the newly-joined inactive rank) so
     // that joining ranks can observe Ready and unblock waitUntilGroupReady().
+    if (view_changed) ++view.epoch;
     if (view.status == GroupStatus::Ready) {
-        // A changed payload must never be published under an epoch that agents
-        // may already have applied. Repeated registrations with no view change
-        // remain idempotent and reuse the current epoch.
-        if (view_changed) view.epoch++;
         effects.push_back(PushViewUpdate{view});
     }
 }
@@ -1848,7 +1835,7 @@ void CentralizedCoordinatorStateMachine::eraseGroup(
 
 CoordinatorEffect CentralizedCoordinatorStateMachine::makeRankStateEffect(
     GlobalRank rank) {
-    return BroadcastRankState{RankStatePush{rank, ranks_[rank].rank_epoch,
+    return BroadcastRankState{RankStatePush{{}, rank, ranks_[rank].rank_epoch,
                                             ranks_[rank].rank_state_version,
                                             ranks_[rank].state}};
 }
@@ -1956,7 +1943,7 @@ void CentralizedCoordinatorStateMachine::resolvePendingSyncs(
     for (auto& [group_id, ranks] : reconciliation_ctx_.pending_syncs) {
         for (auto& [rank, pending_requests] : ranks) {
             for (const PendingSync& pending : pending_requests) {
-                auto status = hasValidSession(rank, pending.agent_session_id)
+                auto status = accepts(pending.identity)
                                   ? SyncAfterFailureStatus::Reconciled
                                   : SyncAfterFailureStatus::Rejected;
                 auto response = makeSyncResponse(status, group_id);

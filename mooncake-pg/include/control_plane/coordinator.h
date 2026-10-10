@@ -17,12 +17,18 @@ namespace mooncake {
 
 // CoordinatorStateMachine - abstract interface for the control-plane server
 // state machine.
+// Ordinary handlers receive identities admitted by CoordinatorHost's gate.
+// Deferred work must revalidate the identity captured when it was admitted.
 class CoordinatorStateMachine {
    public:
     virtual ~CoordinatorStateMachine() = default;
 
     virtual CoordinatorApplyResult<RegisterAgentResponse> handleRegisterAgent(
         const RegisterAgentRequest& req) = 0;
+
+    virtual CoordinatorApplyResult<ConfirmAgentRegistrationResponse>
+    handleConfirmAgentRegistration(
+        const ConfirmAgentRegistrationRequest& req) = 0;
 
     virtual CoordinatorApplyResult<HeartbeatResponse> handleHeartbeat(
         const HeartbeatRequest& req) = 0;
@@ -58,7 +64,7 @@ class CoordinatorStateMachine {
                                                              bool applied) = 0;
 
     virtual CoordinatorApplyResult<void> handleTransferEndpointUpdateAck(
-        const TransferEndpointUpdateAck& ack) = 0;
+        RankIdentity identity, const TransferEndpointUpdateAck& ack) = 0;
 
     virtual CoordinatorApplyResult<void> tick() = 0;
 
@@ -81,6 +87,10 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     CoordinatorApplyResult<RegisterAgentResponse> handleRegisterAgent(
         const RegisterAgentRequest& req) override;
+
+    CoordinatorApplyResult<ConfirmAgentRegistrationResponse>
+    handleConfirmAgentRegistration(
+        const ConfirmAgentRegistrationRequest& req) override;
 
     CoordinatorApplyResult<HeartbeatResponse> handleHeartbeat(
         const HeartbeatRequest& req) override;
@@ -116,7 +126,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                                                      bool applied) override;
 
     CoordinatorApplyResult<void> handleTransferEndpointUpdateAck(
-        const TransferEndpointUpdateAck& ack) override;
+        RankIdentity identity, const TransferEndpointUpdateAck& ack) override;
 
     CoordinatorApplyResult<void> tick() override;
 
@@ -131,20 +141,44 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         return ranks_[rank].agent_addr;
     }
 
+    RankIdentity getIdentity(GlobalRank rank) const {
+        return rankInRange(rank) ? RankIdentity{rank, ranks_[rank].rank_epoch}
+                                : RankIdentity{};
+    }
+
+    bool hasIdentity(RankIdentity identity) const {
+        return identity.valid() && rankInRange(identity.rank) &&
+               getIdentity(identity.rank) == identity;
+    }
+
+    bool accepts(RankIdentity identity) const {
+        return hasIdentity(identity) &&
+               getRankState(identity.rank) != RankState::Offline;
+    }
+
    private:
     int max_world_size_;
+
+    struct PendingRegistration {
+        RegisterAgentRequest request;
+        RankIdentity identity;
+        std::chrono::steady_clock::time_point deadline;
+    };
 
     struct RankInfo {
         RankState state = RankState::Offline;
         std::string agent_addr;
         std::string te_server_name;
-        // Agent-generated key for one logical registration.
-        uint64_t agent_session_id = 0;
         // Coordinator-assigned, monotonically increasing incarnation of this
         // GlobalRank. Zero means no Agent has ever been accepted for it.
         uint64_t rank_epoch = 0;
         // Monotonically increasing version of the authoritative rank state.
         uint64_t rank_state_version = 0;
+        uint64_t next_epoch = 1;
+        RegistrationId registration_id = 0;
+        std::optional<PendingRegistration> pending_registration;
+        // Tombstones prevent delayed Register RPCs from reviving old attempts.
+        std::unordered_set<RegistrationId> retired_registrations;
         std::chrono::steady_clock::time_point last_heartbeat;
         std::vector<uint8_t> link_status;
         uint64_t last_link_event_report_id = 0;
@@ -229,7 +263,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     struct PendingSync {
         uint64_t sync_id = 0;
-        uint64_t agent_session_id = 0;
+        RankIdentity identity;
         std::optional<LinkEventReportAck> link_event_report_ack;
     };
 
@@ -278,8 +312,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     std::optional<LinkEventReportAck> processLinkEventReport(
         const LinkEventReport& report, std::vector<CoordinatorEffect>& effects);
 
-    void populateRegisterAgentResponse(RegisterAgentResponse& response,
-                                       GlobalRank rank) const;
+    void populateConfirmAgentRegistrationResponse(
+        ConfirmAgentRegistrationResponse& response, GlobalRank rank) const;
 
     SyncAfterFailureResponse makeSyncResponse(SyncAfterFailureStatus status,
                                               GroupId group_id) const;
@@ -355,12 +389,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     void rejectPendingSyncs(GroupId group_id, GlobalRank rank,
                             const std::string& reason,
                             std::vector<CoordinatorEffect>& effects);
-
-    // Request validation: rank must be in range, online, and matching session.
-    bool hasValidSession(GlobalRank rank, uint64_t session_id) const {
-        return rankInRange(rank) && ranks_[rank].state != RankState::Offline &&
-               ranks_[rank].agent_session_id == session_id;
-    }
 
     bool rankInRange(GlobalRank rank) const {
         return 0 <= rank && rank < max_world_size_;

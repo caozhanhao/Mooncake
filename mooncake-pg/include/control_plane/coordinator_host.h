@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 
 #include "coordinator.h"
@@ -65,6 +66,10 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
     void registerAgent(coro_rpc::context<RegisterAgentResponse> ctx,
                        RegisterAgentRequest req) override;
 
+    void confirmAgentRegistration(
+        coro_rpc::context<ConfirmAgentRegistrationResponse> ctx,
+        ConfirmAgentRegistrationRequest req) override;
+
     void heartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                    HeartbeatRequest req) override;
 
@@ -116,6 +121,10 @@ class CoordinatorHost {
     void postRegisterAgent(coro_rpc::context<RegisterAgentResponse> ctx,
                            RegisterAgentRequest req);
 
+    void postConfirmAgentRegistration(
+        coro_rpc::context<ConfirmAgentRegistrationResponse> ctx,
+        ConfirmAgentRegistrationRequest req);
+
     void postHeartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                        HeartbeatRequest req);
 
@@ -144,11 +153,6 @@ class CoordinatorHost {
     void postSyncAfterFailure(coro_rpc::context<SyncAfterFailureResponse> ctx,
                               SyncAfterFailureRequest req);
 
-    void postViewUpdateAck(GroupId group_id, GlobalRank rank, uint64_t epoch,
-                           bool applied);
-
-    void postTransferEndpointUpdateAck(TransferEndpointUpdateAck ack);
-
    private:
     CentralizedCoordinatorStateMachine state_machine_;
     SerializedExecutor executor_;
@@ -165,12 +169,18 @@ class CoordinatorHost {
     // Host only maintains deferred response context mapping.
     // Related states is inside CentralizedCoordinatorStateMachine;
 
+    template <typename Response>
+    struct PendingReply {
+        RankIdentity identity;
+        coro_rpc::context<Response> context;
+    };
+
     uint64_t next_propose_id_{1};
-    std::unordered_map<uint64_t, coro_rpc::context<ProposeViewUpdateResponse>>
+    std::unordered_map<uint64_t, PendingReply<ProposeViewUpdateResponse>>
         pending_proposal_resps_;
 
     uint64_t next_sync_id_{1};
-    std::unordered_map<uint64_t, coro_rpc::context<SyncAfterFailureResponse>>
+    std::unordered_map<uint64_t, PendingReply<SyncAfterFailureResponse>>
         pending_sync_resps_;
 
     static constexpr auto kShutdownDrainTimeout = std::chrono::seconds(30);
@@ -184,15 +194,90 @@ class CoordinatorHost {
     void pushViewUpdate(const PushViewUpdate& effect);
     void pushTransferEndpointUpdate(const PushTransferEndpointUpdate& effect);
 
-    template <auto Method, typename Push>
-    void pushToAgent(GlobalRank rank, const Push& msg) {
-        const auto& addr = state_machine_.getAgentAddr(rank);
-        if (addr.empty()) {
-            LOG(WARNING) << "[COORD] push target rank=" << rank
-                         << " has no agent_addr; skipping";
-            return;
+    template <typename Response>
+    void replyRpc(coro_rpc::context<Response> ctx, RankIdentity identity,
+                  Response response, bool allow_closed = false) {
+        if (state_machine_.accepts(identity) ||
+            (allow_closed && state_machine_.hasIdentity(identity))) {
+            ctx.response_msg(std::move(response));
+        } else if constexpr (std::is_same_v<Response, HeartbeatResponse>) {
+            ctx.response_msg(HeartbeatResponse{true});
+        } else {
+            ctx.response_error(coro_rpc::errc::invalid_rpc_arguments,
+                               "stale agent identity");
         }
-        rpc_client_->send<Method>(addr, msg);
+    }
+
+    // All ordinary ingress runs through this gate on the state-machine executor.
+    template <auto Handler, typename Response, typename Request>
+    void postRpc(coro_rpc::context<Response> ctx, Request req,
+                 bool allow_closed = false) {
+        executor_.post([this, ctx = std::move(ctx), req = std::move(req),
+                        allow_closed]() mutable {
+            Response response{};
+            if (state_machine_.accepts(req.identity) ||
+                (allow_closed && state_machine_.hasIdentity(req.identity))) {
+                auto result = (state_machine_.*Handler)(req);
+                response = std::move(result.response);
+                runEffects(result.effects);
+            }
+            replyRpc(std::move(ctx), req.identity, std::move(response),
+                     allow_closed);
+        });
+    }
+
+    template <auto Handler, typename Response, typename Request>
+    void postDeferredRpc(
+        coro_rpc::context<Response> ctx, Request req, uint64_t& next_id,
+        std::unordered_map<uint64_t, PendingReply<Response>>& pending) {
+        executor_.post([this, ctx = std::move(ctx), req = std::move(req),
+                        &next_id, &pending]() mutable {
+            if (!state_machine_.accepts(req.identity)) {
+                replyRpc(std::move(ctx), req.identity, Response{});
+                return;
+            }
+            const auto id = next_id++;
+            pending.emplace(
+                id, PendingReply<Response>{req.identity, std::move(ctx)});
+            runEffects((state_machine_.*Handler)(id, req).effects);
+        });
+    }
+
+    template <typename Response>
+    void finishReply(
+        std::unordered_map<uint64_t, PendingReply<Response>>& pending,
+        uint64_t id, const Response& response) {
+        auto it = pending.find(id);
+        if (it == pending.end()) return;
+        auto& reply = it->second;
+        replyRpc(std::move(reply.context), reply.identity, response);
+        pending.erase(it);
+    }
+
+    template <auto Method, typename Push>
+    void pushToAgent(RankIdentity identity, Push push) {
+        if (!state_machine_.accepts(identity)) return;
+        push.identity = identity;
+        rpc_client_->send<Method>(state_machine_.getAgentAddr(identity.rank),
+                                  std::move(push));
+    }
+
+    template <auto Method, typename Push, typename Callback>
+    void callAgent(RankIdentity identity, Push push, Callback callback) {
+        if (!state_machine_.accepts(identity)) return;
+        push.identity = identity;
+        using Reply = decltype(coro_rpc::get_return_type<Method>());
+        rpc_client_->callAsync<Method>(
+            state_machine_.getAgentAddr(identity.rank), std::move(push),
+            [this, identity, callback = std::move(callback)](
+                PGResult<Reply> result) mutable {
+                executor_.post([this, identity, callback = std::move(callback),
+                                result = std::move(result)]() mutable {
+                    if (!result.has_value() || !state_machine_.accepts(identity))
+                        return;
+                    callback(identity, std::move(result).value());
+                });
+            });
     }
 };
 

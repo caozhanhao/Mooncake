@@ -17,6 +17,18 @@ using GroupBootstrapId = std::string;
 using GroupId = std::string;
 using DeviceUUID = std::array<uint8_t, 16>;
 
+struct RankIdentity {
+    GlobalRank rank = kInvalidGlobalRank;
+    // Never reused for this rank during the Coordinator's lifetime.
+    uint64_t epoch = 0;
+
+    bool valid() const { return rank >= 0 && epoch != 0; }
+    bool operator==(const RankIdentity&) const = default;
+};
+
+// An idempotency key for registration, never a credential for ordinary RPCs.
+using RegistrationId = uint64_t;
+
 // Resolves a registration only against runtime groups stored under the same
 // GroupBootstrapId, i.e. the same device kind and PyTorch group id.
 // An exact match requires both rank_order and max_group_size to be equal.
@@ -279,6 +291,7 @@ struct LinkEvent {
         Failure = 2,
     };
 
+    RankIdentity observer;
     std::vector<EventType> events;
     // The Coordinator-assigned epoch of the target rank observed by the
     // event source.  This is parallel to events and prevents a late event for

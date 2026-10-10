@@ -19,19 +19,26 @@ namespace mooncake {
 inline constexpr auto kProposalAdmissionTimeout = std::chrono::seconds(20);
 inline constexpr auto kViewUpdateAckTimeout = std::chrono::seconds(20);
 inline constexpr auto kTransferEndpointUpdateTimeout = std::chrono::seconds(20);
+inline constexpr auto kRegistrationTimeout = std::chrono::seconds(30);
 
 // Agent -> Coordinator RPC messages
 
+// Register reserves an identity without publishing the candidate. The Agent
+// installs that identity before Confirm; only Confirm publishes Synced state
+// and enables Coordinator pushes. Confirm's snapshot and those pushes merge
+// through the same per-object version rules.
 struct RegisterAgentRequest {
     GlobalRank rank = kInvalidGlobalRank;
     std::string agent_addr;
     std::string te_server_name;
-    uint64_t agent_session_id = 0;
+    RegistrationId registration_id = 0;
     uint64_t warmup_recv_addr = 0;
 
     std::optional<DeviceTransferEndpoint> transfer_service_endpoint;
     std::optional<DeviceCollectiveWorkspaceEndpoint>
         collective_workspace_endpoint;
+
+    bool operator==(const RegisterAgentRequest&) const = default;
 };
 
 struct RankConnectionMetadata {
@@ -49,10 +56,19 @@ struct RegisterAgentResponse {
     std::string reject_reason;
     // The request reached the Coordinator, but this logical registration can
     // no longer be accepted.
-    bool require_new_session = false;
-    // Coordinator-assigned epoch for the accepted incarnation of the
-    // registering rank. Zero means that no incarnation has been accepted.
-    uint64_t rank_epoch = 0;
+    bool require_new_registration = false;
+    RankIdentity identity;
+};
+
+struct ConfirmAgentRegistrationRequest {
+    RegistrationId registration_id = 0;
+    RankIdentity identity;
+};
+
+struct ConfirmAgentRegistrationResponse {
+    bool success = false;
+    std::string reject_reason;
+    bool require_new_registration = false;
     std::vector<RankState> all_rank_states;
     std::vector<uint64_t> all_rank_epochs;
     std::vector<uint64_t> all_rank_state_versions;
@@ -61,9 +77,7 @@ struct RegisterAgentResponse {
 };
 
 struct LinkEventReport {
-    GlobalRank reporter_rank = kInvalidGlobalRank;
-    uint64_t agent_session_id = 0;
-    uint64_t reporter_rank_epoch = 0;
+    RankIdentity identity;
     uint64_t report_id = 0;
     std::vector<LinkEvent::EventType> events;
     // Parallel to events. Each entry identifies the target
@@ -72,23 +86,19 @@ struct LinkEventReport {
 };
 
 struct LinkEventReportAck {
-    GlobalRank reporter_rank = kInvalidGlobalRank;
-    uint64_t reporter_rank_epoch = 0;
     uint64_t report_id = 0;
 };
 
 struct HeartbeatRequest {
-    GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_id = 0;
+    RankIdentity identity;
 };
 
 struct HeartbeatResponse {
-    bool require_new_session = false;
+    bool require_new_registration = false;
 };
 
 struct UnregisterAgentRequest {
-    GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_id = 0;
+    RankIdentity identity;
 };
 
 struct UnregisterAgentResponse {
@@ -97,8 +107,7 @@ struct UnregisterAgentResponse {
 };
 
 struct RegisterGroupRequest {
-    GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_id = 0;
+    RankIdentity identity;
     GroupBootstrapId group_bootstrap_id;
     int32_t max_group_size = 0;
     std::vector<GlobalRank> rank_order;
@@ -116,8 +125,7 @@ struct RegisterGroupResponse {
 
 struct ConfirmReadyForActivationRequest {
     GroupId group_id;
-    GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_id = 0;
+    RankIdentity identity;
 };
 
 struct ConfirmReadyForActivationResponse {
@@ -133,8 +141,7 @@ enum class ProposalStatus : uint8_t {
 
 struct ProposeViewUpdateRequest {
     GroupId group_id;
-    GlobalRank source_rank = kInvalidGlobalRank;
-    uint64_t agent_session_id = 0;
+    RankIdentity identity;
     std::vector<InGroupRank> requested_ranks;
     bool is_activation = false;
 };
@@ -152,8 +159,7 @@ struct GroupEndpointPublication {
 };
 
 struct PublishEndpointRequest {
-    GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_id = 0;
+    RankIdentity identity;
     std::vector<GroupEndpointPublication> endpoints;
 };
 
@@ -164,8 +170,7 @@ struct PublishEndpointResponse {
 
 struct UnregisterGroupRequest {
     GroupId group_id;
-    GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_id = 0;
+    RankIdentity identity;
 };
 
 struct UnregisterGroupResponse {
@@ -175,8 +180,7 @@ struct UnregisterGroupResponse {
 
 struct SyncAfterFailureRequest {
     GroupId group_id;
-    GlobalRank reporter_rank = kInvalidGlobalRank;
-    uint64_t agent_session_id = 0;
+    RankIdentity identity;
     uint64_t current_epoch = 0;
     // Piggybacked link event report.
     std::optional<LinkEventReport> link_event_report;
@@ -199,6 +203,7 @@ struct SyncAfterFailureResponse {
 // Coordinator -> Agent RPC messages
 
 struct PeerJoinedPush {
+    RankIdentity identity;  // Recipient of this push.
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t rank_epoch = 0;
     std::string te_server_name;
@@ -208,6 +213,7 @@ struct PeerJoinedPush {
 };
 
 struct RankStatePush {
+    RankIdentity identity;  // Recipient of this push.
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t rank_epoch = 0;
     uint64_t rank_state_version = 0;
@@ -215,10 +221,12 @@ struct RankStatePush {
 };
 
 struct ViewUpdatePush {
+    RankIdentity identity;
     GroupView view;
 };
 
 struct TransferEndpointUpdatePush {
+    RankIdentity identity;
     DeviceTransferSnapshot snapshot;
     // Agents may reclaim retired route resources from snapshot versions below
     // this value during installation. The Coordinator sets it to the last
@@ -228,8 +236,6 @@ struct TransferEndpointUpdatePush {
 };
 
 struct TransferEndpointUpdateAck {
-    GlobalRank rank = kInvalidGlobalRank;
-    uint64_t rank_epoch = 0;
     // Version of the input snapshot this ACK confirms.
     uint64_t version = 0;
     // True once local routes are installed and execution has resumed.
@@ -241,7 +247,6 @@ struct TransferEndpointUpdateAck {
 };
 
 struct ViewUpdateAck {
-    GlobalRank rank = kInvalidGlobalRank;
     GroupId group_id;
     uint64_t epoch = 0;
     bool applied = false;
@@ -287,6 +292,7 @@ using CoordinatorEffect =
 
 struct InstallTransferEndpoints {
     uint64_t request_id = 0;
+    RankIdentity identity;
     DeviceTransferSnapshot snapshot;
     uint64_t reclaim_before_version = 0;
 };
@@ -395,6 +401,9 @@ class CoordinatorRpcService {
 
     virtual void registerAgent(coro_rpc::context<RegisterAgentResponse> ctx,
                                RegisterAgentRequest req) = 0;
+    virtual void confirmAgentRegistration(
+        coro_rpc::context<ConfirmAgentRegistrationResponse> ctx,
+        ConfirmAgentRegistrationRequest req) = 0;
     virtual void heartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                            HeartbeatRequest req) = 0;
     virtual void unregisterAgent(coro_rpc::context<UnregisterAgentResponse> ctx,

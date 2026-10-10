@@ -27,11 +27,9 @@ class AgentStateMachine {
     PGResult<AgentApplyResult> handleTransferEndpointUpdate(
         uint64_t request_id, const TransferEndpointUpdatePush& push) const;
 
-    HeartbeatRequest buildHeartbeat() const;
-
-    AgentApplyResult applyRegisterAgentResponse(
-        const RegisterAgentResponse& resp);
-    AgentApplyResult reset(uint64_t new_session_id);
+    PGResult<AgentApplyResult> applyRegistrationSnapshot(
+        const ConfirmAgentRegistrationResponse& response);
+    AgentApplyResult reset();
 
     AgentApplyResult pushLinkEvent(const LinkEvent& event);
     std::optional<LinkEventReport> getLinkEventReport() const;
@@ -39,32 +37,32 @@ class AgentStateMachine {
 
     GroupView getGroupView(GroupId group_id) const;
 
-    enum class CoordinatorConnection {
-        Connected,
-        AgentRegistering,
-        Disconnected
+    enum class RegistrationPhase {
+        Unregistered,
+        Registering,
+        Confirming,
+        Registered
     };
-    CoordinatorConnection getCoordinatorConnection() const {
-        return coordinator_connection_;
+    RegistrationPhase registrationPhase() const {
+        return registration_phase_.load(std::memory_order_acquire);
     }
-    void setCoordinatorConnection(CoordinatorConnection state) {
-        coordinator_connection_ = state;
-    }
-
-    uint64_t getAgentSessionId() const {
-        return agent_session_id_.load(std::memory_order_acquire);
+    void setRegistrationPhase(RegistrationPhase phase) {
+        registration_phase_.store(phase, std::memory_order_release);
     }
 
-    uint64_t getRankEpoch() const {
-        return self_rank_epoch_.load(std::memory_order_acquire);
+    RankIdentity identity() const {
+        return {rank_, self_rank_epoch_.load(std::memory_order_acquire)};
     }
+    void setIdentity(RankIdentity identity);
+    bool accepts(RankIdentity identity) const;
 
    private:
     GlobalRank rank_;
     int max_world_size_;
 
-    std::atomic<uint64_t> agent_session_id_{0};
     std::atomic<uint64_t> self_rank_epoch_{0};
+    std::atomic<RegistrationPhase> registration_phase_{
+        RegistrationPhase::Unregistered};
 
     std::unordered_map<GroupId, GroupView> groups_;
 
@@ -77,9 +75,6 @@ class AgentStateMachine {
     std::vector<uint64_t> observed_target_rank_epochs_;
     uint64_t link_state_version_ = 0;
     uint64_t acked_link_state_version_ = 0;
-
-    CoordinatorConnection coordinator_connection_ =
-        CoordinatorConnection::Disconnected;
 
     bool rankInRange(GlobalRank rank) const {
         return 0 <= rank && rank < max_world_size_;

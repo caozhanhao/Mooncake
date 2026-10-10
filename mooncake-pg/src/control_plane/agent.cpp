@@ -1,6 +1,7 @@
 #include "control_plane/agent.h"
 
 #include <algorithm>
+#include <iterator>
 #include <utility>
 #include <glog/logging.h>
 
@@ -18,6 +19,17 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     rank_connections_.resize(max_world_size_);
     observed_link_state_.assign(max_world_size_, LinkEvent::EventType::None);
     observed_target_rank_epochs_.assign(max_world_size_, 0);
+}
+
+void AgentStateMachine::setIdentity(RankIdentity identity) {
+    PG_ASSERT(identity.valid() && identity.rank == rank_,
+              "invalid agent identity");
+    self_rank_epoch_.store(identity.epoch, std::memory_order_release);
+    setRegistrationPhase(RegistrationPhase::Confirming);
+}
+
+bool AgentStateMachine::accepts(RankIdentity candidate) const {
+    return candidate.valid() && candidate == identity();
 }
 
 void AgentStateMachine::appendApplyGroupStateEffect(
@@ -269,18 +281,20 @@ PGResult<AgentApplyResult> AgentStateMachine::applyGroupView(
 
 PGResult<AgentApplyResult> AgentStateMachine::handleViewUpdate(
     const ViewUpdatePush& push) {
+    // A push may arrive before the confirmation snapshot introduces the group.
+    if (registrationPhase() == RegistrationPhase::Confirming &&
+        !groups_.contains(push.view.group_id)) {
+        return registerGroup(push.view);
+    }
     return applyGroupView(push.view);
 }
 
 PGResult<AgentApplyResult> AgentStateMachine::handleTransferEndpointUpdate(
     uint64_t request_id, const TransferEndpointUpdatePush& push) const {
     const auto& snapshot = push.snapshot;
-    const uint64_t rank_epoch =
-        snapshot.rank_epochs.size() == static_cast<size_t>(max_world_size_)
-            ? snapshot.rank_epochs[rank_]
-            : 0;
     PG_VALIDATE_STATE(
-        rank_epoch && rank_epoch == getRankEpoch() &&
+        snapshot.rank_epochs.size() == static_cast<size_t>(max_world_size_) &&
+            snapshot.rank_epochs[rank_] == push.identity.epoch &&
             snapshot.endpoints.size() == static_cast<size_t>(max_world_size_) &&
             snapshot.endpoints[rank_] &&
             std::find(snapshot.participants.begin(),
@@ -289,32 +303,23 @@ PGResult<AgentApplyResult> AgentStateMachine::handleTransferEndpointUpdate(
         "invalid device endpoint installation");
 
     return AgentApplyResult{InstallTransferEndpoints{
-        request_id, snapshot, push.reclaim_before_version}};
+        request_id, push.identity, snapshot, push.reclaim_before_version}};
 }
 
-HeartbeatRequest AgentStateMachine::buildHeartbeat() const {
-    HeartbeatRequest req;
-    req.rank = rank_;
-    return req;
-}
-
-AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
-    const RegisterAgentResponse& resp) {
+PGResult<AgentApplyResult> AgentStateMachine::applyRegistrationSnapshot(
+    const ConfirmAgentRegistrationResponse& resp) {
     AgentApplyResult effects;
 
     if (static_cast<int>(resp.all_rank_states.size()) != max_world_size_ ||
         static_cast<int>(resp.all_rank_epochs.size()) != max_world_size_ ||
         static_cast<int>(resp.all_rank_state_versions.size()) !=
             max_world_size_) {
-        LOG(ERROR) << "AgentStateMachine: malformed RegisterAgentResponse";
-        coordinator_connection_ = CoordinatorConnection::Disconnected;
-        return effects;
+        return makePGError(PGErrorCode::InvalidArgument,
+                           "malformed registration snapshot");
     }
 
-    self_rank_epoch_.store(resp.rank_epoch, std::memory_order_release);
-
     // PeerJoined and RankState pushes use independent RPCs and can arrive while
-    // the RegisterAgent response is in flight. Merge its snapshot monotonically
+    // the confirmation response is in flight. Merge its snapshot monotonically
     // so it cannot roll a rank back to an older epoch or state version.
     for (int rank = 0; rank < max_world_size_; ++rank) {
         const auto response_epoch = resp.all_rank_epochs[rank];
@@ -336,9 +341,8 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
     // entry invalidated by above.
     for (const auto& connection : resp.rank_connections) {
         if (!rankInRange(connection.rank)) {
-            LOG(ERROR) << "AgentStateMachine: malformed rank connection";
-            coordinator_connection_ = CoordinatorConnection::Disconnected;
-            return {};
+            return makePGError(PGErrorCode::InvalidArgument,
+                               "malformed rank connection");
         }
         if (connection.rank_epoch != global_rank_epochs_[connection.rank] ||
             global_rank_states_[connection.rank] == RankState::Offline)
@@ -362,18 +366,23 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
     }
 
     for (const auto& view : resp.groups) {
-        groups_[view.group_id] = view;
-        appendApplyGroupStateEffect(view, effects);
+        if (!groups_.contains(view.group_id)) {
+            groups_[view.group_id] = view;
+            appendApplyGroupStateEffect(view, effects);
+            continue;
+        }
+        PG_TRY(auto updates, applyGroupView(view));
+        effects.insert(effects.end(), std::make_move_iterator(updates.begin()),
+                       std::make_move_iterator(updates.end()));
     }
 
-    coordinator_connection_ = CoordinatorConnection::Connected;
     return effects;
 }
 
-AgentApplyResult AgentStateMachine::reset(uint64_t new_session_id) {
+AgentApplyResult AgentStateMachine::reset() {
     AgentApplyResult effects;
 
-    agent_session_id_.store(new_session_id, std::memory_order_release);
+    setRegistrationPhase(RegistrationPhase::Unregistered);
     self_rank_epoch_.store(0, std::memory_order_release);
     std::fill(observed_link_state_.begin(), observed_link_state_.end(),
               LinkEvent::EventType::None);
@@ -429,7 +438,7 @@ AgentApplyResult AgentStateMachine::pushLinkEvent(const LinkEvent& event) {
     }
 
     if (changed &&
-        coordinator_connection_ == CoordinatorConnection::Connected) {
+        registrationPhase() == RegistrationPhase::Registered) {
         auto report = getLinkEventReport();
         if (report.has_value()) {
             effects.push_back(SendLinkEventReport{std::move(*report)});
@@ -443,9 +452,7 @@ std::optional<LinkEventReport> AgentStateMachine::getLinkEventReport() const {
     if (link_state_version_ <= acked_link_state_version_) return std::nullopt;
 
     LinkEventReport report;
-    report.reporter_rank = rank_;
-    report.agent_session_id = getAgentSessionId();
-    report.reporter_rank_epoch = getRankEpoch();
+    report.identity = identity();
     report.report_id = link_state_version_;
     report.events = observed_link_state_;
     report.target_rank_epochs = observed_target_rank_epochs_;
@@ -454,10 +461,6 @@ std::optional<LinkEventReport> AgentStateMachine::getLinkEventReport() const {
 
 void AgentStateMachine::handleLinkEventReportAck(
     const LinkEventReportAck& ack) {
-    if (ack.reporter_rank != rank_ ||
-        ack.reporter_rank_epoch != getRankEpoch()) {
-        return;
-    }
     acked_link_state_version_ =
         std::max(acked_link_state_version_, ack.report_id);
 }

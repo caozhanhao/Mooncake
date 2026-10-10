@@ -334,6 +334,8 @@ void P2PProxy::reportPeerFailure(int peer_rank) {
     if (!communicator) return;
 
     LinkEvent event;
+    event.observer = {meta_->globalRank,
+                      meta_->rankEpochs[meta_->globalRank]};
     const auto max_world_size = communicator->getMaxWorldSize();
     event.events.assign(max_world_size, LinkEvent::EventType::None);
     event.target_rank_epochs.assign(max_world_size, 0);

@@ -88,6 +88,7 @@ void LinkManager::start(uint64_t self_rank_epoch) {
     }
     if (shutdown_requested_.load(std::memory_order_acquire)) return;
     if (started_.exchange(true, std::memory_order_acq_rel)) return;
+    self_epoch_.store(self_rank_epoch, std::memory_order_release);
 
     TransferMetadata::SegmentID self_target_id{};
     {
@@ -323,6 +324,7 @@ void LinkManager::tearDownPeerLink(GlobalRank peer) {
 }
 
 void LinkManager::emit(TELinkUpEvent event) {
+    event.observer = {rank_, self_epoch_.load(std::memory_order_acquire)};
     std::lock_guard<std::mutex> lock(event_callback_mutex_);
     if (event_callback_) {
         event_callback_(std::move(event));
