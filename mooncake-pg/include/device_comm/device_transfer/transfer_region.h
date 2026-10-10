@@ -45,6 +45,7 @@ class RegionSlice {
 // The region must outlive its slices.
 class DeviceTransferRegion {
    public:
+    // Prefer shareable VMM (FABRIC, then POSIX FD), with cudaMalloc fallback.
     static PGResult<DeviceTransferRegion> create(int device_index, size_t size);
 
     ~DeviceTransferRegion() noexcept;

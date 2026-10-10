@@ -100,19 +100,25 @@ DeviceTransferRegion::DeviceTransferRegion(
 
 PGResult<void> DeviceTransferRegion::allocateBacking(size_t bytes) {
 #if CUDA_VERSION >= 12030
-    // FABRIC VMM lets TE P2P and NCCL share the same allocation.
+    // FABRIC or POSIX FD VMM lets TE P2P and NCCL share one allocation.
+    int vmm_supported = 0;
+    PG_TRY_CU(cuDeviceGetAttribute(
+        &vmm_supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
+        device_index_));
     int fabric_supported = 0;
     cuDeviceGetAttribute(&fabric_supported,
                          CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
                          device_index_);
-    if (fabric_supported) {
+    if (vmm_supported) {
         CUmemAllocationProp prop{};
         prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
         prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         prop.location.id = device_index_;
-        prop.requestedHandleTypes = static_cast<CUmemAllocationHandleType>(
-            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR |
-            CU_MEM_HANDLE_TYPE_FABRIC);
+        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+        if (fabric_supported) {
+            prop.requestedHandleTypes = static_cast<CUmemAllocationHandleType>(
+                prop.requestedHandleTypes | CU_MEM_HANDLE_TYPE_FABRIC);
+        }
         int rdma_supported = 0;
         PG_TRY_CU(cuDeviceGetAttribute(
             &rdma_supported,
@@ -120,21 +126,31 @@ PGResult<void> DeviceTransferRegion::allocateBacking(size_t bytes) {
             device_index_));
         prop.allocFlags.gpuDirectRDMACapable = rdma_supported != 0;
 
-        // Match NCCL's user-buffer requirements without depending on libnccl.
-        size_t granularity = 0;
-        PG_TRY_CU(cuMemGetAllocationGranularity(
-            &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
-        PG_VALIDATE_STATE(granularity != 0,
-                          "VMM allocation granularity is zero");
-        const size_t padding =
-            (granularity - bytes % granularity) % granularity;
-        PG_VALIDATE_ARG(bytes <= std::numeric_limits<size_t>::max() - padding,
-                        "device region size overflows VMM alignment");
-        size_ = bytes + padding;
+        for (;;) {
+            // Match NCCL's user-buffer requirements without depending on
+            // libnccl. Recompute alignment if the handle type changes on retry.
+            size_t granularity = 0;
+            PG_TRY_CU(cuMemGetAllocationGranularity(
+                &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+            PG_VALIDATE_STATE(granularity != 0,
+                              "VMM allocation granularity is zero");
+            const size_t padding =
+                (granularity - bytes % granularity) % granularity;
+            PG_VALIDATE_ARG(
+                bytes <= std::numeric_limits<size_t>::max() - padding,
+                "device region size overflows VMM alignment");
+            size_ = bytes + padding;
 
-        const auto result = cuMemCreate(&handle_, size_, &prop, 0);
-        if (result != CUDA_ERROR_NOT_PERMITTED &&
-            result != CUDA_ERROR_NOT_SUPPORTED) {
+            const auto result = cuMemCreate(&handle_, size_, &prop, 0);
+            if (result == CUDA_ERROR_NOT_PERMITTED ||
+                result == CUDA_ERROR_NOT_SUPPORTED) {
+                if (prop.requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) {
+                    prop.requestedHandleTypes =
+                        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+                    continue;
+                }
+                break;
+            }
             PG_TRY_CU(result);
             CUdeviceptr address = 0;
             PG_TRY_CU(cuMemAddressReserve(&address, size_, granularity, 0, 0));
@@ -145,13 +161,17 @@ PGResult<void> DeviceTransferRegion::allocateBacking(size_t bytes) {
             access.location = prop.location;
             access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
             PG_TRY_CU(cuMemSetAccess(address, size_, &access, 1));
+            if (prop.requestedHandleTypes ==
+                CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
+                LOG(INFO) << "[PG] Device-transfer region uses POSIX FD VMM: "
+                          << "device=" << device_index_ << " size=" << size_;
+            }
             return {};
         }
     }
 #endif
-    // Without FABRIC, TE P2P needs legacy CUDA IPC: POSIX FD import is not
-    // implemented. Prefer keeping P2P available when both routes cannot share
-    // one allocation.
+    // Keep legacy CUDA IPC available if the requested VMM types are
+    // unsupported.
     PG_TRY_CUDA(cudaMalloc(&addr_, bytes));
     size_ = bytes;
     return {};

@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-#include <transport/device/device_transport.h>
+#include <transport/device/p2p_memory.h>
 
 #include "device_comm/device_transfer/routes/route_provider.h"
 
@@ -21,7 +21,7 @@ struct P2pRouteOptions {
 class P2pRoute : public RouteProvider {
    public:
     static constexpr std::string_view kRouteKey = "p2p";
-    static constexpr uint32_t kEndpointVersion = 1;
+    static constexpr uint32_t kEndpointVersion = 2;
 
     [[nodiscard]] static PGResult<std::unique_ptr<P2pRoute>> create(
         int device_index, GlobalRank self_rank, uint32_t max_world_size);
@@ -61,7 +61,8 @@ class P2pRoute : public RouteProvider {
 
     void* local_ptr_ = nullptr;
     size_t local_size_ = 0;
-    std::vector<int32_t> local_handle_;
+    device::P2pMemoryExchange memory_exchange_;
+    std::unique_ptr<device::P2pExport> local_export_;
     std::unique_ptr<State> current_;
     std::unique_ptr<State> standby_;
     int device_index_ = -1;

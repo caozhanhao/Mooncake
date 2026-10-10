@@ -15,6 +15,10 @@ install(FILES transport/transport.h DESTINATION include/transport)
 # Device API headers (header-only, consumed by EP kernel)
 install(FILES transport/device/device_transport.h
         DESTINATION include/transport/device)
+if(USE_CUDA)
+  install(FILES transport/device/p2p_memory.h
+          DESTINATION include/transport/device)
+endif()
 install(FILES transport/device/device_ops.cuh
         DESTINATION include/transport/device)
 install(FILES transport/device/comm_device.cuh

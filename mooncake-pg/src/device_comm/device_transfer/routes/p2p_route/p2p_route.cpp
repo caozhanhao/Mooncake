@@ -3,8 +3,6 @@
 #include <cstring>
 #include <utility>
 
-#include <transport/device/device_transport.h>
-
 #include "gpu_runtime.h"
 
 namespace mooncake {
@@ -51,11 +49,11 @@ PGResult<std::unique_ptr<P2pRoute>> P2pRoute::create(int device_index,
 }
 
 std::optional<RouteEndpoint> P2pRoute::localEndpoint() {
-    if (local_handle_.empty()) return std::nullopt;
+    if (!local_export_) return std::nullopt;
     return RouteEndpoint{
         .route_key = std::string(kRouteKey),
         .version = routeVersion(),
-        .metadata = encodeEndpointMetadata(local_handle_),
+        .metadata = encodeEndpointMetadata(local_export_->metadata()),
     };
 }
 
@@ -105,7 +103,7 @@ PGResult<void> P2pRoute::installEndpoints(
                 previous->handle == peer.handle)
                 peer.mapping = previous->mapping;
             else
-                peer.mapping = device::importP2pMemory(peer.handle);
+                peer.mapping = memory_exchange_.importMemory(peer.handle);
             if (!peer.mapping) continue;
             address = peer.mapping->address();
         }
@@ -137,14 +135,14 @@ PGResult<void> P2pRoute::registerRegion(DeviceRegionKind kind, void* addr,
     if (kind == DeviceRegionKind::LocalStaging) return {};
     PG_VALIDATE_STATE(!local_ptr_, "P2P region is already registered");
     PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
-    auto handle = device::exportP2pMemory(addr, size);
-    if (handle.empty()) {
+    auto exported = memory_exchange_.exportMemory(addr, size);
+    if (!exported) {
         return makePGError(PGErrorCode::NotSupported,
                            "P2P region cannot be exported");
     }
     local_ptr_ = addr;
     local_size_ = size;
-    local_handle_ = std::move(handle);
+    local_export_ = std::move(exported);
     return {};
 }
 
@@ -154,7 +152,7 @@ PGResult<void> P2pRoute::unregisterRegion(DeviceRegionKind kind, void* addr,
     if (kind == DeviceRegionKind::LocalStaging) return {};
     PG_VALIDATE_STATE(local_ptr_ == addr && local_size_ == size,
                       "P2P region does not match the exported allocation");
-    local_handle_.clear();
+    local_export_.reset();
     local_ptr_ = nullptr;
     local_size_ = 0;
     return {};
