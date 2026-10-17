@@ -2,6 +2,7 @@
 #define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_PROTOCOLS_LL_TYPES_CUH
 
 #include "device_comm/device_collective/device_collective_types.cuh"
+#include "device_comm/device_utils/device_utils.cuh"
 
 namespace mooncake {
 
@@ -24,8 +25,7 @@ struct LLPacket {
 
     [[nodiscard]] __host__ __device__ static constexpr uint64_t packetCount(
         uint64_t payload_bytes) {
-        return payload_bytes / kPayloadBytes +
-               (payload_bytes % kPayloadBytes != 0);
+        return ceilDiv(payload_bytes, kPayloadBytes);
     }
 
     [[nodiscard]] __host__ __device__ static constexpr uint64_t payloadCapacity(

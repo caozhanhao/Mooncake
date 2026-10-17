@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_ONE_SHOT_TYPES_CUH
-#define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_ONE_SHOT_TYPES_CUH
+#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_ONE_SHOT_ALGORITHM_CUH
+#define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_ONE_SHOT_ALGORITHM_CUH
 
 #include "device_comm/device_collective/device_collective_types.cuh"
 #include "device_comm/device_collective/protocols/ll/ll_types.cuh"
@@ -36,7 +36,7 @@ struct OneShotBufferLayout {
     }
 };
 
-struct OneShotAllReducePlan {
+struct OneShotPlan {
     DevicePlanStatus status = DevicePlanStatus::Unavailable;
     uint64_t view_epoch = kInvalidViewEpoch;
     OneShotBufferLayout layout;
@@ -62,18 +62,22 @@ struct OneShotAllReducePlan {
     }
 };
 
-struct alignas(64) OneShotAllReduceDeviceState {
-    OneShotAllReducePlan plan;
+// Local device state owned by OneShotAlgorithm and shared by its kernels.
+struct alignas(64) OneShotDeviceState {
+    OneShotPlan plan;
     CollectiveRuntimeBindings collective;
     // Borrowed control bindings and progress from the communicator's LL
-    // resources.
+    // protocol.
     LLState* ll = nullptr;
 };
 
 cudaError_t launchOneShotAllReduceKernel(const AllReduceRequest& request,
-                                         OneShotAllReduceDeviceState* state,
+                                         OneShotDeviceState* state,
+                                         cudaStream_t stream);
+cudaError_t launchOneShotAllGatherKernel(const AllGatherRequest& request,
+                                         OneShotDeviceState* state,
                                          cudaStream_t stream);
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_ONE_SHOT_TYPES_CUH
+#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_ONE_SHOT_ALGORITHM_CUH

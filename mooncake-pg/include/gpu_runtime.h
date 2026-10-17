@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_PG_GPU_RUNTIME_H
 #define MOONCAKE_PG_GPU_RUNTIME_H
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -11,6 +12,8 @@
 
 namespace mooncake {
 
+using GpuUuid = std::array<uint8_t, 16>;
+
 class GpuStream;
 class GpuEvent;
 
@@ -19,6 +22,13 @@ class GpuEvent;
 // compatibility restriction will be fixed as the new collective runtime
 // matures.
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
+[[nodiscard]] PGResult<GpuUuid> queryGpuUuid(int device_index);
+
+// Whether native atomics from source to destination are known to be supported.
+// Returns false when the capability cannot be determined.
+[[nodiscard]] PGResult<bool> gpuPeerSupportsNativeAtomics(
+    const GpuUuid& source, const GpuUuid& destination);
+
 // Convert microseconds to clock64() ticks.
 PGResult<uint64_t> gpuTimeoutTicks(int device_index, size_t timeout_us);
 

@@ -6,7 +6,7 @@
 #include "device_comm/device_collective/protocols/ll/ll_types.cuh"
 #include "device_comm/device_transfer/transfer_lane.cuh"
 #include "pg_assert.h"
-#include "device_comm/device_utils/device_timeout.cuh"
+#include "device_comm/device_utils/device_utils.cuh"
 
 namespace mooncake {
 

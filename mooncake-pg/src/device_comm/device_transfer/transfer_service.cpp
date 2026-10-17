@@ -4,7 +4,7 @@
 #include <thread>
 #include <memory>
 #include <optional>
-#include <string>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -51,9 +51,24 @@ bool validEndpoint(const DeviceTransferEndpoint& endpoint) {
         return false;
     }
     for (const auto& route : endpoint.routes) {
-        if (route.route_key.empty()) return false;
+        if (route.key.empty()) return false;
     }
     return true;
+}
+
+// Summarize DTS routes for external use
+std::vector<DeviceTransferRouteInfo> describeRoutes(
+    std::span<const DeviceTransferRoute> routes) {
+    std::vector<DeviceTransferRouteInfo> result;
+    result.reserve(routes.size());
+    for (const auto& route : routes) {
+        result.push_back({
+            .reachable = route.type != DeviceRouteType::Unreachable,
+            .directly_addressable = route.mappedRegionAddress() != 0,
+            .native_atomics = route.native_atomics,
+        });
+    }
+    return result;
 }
 
 template <typename Item>
@@ -183,7 +198,7 @@ struct DeviceTransferService::DeviceState {
           peer_accessible_region(std::move(peer_accessible_region)),
           route_stream(std::move(route_stream)),
           strong_stream(strong_stream),
-          published_route_types(max_world_size, DeviceRouteType::Unreachable) {}
+          logged_route_types(max_world_size, DeviceRouteType::Unreachable) {}
 
     ~DeviceState() noexcept {
         auto result = shutdown();
@@ -242,31 +257,26 @@ struct DeviceTransferService::DeviceState {
                                      engine, link_manager, max_world_size);
     }
 
-    void installEndpoints(const DeviceTransferSnapshot& snapshot,
-                          uint64_t reclaim_before_version) {
+    PGResult<void> installEndpoints(const DeviceTransferSnapshot& snapshot,
+                                    uint64_t reclaim_before_version) {
+        // Providers are ordered by preference. Select the first reachable
+        // route for each peer without changing the current device routes.
+        std::vector<DeviceTransferRoute> selected_routes(max_world_size);
         for (auto it = route_providers.begin(); it != route_providers.end();) {
             auto result =
                 (*it)->installEndpoints(snapshot, reclaim_before_version);
-            if (result.has_value()) {
-                ++it;
+            if (!result.has_value()) {
+                LOG(WARNING)
+                    << "[PG] " << (*it)->key()
+                    << " device-transfer route is poisoned by endpoint "
+                       "installation failure: "
+                    << result.error().message;
+                poisoned_routes.push_back(
+                    {std::move(*it), local_staging_region.has_value()});
+                it = route_providers.erase(it);
                 continue;
             }
-            LOG(WARNING) << "[PG] " << (*it)->routeKey()
-                         << " device-transfer route is poisoned by endpoint "
-                            "installation failure: "
-                         << result.error().message;
-            poisoned_routes.push_back(
-                {std::move(*it), local_staging_region.has_value()});
-            it = route_providers.erase(it);
-        }
-    }
-
-    PGResult<void> updateRoutes() {
-        // Providers are ordered by preference. Build the complete next image
-        // separately, selecting the first reachable candidate for each peer.
-        std::vector<DeviceTransferRoute> selected_routes(max_world_size);
-        for (const auto& provider : route_providers) {
-            PG_TRY(auto candidates, provider->updateRoutes());
+            const auto& candidates = result.value();
             PG_VALIDATE_STATE(
                 candidates.size() == max_world_size,
                 "route provider returned an invalid global-rank route table");
@@ -279,9 +289,17 @@ struct DeviceTransferService::DeviceState {
                     selected = candidates[rank];
                 }
             }
+            ++it;
         }
         std::copy(selected_routes.begin(), selected_routes.end(),
                   host_route_image);
+        return {};
+    }
+
+    PGResult<void> updateRoutes() {
+        for (const auto& provider : route_providers) {
+            PG_TRY(provider->updateRoutes());
+        }
         return {};
     }
 
@@ -359,11 +377,11 @@ struct DeviceTransferService::DeviceState {
         for (GlobalRank rank = 0;
              rank < static_cast<GlobalRank>(max_world_size); ++rank) {
             const auto type = host_route_image[rank].type;
-            if (type == published_route_types[rank]) continue;
+            if (type == logged_route_types[rank]) continue;
             LOG(INFO) << "[PG] Device-transfer route selected: rank="
                       << self_rank << " device=" << device_index
                       << " peer=" << rank << " route=" << routeTypeName(type);
-            published_route_types[rank] = type;
+            logged_route_types[rank] = type;
         }
         return {};
     }
@@ -512,7 +530,7 @@ struct DeviceTransferService::DeviceState {
     DeviceMetadata device_metadata;
     // Pinned host image copied into device_metadata.routes.
     DeviceTransferRoute* host_route_image = nullptr;
-    std::vector<DeviceRouteType> published_route_types;
+    std::vector<DeviceRouteType> logged_route_types;
     DeviceTransferEndpoint local_endpoint;
     bool shutdown_requested_ = false;
 };
@@ -546,8 +564,7 @@ struct DeviceTransferService::PublishedState {
     int device_index = -1;
     const DeviceTransferHandle* device_handle = nullptr;
     DeviceTransferEndpoint local_endpoint;
-    std::vector<DeviceTransferRoute> routes;
-    std::vector<const RouteProvider*> route_providers;
+    std::vector<DeviceTransferRouteInfo> routes;
     DeviceTransferRegion* peer_accessible_region = nullptr;
     DeviceTransferRegion* local_staging_region = nullptr;
 };
@@ -605,10 +622,8 @@ void DeviceTransferService::publishHostState() {
     next->device_index = state.device_index;
     next->device_handle = state.device_metadata.handle;
     next->local_endpoint = state.local_endpoint;
-    next->routes.assign(state.host_route_image,
-                        state.host_route_image + state.max_world_size);
-    for (const auto& provider : state.route_providers)
-        next->route_providers.push_back(provider.get());
+    next->routes =
+        describeRoutes({state.host_route_image, state.max_world_size});
     next->peer_accessible_region = &state.peer_accessible_region;
     if (state.local_staging_handle_initialized)
         next->local_staging_region = &*state.local_staging_region;
@@ -622,17 +637,14 @@ const DeviceTransferHandle* DeviceTransferService::deviceHandle() {
     return published_ ? published_->device_handle : nullptr;
 }
 
-PGResult<bool> DeviceTransferService::isDirectlyAddressable(GlobalRank rank) {
+PGResult<DeviceTransferRouteInfo> DeviceTransferService::routeInfo(
+    GlobalRank rank) const {
     std::lock_guard lock(published_mutex_);
     PG_VALIDATE_STATE(published_, "DTS is unavailable");
     PG_VALIDATE_ARG(
         rank >= 0 && static_cast<size_t>(rank) < published_->routes.size(),
         "transfer rank is out of range");
-    const auto& route = published_->routes[rank];
-    PG_VALIDATE_STATE(route.type != DeviceRouteType::Unreachable,
-                      "transfer peer " + std::to_string(rank) +
-                          " has no device transfer route");
-    return route.mappedRegionAddress() != 0;
+    return published_->routes[rank];
 }
 
 DeviceTransferEndpoint DeviceTransferService::localEndpoint() const {
@@ -644,16 +656,6 @@ DeviceTransferEndpoint DeviceTransferService::localEndpoint() const {
 int DeviceTransferService::deviceIndex() const noexcept {
     std::lock_guard lock(published_mutex_);
     return published_ ? published_->device_index : -1;
-}
-
-const RouteProvider* DeviceTransferService::findRoute(
-    std::string_view route_key) const noexcept {
-    std::lock_guard lock(published_mutex_);
-    if (!published_) return nullptr;
-    for (const auto* provider : published_->route_providers) {
-        if (provider->routeKey() == route_key) return provider;
-    }
-    return nullptr;
 }
 
 PGResult<RegionSlice> DeviceTransferService::allocatePeerAccessible(
@@ -682,7 +684,7 @@ PGResult<RegionSlice> DeviceTransferService::allocateLocalStaging(
     return slice;
 }
 
-PGResult<DeviceTransferEndpoint> DeviceTransferService::installEndpoints(
+PGResult<DeviceTransferInstallResult> DeviceTransferService::installEndpoints(
     const DeviceTransferSnapshot& snapshot, uint64_t reclaim_before_version) {
     std::lock_guard lock(resource_mutex_);
     PG_VALIDATE_STATE(device_ && !shutdown_requested_, "DTS is unavailable");
@@ -707,7 +709,7 @@ PGResult<DeviceTransferEndpoint> DeviceTransferService::installEndpoints(
         PG_TRY(state.prepareLocalStaging());
     }
 
-    state.installEndpoints(snapshot, reclaim_before_version);
+    PG_TRY(state.installEndpoints(snapshot, reclaim_before_version));
 
     PG_ASSERT_OK(state.pause());
     PG_ASSERT_OK(state.updateRoutes());
@@ -725,7 +727,12 @@ PGResult<DeviceTransferEndpoint> DeviceTransferService::installEndpoints(
     // Publish the host view before resuming device users.
     publishHostState();
     state.resume();
-    return state.local_endpoint;
+    DeviceTransferInstallResult result;
+    result.routes =
+        describeRoutes({state.host_route_image, state.max_world_size});
+    if (state.local_endpoint != *snapshot.endpoints[state.self_rank])
+        result.updated_endpoint = state.local_endpoint;
+    return result;
 }
 
 PGResult<void> DeviceTransferService::shutdown() {

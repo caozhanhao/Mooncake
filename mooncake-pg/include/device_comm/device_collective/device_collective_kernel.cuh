@@ -98,6 +98,8 @@ prepareCollectiveInvocation(Plan* plan,
     }
     block.sync();
     PG_ASSERT(plan->status == DevicePlanStatus::Ready);
+    // Single-participant execution needs no communication preparation.
+    if (plan->participant_count == 1) return {};
     return prepare();
 }
 

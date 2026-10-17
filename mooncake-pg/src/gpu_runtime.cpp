@@ -1,6 +1,7 @@
 #include "gpu_runtime.h"
 
 #include <algorithm>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <string>
@@ -21,6 +22,49 @@ void warnCleanupFailure(const char* operation, const char* error) noexcept {
 }  // namespace
 
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
+PGResult<GpuUuid> queryGpuUuid(int device_index) {
+    cudaDeviceProp properties{};
+    PG_TRY_CUDA(cudaGetDeviceProperties(&properties, device_index));
+    GpuUuid uuid{};
+    static_assert(sizeof(properties.uuid.bytes) == sizeof(uuid));
+    std::memcpy(uuid.data(), properties.uuid.bytes, uuid.size());
+    return uuid;
+}
+
+PGResult<bool> gpuPeerSupportsNativeAtomics(const GpuUuid& source,
+                                            const GpuUuid& destination) {
+    // Accesses within one GPU use local atomic semantics; CUDA's peer
+    // query requires distinct GPUs.
+    if (source == destination) return true;
+
+    int source_device = -1;
+    int destination_device = -1;
+    int device_count = 0;
+    PG_TRY_CUDA(cudaGetDeviceCount(&device_count));
+    for (int candidate = 0; candidate < device_count; ++candidate) {
+        PG_TRY(auto uuid, queryGpuUuid(candidate));
+        if (uuid == source) source_device = candidate;
+        if (uuid == destination) destination_device = candidate;
+        if (source_device >= 0 && destination_device >= 0) break;
+    }
+
+    if (source_device < 0 || destination_device < 0) {
+        // FIXME: Query native atomics for peers hidden by CUDA_VISIBLE_DEVICES
+        // and for MNNVL peers, e.g. via NVML. Until then, report no support.
+        return false;
+    }
+
+    int accessible = 0;
+    PG_TRY_CUDA(cudaDeviceCanAccessPeer(&accessible, source_device,
+                                        destination_device));
+    if (!accessible) return false;
+    int native_atomics = 0;
+    PG_TRY_CUDA(cudaDeviceGetP2PAttribute(&native_atomics,
+                                          cudaDevP2PAttrNativeAtomicSupported,
+                                          source_device, destination_device));
+    return native_atomics != 0;
+}
+
 PGResult<uint64_t> gpuTimeoutTicks(int device_index, size_t timeout_us) {
     if (timeout_us == 0) return uint64_t{0};
     PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));

@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_TYPES_CUH
-#define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_TYPES_CUH
+#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_ALGORITHM_CUH
+#define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_ALGORITHM_CUH
 
 #include <cstdint>
 
@@ -11,14 +11,11 @@
 namespace mooncake {
 
 // An oversized chunk reduces pipeline overlap, so a cap is applied here.
-
 inline constexpr uint64_t kMaxRingChunkBytes = 512ull * 1024;  // 512 KiB
 
-// Complete published resource and topology binding read by a Ring AllReduce
-// kernel. A control update replaces the Plan while algorithm execution is
-// quiescent, so a kernel needs only the state pointer and its per-invocation
-// request.
-struct RingAllReducePlan {
+// Ring neighbors, active-index mapping and workspace bindings for one group
+// view. The runtime publishes this plan through a device control update.
+struct RingPlan {
     DevicePlanStatus status = DevicePlanStatus::Unavailable;
     uint64_t view_epoch = kInvalidViewEpoch;
 
@@ -26,6 +23,8 @@ struct RingAllReducePlan {
 
     int32_t self_active_index = -1;
     uint32_t participant_count = 0;
+    // Active index -> stable group slot, used only for operand addressing.
+    InGroupRank in_group_ranks[kMaxNumRanks] = {};
     // Predecessor first, successor last. A two-rank Ring has one remote peer.
     CollectivePeer remote_peers[2] = {};
     uint32_t peer_count = 0;
@@ -46,10 +45,9 @@ struct RingAllReducePlan {
     }
 };
 
-// Ordinary device memory owned by one Ring AllReduce algorithm instance. None
-// of this state is registered or published to peers.
-struct alignas(256) RingAllReduceDeviceState {
-    RingAllReducePlan plan;
+// Local device state owned by RingAlgorithm and shared by its kernels.
+struct alignas(256) RingDeviceState {
+    RingPlan plan;
     CollectiveRuntimeBindings collective;
     // Borrowed Simple bindings; progress is shared with other Simple
     // algorithms.
@@ -57,9 +55,12 @@ struct alignas(256) RingAllReduceDeviceState {
 };
 
 cudaError_t launchRingAllReduceKernel(const AllReduceRequest& request,
-                                      RingAllReduceDeviceState* state,
+                                      RingDeviceState* state,
+                                      cudaStream_t stream);
+cudaError_t launchRingAllGatherKernel(const AllGatherRequest& request,
+                                      RingDeviceState* state,
                                       cudaStream_t stream);
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_TYPES_CUH
+#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_ALGORITHM_CUH

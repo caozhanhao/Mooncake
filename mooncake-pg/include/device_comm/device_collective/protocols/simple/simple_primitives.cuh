@@ -11,7 +11,7 @@ namespace mooncake {
 // and one send connection. send() and Reduce operations read chunk.source;
 // Copy operations write chunk.destination. Call begin() once before data
 // operations and finish() once after them.
-template <typename T, ReduceOp Op>
+template <typename T>
 class SimplePrimitives {
    public:
     [[nodiscard]] __device__ __forceinline__ static SimplePrimitives bind(
@@ -74,8 +74,7 @@ class SimplePrimitives {
          cooperative_groups::thread_block block) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto send = slotFor(send_cursor_);
-        const auto available = waitPrevSendConsumed(send, block);
-        if (!available.succeeded()) return available;
+        PG_COLL_TRY(waitPrevSendConsumed(send, block));
         const auto payload = outgoingPayload(send);
         copyValuesTo(chunk.source, chunk.count, block,
                      payload.template dataAs<T>());
@@ -83,17 +82,31 @@ class SimplePrimitives {
         return {};
     }
 
+    // Store source to destination and send the same values.
+    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    copySend(const CollectiveChunk<T>& chunk,
+             cooperative_groups::thread_block block) {
+        PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
+        const auto send = slotFor(send_cursor_);
+        PG_COLL_TRY(waitPrevSendConsumed(send, block));
+
+        const auto payload = outgoingPayload(send);
+        copyValuesTo(chunk.source, chunk.count, block, chunk.destination,
+                     payload.template dataAs<T>());
+        publishSend(send, payload, chunk.count, block);
+        return {};
+    }
+
     // Receive the next message and send Op(source, received). No local copy.
+    template <ReduceOp Op>
     [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
     recvReduceSend(const CollectiveChunk<T>& chunk,
                    cooperative_groups::thread_block block) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto recv = slotFor(recv_cursor_);
         const auto send = slotFor(send_cursor_);
-        const auto arrived = waitRecvReady(recv, block);
-        if (!arrived.succeeded()) return arrived;
-        const auto available = waitPrevSendConsumed(send, block);
-        if (!available.succeeded()) return available;
+        PG_COLL_TRY(waitRecvReady(recv, block));
+        PG_COLL_TRY(waitPrevSendConsumed(send, block));
 
         const auto payload = outgoingPayload(send);
         reduceValuesTo<T, Op>(chunk.source, receivedPayload(recv), chunk.count,
@@ -104,13 +117,13 @@ class SimplePrimitives {
     }
 
     // Receive the next message and store Op(source, received) to destination.
+    template <ReduceOp Op>
     [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
     recvReduceCopy(const CollectiveChunk<T>& chunk,
                    cooperative_groups::thread_block block) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto recv = slotFor(recv_cursor_);
-        const auto arrived = waitRecvReady(recv, block);
-        if (!arrived.succeeded()) return arrived;
+        PG_COLL_TRY(waitRecvReady(recv, block));
 
         reduceValuesTo<T, Op>(chunk.source, receivedPayload(recv), chunk.count,
                               block, chunk.destination);
@@ -119,16 +132,15 @@ class SimplePrimitives {
     }
 
     // Store Op(source, received) to destination and send the same result.
+    template <ReduceOp Op>
     [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
     recvReduceCopySend(const CollectiveChunk<T>& chunk,
                        cooperative_groups::thread_block block) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto recv = slotFor(recv_cursor_);
         const auto send = slotFor(send_cursor_);
-        const auto arrived = waitRecvReady(recv, block);
-        if (!arrived.succeeded()) return arrived;
-        const auto available = waitPrevSendConsumed(send, block);
-        if (!available.succeeded()) return available;
+        PG_COLL_TRY(waitRecvReady(recv, block));
+        PG_COLL_TRY(waitPrevSendConsumed(send, block));
 
         const auto payload = outgoingPayload(send);
         reduceValuesTo<T, Op>(chunk.source, receivedPayload(recv), chunk.count,
@@ -145,8 +157,7 @@ class SimplePrimitives {
              cooperative_groups::thread_block block) {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto recv = slotFor(recv_cursor_);
-        const auto arrived = waitRecvReady(recv, block);
-        if (!arrived.succeeded()) return arrived;
+        PG_COLL_TRY(waitRecvReady(recv, block));
 
         copyValuesTo(receivedPayload(recv), chunk.count, block,
                      chunk.destination);
@@ -161,10 +172,8 @@ class SimplePrimitives {
         PG_ASSERT(chunk.count <= buffers_.chunk_bytes / sizeof(T));
         const auto recv = slotFor(recv_cursor_);
         const auto send = slotFor(send_cursor_);
-        const auto arrived = waitRecvReady(recv, block);
-        if (!arrived.succeeded()) return arrived;
-        const auto available = waitPrevSendConsumed(send, block);
-        if (!available.succeeded()) return available;
+        PG_COLL_TRY(waitRecvReady(recv, block));
+        PG_COLL_TRY(waitPrevSendConsumed(send, block));
 
         const auto payload = outgoingPayload(send);
         copyValuesTo(receivedPayload(recv), chunk.count, block,
@@ -187,8 +196,7 @@ class SimplePrimitives {
 
     [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
     finish(cooperative_groups::thread_block block) {
-        const auto result = waitSendsConsumed(block);
-        if (!result.succeeded()) return result;
+        PG_COLL_TRY(waitSendsConsumed(block));
         if (block.thread_rank() == 0) {
             device::mc_st_release_u64(&send_progress_->send_cursor,
                                       send_cursor_);

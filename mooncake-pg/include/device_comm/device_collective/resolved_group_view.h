@@ -2,6 +2,7 @@
 #define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_RESOLVED_GROUP_VIEW_H
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "common_types.h"
@@ -13,7 +14,8 @@ namespace mooncake {
 struct ResolvedParticipant {
     GlobalRank global_rank = kInvalidGlobalRank;
     InGroupRank in_group_rank = kInvalidInGroupRank;
-    DeviceGroupEndpoint endpoint;
+    std::vector<ProtocolEndpoint> protocols;
+    std::vector<AlgorithmEndpoint> algorithms;
     DeviceCollectiveWorkspaceEndpoint workspace;
     // Remote word written by this communicator's rank.
     uint64_t view_epoch_signal_offset = 0;
@@ -28,15 +30,26 @@ struct ResolvedParticipant {
     }
 };
 
-// Host-only input to protocol binding and algorithm Plan construction.
-// Runtime resolves active peers and View-epoch bindings. Protocols and
-// algorithms interpret their own endpoints; algorithms choose connections and
-// payload layout.
+// Host input for collective execution. resolveGroupView validates membership
+// and shared endpoint data, resolves workspace and signal offsets, and keeps
+// only the data needed for protocol and algorithm setup.
 struct ResolvedGroupView {
-    uint64_t epoch = 0;
+    uint64_t epoch = kInvalidViewEpoch;
     int32_t self_active_index = -1;
     uint64_t buffer_size = 0;
     std::vector<ResolvedParticipant> participants;
+    std::vector<DeviceCollectiveAlgorithmChoice> collective_algorithm_choices;
+
+    [[nodiscard]] static ResolvedGroupView localOnly(
+        InGroupRank self_rank, uint64_t buffer_size,
+        std::span<const DeviceCollectiveAlgorithmChoice> choices) {
+        return {
+            .self_active_index = 0,
+            .buffer_size = buffer_size,
+            .participants = {ResolvedParticipant{.in_group_rank = self_rank}},
+            .collective_algorithm_choices = {choices.begin(), choices.end()},
+        };
+    }
 };
 
 }  // namespace mooncake

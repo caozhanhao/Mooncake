@@ -2,6 +2,7 @@
 #define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_COLLECTIVE_TYPES_CUH
 
 #include <cstdint>
+#include <variant>
 
 #include <cuda_alike.h>
 
@@ -21,7 +22,19 @@ struct CollectiveStepResult {
     }
 };
 
+// Evaluate a collective step once and return its failure unchanged.
+#define PG_COLL_TRY(...)                                                 \
+    do {                                                                 \
+        const ::mooncake::CollectiveStepResult pg_coll_result_internal = \
+            (__VA_ARGS__);                                               \
+        if (!pg_coll_result_internal.succeeded()) {                      \
+            return pg_coll_result_internal;                              \
+        }                                                                \
+    } while (false)
+
 struct AllReduceRequest {
+    static constexpr OpType kOperation = OpType::AllReduce;
+
     const void* send_buffer = nullptr;
     void* recv_buffer = nullptr;
     uint64_t count = 0;
@@ -29,6 +42,20 @@ struct AllReduceRequest {
     ReduceOp op = ReduceOp::Sum;
     int32_t* failed_ranks_hint = nullptr;
 };
+
+struct AllGatherRequest {
+    static constexpr OpType kOperation = OpType::AllGather;
+
+    const void* send_buffer = nullptr;
+    void* recv_buffer = nullptr;
+    // Number of input elements contributed by each participant.
+    uint64_t count = 0;
+    DataType datatype = DataType::Float32;
+    int32_t* failed_ranks_hint = nullptr;
+};
+
+using DeviceCollectiveRequest =
+    std::variant<AllReduceRequest, AllGatherRequest>;
 
 // One remote participant selected by an algorithm. Workspace and signal offsets
 // are relative to that peer's DTS region.
@@ -90,7 +117,7 @@ static_assert(kMaxDeviceCollectiveChannels <= kTransferLaneCount);
 inline constexpr uint32_t kMaxDeviceControlUpdateOperations = 8;
 inline constexpr uint32_t kDeviceControlUpdatePayloadBytes = 8192;
 
-inline constexpr bool isDeviceAllReduceCombinationSupported(
+inline constexpr bool isDeviceReductionCombinationSupported(
     DataType datatype, ReduceOp op) noexcept {
     switch (op) {
         case ReduceOp::Sum:
@@ -158,7 +185,7 @@ struct alignas(16) ControlUpdateOp {
     Payload payload = {};
 };
 
-// One complete, idempotent update for device-resident control-plane state.
+// One complete update for device-resident control-plane state.
 // The host constructs it locally before briefly acquiring the mapped slot for
 // publication.
 struct alignas(16) ControlUpdate {
@@ -212,11 +239,12 @@ struct alignas(64) InvocationState {
 };
 
 // Stable runtime bindings borrowed by every collective algorithm. Per-call
-// operands live in AllReduceRequest; topology and protocol bindings live in the
+// operands live in requests; topology and protocol bindings live in the
 // algorithm's device state.
 struct CollectiveRuntimeBindings {
     const DeviceTransferHandle* transfer_handle = nullptr;
     uint64_t timeout_ticks = 0;
+    InGroupRank self_rank = kInvalidInGroupRank;
     const uint64_t* view_epoch_signals = nullptr;
     InvocationState* invocation_state = nullptr;
     ControlMailbox* control_mailbox = nullptr;

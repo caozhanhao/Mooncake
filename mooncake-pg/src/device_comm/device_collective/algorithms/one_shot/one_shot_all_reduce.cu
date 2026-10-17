@@ -1,14 +1,12 @@
-#include "device_comm/device_collective/algorithms/oneshot/one_shot_types.cuh"
+#include "device_comm/device_collective/algorithms/one_shot/one_shot_kernel.cuh"
 
 #include <cstdint>
 
 #include <cooperative_groups.h>
 
-#include "device_comm/device_collective/device_collective_kernel.cuh"
-#include "device_comm/device_collective/protocols/ll/ll_primitives.cuh"
 #include "device_comm/device_collective/protocols/ll/ll_value_pack.cuh"
 #include "device_comm/device_primitives/value_primitives.cuh"
-#include "device_comm/device_transfer/transfer_lane.cuh"
+#include "device_comm/device_utils/device_utils.cuh"
 #include "pg_assert.h"
 
 namespace mooncake {
@@ -16,100 +14,9 @@ namespace {
 
 inline constexpr int kOneShotTileSize = 8;
 
-// Send to every peer and finish all receives before advancing LL progress.
-template <typename T>
-class OneShotExchange {
-    using Pack = LLValuePack<T>;
-
-   public:
-    __device__ __forceinline__ OneShotExchange(const OneShotAllReducePlan& plan,
-                                               LLState& ll, uint32_t channel,
-                                               uint64_t timeout_ticks)
-        : plan_(plan),
-          ll_(ll),
-          channel_(channel),
-          timeout_ticks_(timeout_ticks) {}
-
-    [[nodiscard]] __device__ __forceinline__ uint64_t
-    chunkElementCapacity() const {
-        return OneShotBufferLayout::kChunkBytes / sizeof(T);
-    }
-
-    [[nodiscard]] __device__ __forceinline__ static uint64_t packCount(
-        uint64_t count) {
-        return count / Pack::kValueCount + (count % Pack::kValueCount != 0);
-    }
-
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
-    begin(cooperative_groups::thread_block block) {
-        const auto result =
-            LLControl(ll_, channel_, timeout_ticks_)
-                .begin(plan_.view_epoch, plan_.remotePeers(),
-                       plan_.packets + plan_.layout.packetIndex(channel_, 0, 0),
-                       plan_.layout.channelPacketBytes(), block);
-        sequence_ = ll_.progress[channel_].next_sequence;
-        return result;
-    }
-
-    // Before X sends n+2, it receives Y's n+1, so Y has consumed X's n.
-    // Empty/local-only calls consume no sequence, preserving this dependency.
-    __device__ __forceinline__ void sendAll(
-        CollectiveChunk<T> chunk,
-        cooperative_groups::thread_block block) const {
-        const uint64_t pack_count = packCount(chunk.count);
-        const auto remote_peers = plan_.remotePeers();
-        const uint64_t work = pack_count * remote_peers.size();
-        const LLPacketOps packets(sequence_, timeout_ticks_);
-        for (uint64_t index = block.thread_rank(); index < work;
-             index += block.size()) {
-            const auto& peer = remote_peers.atIndex(index / pack_count);
-            const uint64_t pack_index = index % pack_count;
-            const auto value =
-                Pack::load(chunk.source, chunk.count, pack_index);
-            const uint64_t remote_offset =
-                peer.workspace_offset +
-                plan_.layout.packetIndex(
-                    channel_, sequence_ % OneShotBufferLayout::kSlots,
-                    plan_.self_rank, pack_index * Pack::kPayloadWords) *
-                    LLPacket::kStorageBytes;
-            auto* destination =
-                static_cast<LLPacket*>(ll_.bindings.transfer_handle->remotePtr(
-                    peer.global_rank, remote_offset));
-            packets.storePack<Pack>(destination, value);
-        }
-        block.sync();
-    }
-
-    [[nodiscard]] __device__ __forceinline__ bool readReceived(
-        uint32_t active_index, uint64_t pack_index,
-        typename Pack::Value& value) const {
-        const auto& peer = plan_.remoteParticipant(active_index);
-        const auto* packet =
-            plan_.packets +
-            plan_.layout.packetIndex(
-                channel_, sequence_ % OneShotBufferLayout::kSlots,
-                peer.in_group_rank, pack_index * Pack::kPayloadWords);
-        return LLPacketOps(sequence_, timeout_ticks_)
-            .loadPack<Pack>(packet, value);
-    }
-
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
-    finish(InGroupRank failed, cooperative_groups::thread_block block) {
-        return LLControl(ll_, channel_, timeout_ticks_)
-            .finish(sequence_, failed, block);
-    }
-
-   private:
-    const OneShotAllReducePlan& plan_;
-    LLState& ll_;
-    uint32_t channel_;
-    uint64_t timeout_ticks_;
-    uint64_t sequence_ = 0;
-};
-
 template <typename T, ReduceOp Op>
 [[nodiscard]] __device__ __forceinline__ InGroupRank
-reducePeersScalar(CollectiveChunk<T> chunk, const OneShotAllReducePlan& plan,
+reducePeersScalar(CollectiveChunk<T> chunk, const OneShotPlan& plan,
                   const OneShotExchange<T>& exchange, uint64_t pack_count,
                   cooperative_groups::thread_block block) {
     using Pack = LLValuePack<T>;
@@ -134,7 +41,7 @@ reducePeersScalar(CollectiveChunk<T> chunk, const OneShotAllReducePlan& plan,
 
 template <typename T, ReduceOp Op>
 [[nodiscard]] __device__ __forceinline__ InGroupRank
-reducePeersTiled(CollectiveChunk<T> chunk, const OneShotAllReducePlan& plan,
+reducePeersTiled(CollectiveChunk<T> chunk, const OneShotPlan& plan,
                  const OneShotExchange<T>& exchange, uint64_t pack_count,
                  cooperative_groups::thread_block block) {
     using Pack = LLValuePack<T>;
@@ -183,12 +90,11 @@ reducePeersTiled(CollectiveChunk<T> chunk, const OneShotAllReducePlan& plan,
 
 template <typename T, ReduceOp Op>
 [[nodiscard]] __device__ __forceinline__ CollectiveStepResult runOneShotChunks(
-    CollectiveChunk<T> values, const OneShotAllReducePlan& plan,
+    CollectiveChunk<T> values, const OneShotPlan& plan,
     OneShotExchange<T>& exchange, cooperative_groups::thread_block block) {
     uint64_t offset = 0;
     while (offset < values.count) {
-        const auto ready = exchange.begin(block);
-        if (!ready.succeeded()) return ready;
+        PG_COLL_TRY(exchange.begin(block));
         const uint64_t remaining = values.count - offset;
         const CollectiveChunk<T> chunk{
             .source = values.source + offset,
@@ -207,47 +113,26 @@ template <typename T, ReduceOp Op>
                                                           pack_count, block)
                                 : reducePeersScalar<T, Op>(
                                       chunk, plan, exchange, pack_count, block);
-        const auto result = exchange.finish(failed, block);
-        if (!result.succeeded()) return result;
+        PG_COLL_TRY(exchange.finish(failed, block));
         offset += chunk.count;
     }
     return {};
 }
 
-template <typename T, ReduceOp Op, CollectiveExecution Execution>
+template <typename T, ReduceOp Op>
 [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
-runOneShot(const AllReduceRequest& request, OneShotAllReduceDeviceState* state,
-           cooperative_groups::thread_block block) {
+runOneShotChannel(const AllReduceRequest& request, OneShotDeviceState* state,
+                  uint32_t channel, uint32_t channel_count,
+                  cooperative_groups::thread_block block) {
     const auto& plan = state->plan;
-    PG_ASSERT(plan.participant_count > 0 &&
-              plan.participant_count <= kMaxNumRanks);
-    if (request.count == 0) return {};
-    uint64_t offset = 0;
-    uint64_t count = request.count;
-    uint32_t channel = 0;
-    if constexpr (Execution == CollectiveExecution::MultiCTA) {
-        channel = blockIdx.x;
-        // Split on pack boundaries so CTAs never share an pack.
-        const uint64_t packs = OneShotExchange<T>::packCount(request.count);
-        const uint64_t capacity =
-            ((packs + gridDim.x - 1) / gridDim.x) * LLValuePack<T>::kValueCount;
-        offset = uint64_t{channel} * capacity;
-        if (offset >= request.count) return {};
-        count = request.count - offset;
-        if (count > capacity) count = capacity;
-    }
+    const auto partition =
+        OneShotChannelPartition::make<T>(request.count, channel, channel_count);
+    if (partition.count == 0) return {};
     const CollectiveChunk<T> values{
-        .source = static_cast<const T*>(request.send_buffer) + offset,
-        .destination = static_cast<T*>(request.recv_buffer) + offset,
-        .count = count,
+        .source = static_cast<const T*>(request.send_buffer) + partition.offset,
+        .destination = static_cast<T*>(request.recv_buffer) + partition.offset,
+        .count = partition.count,
     };
-    if (plan.participant_count == 1) {
-        if (values.source != values.destination)
-            copyValuesTo(values.source, values.count, block,
-                         values.destination);
-        return {};
-    }
-
     PG_ASSERT(state->ll);
     OneShotExchange<T> exchange(plan, *state->ll, channel,
                                 state->collective.timeout_ticks);
@@ -256,21 +141,19 @@ runOneShot(const AllReduceRequest& request, OneShotAllReduceDeviceState* state,
 
 template <typename T, ReduceOp Op, CollectiveExecution Execution>
 __global__ __launch_bounds__(kOneShotMaxThreads) void oneShotAllReduceKernel(
-    AllReduceRequest request, OneShotAllReduceDeviceState* state) {
-    const auto block = cooperative_groups::this_thread_block();
-    PG_ASSERT(state);
-    auto result = beginCollectiveInvocation<Execution>(
-        &state->plan, state->collective, block);
-    if (result.succeeded())
-        result = runOneShot<T, Op, Execution>(request, state, block);
-    finishCollectiveInvocation<Execution>(
-        state->collective, state->plan.remotePeers(), block, result.failed_rank,
-        request.failed_ranks_hint);
+    AllReduceRequest request, OneShotDeviceState* state) {
+    runOneShotInvocation<Execution>(
+        request, state,
+        [&](uint32_t channel, uint32_t channel_count,
+            cooperative_groups::thread_block block) {
+            return runOneShotChannel<T, Op>(request, state, channel,
+                                            channel_count, block);
+        });
 }
 
 template <typename T, ReduceOp Op>
 cudaError_t launchKernel(const AllReduceRequest& request,
-                         OneShotAllReduceDeviceState* state, int threads,
+                         OneShotDeviceState* state, int threads,
                          uint32_t channels, cudaStream_t stream) {
     if (channels > 1) {
         oneShotAllReduceKernel<T, Op, CollectiveExecution::MultiCTA>
@@ -284,7 +167,7 @@ cudaError_t launchKernel(const AllReduceRequest& request,
 
 template <typename T>
 cudaError_t launchForType(const AllReduceRequest& request,
-                          OneShotAllReduceDeviceState* state, int threads,
+                          OneShotDeviceState* state, int threads,
                           uint32_t channels, cudaStream_t stream) {
     switch (request.op) {
         case ReduceOp::Sum:
@@ -307,9 +190,9 @@ cudaError_t launchForType(const AllReduceRequest& request,
 }  // namespace
 
 cudaError_t launchOneShotAllReduceKernel(const AllReduceRequest& request,
-                                         OneShotAllReduceDeviceState* state,
+                                         OneShotDeviceState* state,
                                          cudaStream_t stream) {
-    if (!isDeviceAllReduceCombinationSupported(request.datatype, request.op))
+    if (!isDeviceReductionCombinationSupported(request.datatype, request.op))
         return cudaErrorInvalidValue;
     const uint64_t bytes = request.count * elementSize(request.datatype);
     // Size is fixed in a captured call; smaller blocks suit tiny messages.
